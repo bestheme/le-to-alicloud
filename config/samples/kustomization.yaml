@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- certs_v1alpha1_aliyuncertificate.yaml
+- certs_v1alpha1_aliyuncertificatebinding.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
