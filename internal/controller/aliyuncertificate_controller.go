@@ -217,9 +217,9 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 	}
 	r.setUploadedCondition(ac)
 
-	// 8. 保留策略回收（失败按云错误处理，不影响 Ready 判定）
+	// 8. 保留策略回收。纯清理动作：失败只发事件并择机重试，绝不降级 Uploaded / Ready（R21）
 	if err := r.reclaimOldGenerations(ctx, ac); err != nil {
-		return r.handleCloudError(ctx, ac, orig, "Delete", err)
+		return r.handleReclaimError(ctx, ac, orig, err)
 	}
 
 	// 9. CAS 探测由 Task 14 接入

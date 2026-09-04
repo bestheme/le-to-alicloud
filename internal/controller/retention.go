@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -107,6 +108,8 @@ func (r *AliyunCertificateReconciler) reclaimOldGenerations(ctx context.Context,
 			}
 			err := cas.Delete(ctx, *oldest.CertID, token)
 			if err != nil && aliyun.ClassOf(err) != aliyun.ClassNotFound {
+				// 唯一一处知道「删的是哪一张」的地方；错误详情只到日志为止，事件里不带。
+				log.Error(err, "delete CAS certificate failed", "certId", *oldest.CertID, "fingerprint", oldest.Fingerprint[:8])
 				return err
 			}
 			r.Recorder.Event(ac, corev1.EventTypeNormal, "Reclaimed", "old CAS certificate reclaimed")
@@ -116,4 +119,30 @@ func (r *AliyunCertificateReconciler) reclaimOldGenerations(ctx context.Context,
 		excess--
 	}
 	return nil
+}
+
+// reclaimFailedMessage 是 ReclaimFailed 事件的固定文案。事件是广播给用户的对象，云错误
+// 原文可能夹带 request id 之类的细节，不该进这里；详情只进日志。
+const reclaimFailedMessage = "failed to reclaim an old CAS certificate; the current certificate is unaffected"
+
+// handleReclaimError 处理回收失败（控制器裁决 R21）。
+//
+// 回收是纯清理动作：当前这一代早就上传成功、正在服役，删不掉一张早已没人引用的旧证书
+// 说明不了它有任何问题。若沿用 handleCloudError，一次清理失败会把 Uploaded / Ready 打成
+// False，Binding 侧会跟着认为证书不可用而连锁停摆——用一个无害的失败换来一场真实的故障。
+// 所以这里一个 condition 都不碰，只发一条 Warning 事件，把既有判定原样保留下来。
+func (r *AliyunCertificateReconciler) handleReclaimError(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, err error) (ctrl.Result, error) {
+	logf.FromContext(ctx).Error(err, "保留策略回收失败")
+	r.Recorder.Event(ac, corev1.EventTypeWarning, "ReclaimFailed", reclaimFailedMessage)
+	// aggregateReady 只读 Issued / Uploaded，上面没动过，判定与回收成功时完全一致。
+	r.aggregateReady(ac)
+	// 本轮可能已经成功删掉了更老的几代：那部分 history 必须落盘，否则下一轮会对着同一批
+	// certId 再删一次。
+	if perr := r.patchStatus(ctx, ac, orig); perr != nil {
+		return ctrl.Result{}, perr
+	}
+	if aliyun.ClassOf(err) == aliyun.ClassRetryable {
+		return ctrl.Result{}, err // 交给 controller-runtime 指数退避
+	}
+	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
