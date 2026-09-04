@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
@@ -27,6 +29,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
@@ -75,6 +79,36 @@ func ctrlCreateOrUpdateSecret(ctx context.Context, s *corev1.Secret, certPEM, ke
 	s.Type = corev1.SecretTypeTLS
 	s.Data = map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM}
 	return true, k8sClient.Create(ctx, s)
+}
+
+// gatedCAS 在第一次 Upload **提交之后** 卡住，让用例能在「云上已经有证书、status 还没
+// 记下它」这个精确窗口里观察服务端状态。放行后那一次调用以 retryable 错误收场，模拟
+// 「服务端成功、响应丢失」。
+type gatedCAS struct {
+	aliyun.CASClient
+	first   sync.Once
+	release func()
+	entered chan struct{}
+	gate    chan struct{}
+}
+
+func newGatedCAS(inner aliyun.CASClient) *gatedCAS {
+	g := &gatedCAS{CASClient: inner, entered: make(chan struct{}), gate: make(chan struct{})}
+	var once sync.Once
+	g.release = func() { once.Do(func() { close(g.gate) }) }
+	return g
+}
+
+func (g *gatedCAS) Upload(ctx context.Context, name string, certPEM, keyPEM []byte, token string) (int64, error) {
+	id, err := g.CASClient.Upload(ctx, name, certPEM, keyPEM, token)
+	held := false
+	g.first.Do(func() { held = true })
+	if !held {
+		return id, err
+	}
+	close(g.entered)
+	<-g.gate
+	return 0, &aliyun.Error{Class: aliyun.ClassRetryable, Op: "Upload", Code: "Timeout", Err: errors.New("response lost")}
 }
 
 var _ = Describe("证书 controller：上传", func() {
@@ -186,6 +220,103 @@ var _ = Describe("证书 controller：上传", func() {
 		Expect(currentCAS().Certs()).To(HaveLen(1))
 		Expect(currentCAS().UploadCalls()).To(BeNumerically(">=", 2))
 		Expect(getAC(ctx, ns, "lost").Status.PendingUpload).To(BeNil())
+		// 重试是靠 ClientToken 命中的，不是靠同名兜底：findByName 一次都不该被调到。
+		Expect(currentCAS().FindCalls()).To(Equal(0))
+	})
+
+	It("上传已提交但代次未落盘的窗口里，write-ahead 记录必须还在", func() {
+		ns := newNamespace(ctx)
+		inner := currentCAS()
+		gate := newGatedCAS(inner)
+		prev := reconciler.CASFactory
+		reconciler.CASFactory = func(context.Context, *certsv1alpha1.AliyunCertificate) (aliyun.CASClient, error) {
+			return gate, nil
+		}
+		DeferCleanup(func() { gate.release(); reconciler.CASFactory = prev })
+
+		Expect(k8sClient.Create(ctx, baseAC(ns, "atomic"))).To(Succeed())
+		crt, key := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
+		simulateIssuance(ctx, ns, "atomic", 1, crt, key)
+
+		// 卡在「CAS 已经收下这张证书、reconcile 还没来得及写 current」这一刻。
+		// 这正是 write-ahead 存在的理由：此刻进程死掉，pendingUpload 是唯一能把
+		// 云上那张证书找回来的线索，所以它必须已经在服务端。
+		Eventually(gate.entered, "10s").Should(BeClosed())
+		Expect(inner.Certs()).To(HaveLen(1))
+		ac := getAC(ctx, ns, "atomic")
+		Expect(ac.Status.Current).To(BeNil())
+		Expect(ac.Status.PendingUpload).NotTo(BeNil())
+		// 云上那张证书带的正是落盘的那个 token，重试才找得回它。
+		Expect(inner.Certs()[0].Token).To(Equal(ac.Status.PendingUpload.ClientToken))
+		Expect(inner.Certs()[0].Name).To(Equal(ac.Status.PendingUpload.CASName))
+		// token 的时间后缀与 StartedAt 取自同一个 now，可以由记录本身复算出来。
+		Expect(ac.Status.PendingUpload.ClientToken).To(HaveLen(48))
+		Expect(ac.Status.PendingUpload.ClientToken[40:]).To(
+			Equal(fmt.Sprintf("%08x", uint32(ac.Status.PendingUpload.StartedAt.Unix()))))
+
+		// 放行后这一轮以 retryable 失败收场，重试靠同一 token 命中，不产生第二张证书。
+		gate.release()
+		eventually(func() bool {
+			got := getAC(ctx, ns, "atomic")
+			return got.Status.Current != nil && got.Status.Current.CertID != nil && got.Status.PendingUpload == nil
+		})
+		Expect(inner.Certs()).To(HaveLen(1))
+		Expect(inner.FindCalls()).To(Equal(0))
+	})
+
+	It("write-ahead 记录的清除与代次推进落在同一次写里", func() {
+		ns := newNamespace(ctx)
+
+		// 用 watch 而不是轮询：它看得到服务端写出的**每一个**版本，抽样会漏掉那些
+		// 只存在几毫秒的中间态。
+		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme.Scheme})
+		Expect(err).NotTo(HaveOccurred())
+		w, err := wc.Watch(ctx, &certsv1alpha1.AliyunCertificateList{}, client.InNamespace(ns))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(w.Stop)
+
+		var (
+			mu         sync.Mutex
+			sawPending bool
+			orphans    []string
+			settled    = make(chan struct{})
+		)
+		go func() {
+			defer GinkgoRecover()
+			for ev := range w.ResultChan() {
+				got, ok := ev.Object.(*certsv1alpha1.AliyunCertificate)
+				if !ok {
+					continue
+				}
+				mu.Lock()
+				recorded := got.Status.Current != nil && got.Status.Current.CertID != nil
+				switch {
+				case got.Status.PendingUpload != nil:
+					sawPending = true
+				case sawPending && !recorded:
+					// write-ahead 记录没了，代次也还没写：这一版里 CAS 上那张证书
+					// 无人认领，此刻崩溃就再也找不回它。
+					orphans = append(orphans, got.ResourceVersion)
+				}
+				if sawPending && recorded && got.Status.PendingUpload == nil {
+					select {
+					case <-settled:
+					default:
+						close(settled)
+					}
+				}
+				mu.Unlock()
+			}
+		}()
+
+		Expect(k8sClient.Create(ctx, baseAC(ns, "atomicwrite"))).To(Succeed())
+		crt, key := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
+		simulateIssuance(ctx, ns, "atomicwrite", 1, crt, key)
+
+		Eventually(settled, "15s").Should(BeClosed())
+		mu.Lock()
+		defer mu.Unlock()
+		Expect(orphans).To(BeEmpty(), "这些版本里 pendingUpload 已清但代次未推进")
 	})
 
 	It("凭证 Secret 缺失时 Uploaded=False/CredentialsSecretNotFound", func() {

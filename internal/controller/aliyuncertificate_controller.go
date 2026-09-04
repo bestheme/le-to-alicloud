@@ -212,7 +212,7 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 	setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "Secret 通过校验")
 
 	// 6–7. 上传（含短路）
-	if _, err := r.ensureUploaded(ctx, ac, b); err != nil {
+	if _, err := r.ensureUploaded(ctx, ac, orig, b); err != nil {
 		return r.handleCloudError(ctx, ac, orig, "Upload", err)
 	}
 	r.setUploadedCondition(ac)

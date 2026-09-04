@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -37,7 +39,10 @@ const tokenPrefixLen = 40
 
 // ensureUploaded 保证 status.current 对应 b 的指纹；需要时上传 CAS。
 // 返回 changed=true 表示 status.current 被推进（新代次）。
-func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac *certsv1alpha1.AliyunCertificate, b *pki.Bundle) (bool, error) {
+//
+// orig 是本轮 patch 的基准快照。这里要能改它：write-ahead 记录是在本轮中途单独落盘的，
+// 基准若不跟着走，轮末的 MergeFrom 就算不出正确的差异（见 patchPendingUpload）。
+func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, b *pki.Bundle) (bool, error) {
 	log := logf.FromContext(ctx).WithValues("fingerprint", b.Fingerprint[:8])
 
 	if ac.Status.Current != nil && ac.Status.Current.Fingerprint == b.Fingerprint {
@@ -47,30 +52,33 @@ func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac *ce
 	// 到这里说明要推进代次，而推进代次会调云。informer cache 可能还没追上上一轮 reconcile
 	// 自己写下的 status——write-ahead patch 会立刻唤醒下一轮，那时 cache 往往还停在更早的
 	// 版本。动手之前直读一次 API server，换成权威值再判断一遍。
-	if err := r.refreshUploadState(ctx, ac); err != nil {
+	if err := r.refreshUploadState(ctx, ac, orig); err != nil {
 		return false, err
 	}
 	if ac.Status.Current != nil && ac.Status.Current.Fingerprint == b.Fingerprint {
 		return false, nil
 	}
 
+	now := r.now()
 	gen := certsv1alpha1.CertificateGeneration{
 		Fingerprint: b.Fingerprint,
 		NotBefore:   metav1.NewTime(b.Leaf.NotBefore),
 		NotAfter:    metav1.NewTime(b.Leaf.NotAfter),
-		UploadedAt:  metav1.NewTime(r.now()),
+		UploadedAt:  metav1.NewTime(now),
 	}
 
 	if ac.Spec.Aliyun.UploadEnabled() {
 		// write-ahead：先把意图写进 status，再调云；崩溃后重启能用同一 token 续上。
 		if ac.Status.PendingUpload == nil || ac.Status.PendingUpload.Fingerprint != b.Fingerprint {
+			// token 的时间后缀与 StartedAt 必须取同一个 now，两者才对得上。
+			startedAt := r.now()
 			pending := &certsv1alpha1.PendingUpload{
 				Fingerprint: b.Fingerprint,
 				CASName:     naming.CASName(ac.Name, b.Fingerprint),
-				ClientToken: r.uploadToken(ac, b.Fingerprint),
-				StartedAt:   metav1.NewTime(r.now()),
+				ClientToken: uploadToken(ac.UID, b.Fingerprint, startedAt),
+				StartedAt:   metav1.NewTime(startedAt),
 			}
-			if err := r.patchPendingUpload(ctx, ac, pending); err != nil {
+			if err := r.patchPendingUpload(ctx, ac, orig, pending); err != nil {
 				return false, err
 			}
 		}
@@ -101,10 +109,11 @@ func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac *ce
 		gen.CertID = &certID
 		gen.CASName = ac.Status.PendingUpload.CASName
 		// 刚上传等于刚确认这张证书在 CAS 侧存在，探测时间戳一并推进。
-		ac.Status.CASProbedAt = &metav1.Time{Time: r.now()}
-		if err := r.patchPendingUpload(ctx, ac, nil); err != nil {
-			return false, err
-		}
+		ac.Status.CASProbedAt = &metav1.Time{Time: now}
+		// 只在内存里抹掉 write-ahead 记录，落盘留给轮末那一次 patchStatus——它同时写
+		// current / history / casProbedAt 与 pendingUpload:null。分成两次写会开出一个
+		// 「记录已删、代次未记」的窗口：那一刻崩溃，CAS 上这张证书就再没有任何东西指向它。
+		ac.Status.PendingUpload = nil
 		r.Recorder.Event(ac, corev1.EventTypeNormal, "Uploaded", "certificate uploaded to CAS")
 		log.Info("uploaded to CAS", "certId", certID)
 	}
@@ -116,23 +125,28 @@ func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac *ce
 	return true, nil
 }
 
-// uploadToken 生成本次上传的幂等令牌：naming.ClientToken 的稳定前缀 + 8 位时间后缀，
-// 仍是 48 个 hex 字符。前缀让同一代证书的重试复用同一 token；时间后缀让「CAS 侧被删后重传」
-// 拿到全新 token，不会命中云端仍保留的旧映射。生成后立即写入 pendingUpload，
-// 此后的每次重试都只读那一份，不再重新生成。
-func (r *AliyunCertificateReconciler) uploadToken(ac *certsv1alpha1.AliyunCertificate, fingerprint string) string {
-	base := naming.ClientToken(ac.UID, fingerprint)
+// uploadToken 生成本次上传的幂等令牌：naming.ClientToken 的稳定前缀 + startedAt 的 8 位
+// 时间后缀，仍是 48 个 hex 字符。前缀让同一代证书的重试复用同一 token；时间后缀让
+// 「CAS 侧被删后重传」拿到全新 token，不会命中云端仍保留的旧映射。生成后立即写入
+// pendingUpload，此后的每次重试都只读那一份，不再重新生成——所以 startedAt 必须与
+// PendingUpload.StartedAt 是同一个时刻，token 才能由记录本身复算出来。
+func uploadToken(uid types.UID, fingerprint string, startedAt time.Time) string {
+	base := naming.ClientToken(uid, fingerprint)
 	if len(base) > tokenPrefixLen {
 		base = base[:tokenPrefixLen]
 	}
-	return base + fmt.Sprintf("%08x", uint32(r.now().Unix())) //nolint:gosec // 只取低 32 位做时间后缀
+	return base + fmt.Sprintf("%08x", uint32(startedAt.Unix())) //nolint:gosec // 只取低 32 位做时间后缀
 }
 
 // refreshUploadState 用 APIReader 直读 CR，把代次与 write-ahead 记录换成 API server 上的
 // 权威值。落后的 cache 会造成两种真实损害：按它判断会对同一代证书多调一次 CAS Upload
 // （幂等，但白费一次云调用，且测试里数得出来）；更糟的是它看不到已落盘的 write-ahead 记录，
 // 于是生成新 token 覆盖旧的，重试就不再幂等。
-func (r *AliyunCertificateReconciler) refreshUploadState(ctx context.Context, ac *certsv1alpha1.AliyunCertificate) error {
+//
+// ac 与 orig 都要换：orig 是轮末 MergeFrom 的基准，留着旧 cache 快照的话，基准与目标就
+// 分属两个不同版本，算出来的差异可能只含嵌套对象的部分字段，拼出一个缺 notBefore /
+// notAfter / uploadedAt 的残缺 CertificateGeneration。
+func (r *AliyunCertificateReconciler) refreshUploadState(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate) error {
 	reader := client.Reader(r.APIReader)
 	if reader == nil {
 		reader = r.Client
@@ -141,26 +155,48 @@ func (r *AliyunCertificateReconciler) refreshUploadState(ctx context.Context, ac
 	if err := reader.Get(ctx, client.ObjectKeyFromObject(ac), fresh); err != nil {
 		return err
 	}
-	ac.Status.Current = fresh.Status.Current
-	ac.Status.History = fresh.Status.History
-	ac.Status.PendingUpload = fresh.Status.PendingUpload
-	ac.Status.CASProbedAt = fresh.Status.CASProbedAt
+	// 两份各自深拷贝：共享指针会让轮末的 MergeFrom 看不出任何差异。
+	adoptUploadState(ac, fresh)
+	adoptUploadState(orig, fresh)
 	return nil
 }
 
-// patchPendingUpload 用一次最小补丁把 status.pendingUpload 改成 want（nil 表示删除）。
+// adoptUploadState 把 src 的代次与 write-ahead 记录深拷贝进 dst。
+func adoptUploadState(dst, src *certsv1alpha1.AliyunCertificate) {
+	dst.Status.Current = src.Status.Current.DeepCopy()
+	dst.Status.PendingUpload = src.Status.PendingUpload.DeepCopy()
+	dst.Status.CASProbedAt = src.Status.CASProbedAt.DeepCopy()
+	dst.Status.History = nil
+	if src.Status.History != nil {
+		dst.Status.History = make([]certsv1alpha1.CertificateGeneration, len(src.Status.History))
+		for i := range src.Status.History {
+			src.Status.History[i].DeepCopyInto(&dst.Status.History[i])
+		}
+	}
+}
+
+// patchPendingUpload 用一次最小补丁把 status.pendingUpload 落盘成 want。
 //
-// 它必须独立于本轮末尾的 patchStatus：write-ahead 记录要在调云之前落盘，而末尾的
-// MergeFrom 以本轮开头的快照为基准，看不到「本轮先写后删」这条轨迹——写进去的
-// pendingUpload 会因为首尾都是 nil 而永远删不掉。
+// 这一次写必须独立于轮末的 patchStatus：write-ahead 记录的全部意义就是先于云调用落盘。
+// 反过来，清除它绝不能走这里——那会开出「记录已删、代次未记」的窗口。
 //
 // Patch 传副本而不是 ac：client 会把响应解码回传入对象，直接用 ac 会把本轮已在内存里
 // 设好、尚未持久化的 condition 覆盖成服务端旧值。
-func (r *AliyunCertificateReconciler) patchPendingUpload(ctx context.Context, ac *certsv1alpha1.AliyunCertificate, want *certsv1alpha1.PendingUpload) error {
-	base := ac.DeepCopy()
+//
+// 两个赋值都放在 Patch 成功之后：
+//   - 写 ac，是因为 patch 失败时内存里不该留下一条服务端没有的记录；
+//   - 写 orig，是因为它是轮末 MergeFrom 的基准。基准不跟着走，轮末就发不出
+//     pendingUpload:null（首尾都是 nil，差异为空），记录会永远留在 status 里；
+//     而在错误路径上，基准反而会凭空 diff 出一个删除，把这次没删成的记录真的删掉。
+func (r *AliyunCertificateReconciler) patchPendingUpload(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, want *certsv1alpha1.PendingUpload) error {
+	target := ac.DeepCopy()
+	target.Status.PendingUpload = want
+	if err := r.Status().Patch(ctx, target, client.MergeFrom(ac)); err != nil {
+		return err
+	}
 	ac.Status.PendingUpload = want
-	obj := ac.DeepCopy()
-	return r.Status().Patch(ctx, obj, client.MergeFrom(base))
+	orig.Status.PendingUpload = want.DeepCopy()
+	return nil
 }
 
 // casClient 通过 CASFactory 获取 client；凭证错误转成 condition reason 由调用方处理。
