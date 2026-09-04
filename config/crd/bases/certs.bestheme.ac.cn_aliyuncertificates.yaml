@@ -14,10 +14,29 @@ spec:
     singular: aliyuncertificate
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Issued")].status
+      name: Issued
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Uploaded")].status
+      name: Uploaded
+      type: string
+    - jsonPath: .status.effectiveIssuerRef.name
+      name: Effective-Issuer
+      type: string
+    - jsonPath: .status.current.notAfter
+      name: Not-After
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: AliyunCertificate is the Schema for the aliyuncertificates API.
+        description: AliyunCertificate 描述一张由 cert-manager 签发并托管到阿里云 CAS 的证书。
         properties:
           apiVersion:
             description: |-
@@ -37,15 +56,472 @@ spec:
           metadata:
             type: object
           spec:
-            description: AliyunCertificateSpec defines the desired state of AliyunCertificate.
+            description: AliyunCertificateSpec 定义期望状态。
             properties:
-              foo:
-                description: Foo is an example field of AliyunCertificate. Edit aliyuncertificate_types.go
-                  to remove/update
+              aliyun:
+                description: AliyunSpec 描述阿里云侧的账号与位置。
+                properties:
+                  casRegion:
+                    description: CAS 的 region；缺省等于 region。SDK 按 region 自动选择 endpoint（cn-*
+                      全部落到 cas.aliyuncs.com）。
+                    type: string
+                  credentialsRef:
+                    description: LocalSecretReference 只允许引用同 namespace 的 Secret；故意不提供
+                      namespace 字段。
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  endpointOverride:
+                    description: 非空时覆盖 SDK 选出的 endpoint（VPC / 专有云）。
+                    type: string
+                  region:
+                    minLength: 1
+                    type: string
+                  resourceGroupId:
+                    type: string
+                  uploadToCAS:
+                    default: true
+                    description: 为 false 时跳过 CAS 上传 / 回收 / 探测，Uploaded 不参与 Ready 聚合。
+                    type: boolean
+                required:
+                - credentialsRef
+                - region
+                type: object
+              certificateTemplate:
+                description: |-
+                  CertificateTemplate 是透传给 cert-manager Certificate 的字段子集。
+                  顶层字段由本项目挑选，嵌套类型复用 cert-manager 的定义。
+                properties:
+                  commonName:
+                    type: string
+                  dnsNames:
+                    items:
+                      type: string
+                    type: array
+                  duration:
+                    type: string
+                  ipAddresses:
+                    items:
+                      type: string
+                    type: array
+                  issuerRef:
+                    description: 缺省时回退到 operator 的 --default-issuer-* flag；首次生效后被固化到
+                      status.effectiveIssuerRef。
+                    properties:
+                      group:
+                        description: |-
+                          Group of the issuer being referred to.
+                          Defaults to 'cert-manager.io'.
+                        type: string
+                      kind:
+                        description: |-
+                          Kind of the issuer being referred to.
+                          Defaults to 'Issuer'.
+                        type: string
+                      name:
+                        description: Name of the issuer being referred to.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  privateKey:
+                    description: 缺省 encoding 为 PKCS1（阿里云 CAS / FC3 / CDN 三处文档一致要求）。
+                    properties:
+                      algorithm:
+                        description: |-
+                          Algorithm is the private key algorithm of the corresponding private key
+                          for this certificate.
+
+                          If provided, allowed values are either `RSA`, `ECDSA` or `Ed25519`.
+                          If `algorithm` is specified and `size` is not provided,
+                          key size of 2048 will be used for `RSA` key algorithm and
+                          key size of 256 will be used for `ECDSA` key algorithm.
+                          key size is ignored when using the `Ed25519` key algorithm.
+                        enum:
+                        - RSA
+                        - ECDSA
+                        - Ed25519
+                        type: string
+                      encoding:
+                        description: |-
+                          The private key cryptography standards (PKCS) encoding for this
+                          certificate's private key to be encoded in.
+
+                          If provided, allowed values are `PKCS1` and `PKCS8` standing for PKCS#1
+                          and PKCS#8, respectively.
+                          Defaults to `PKCS1` if not specified.
+                        enum:
+                        - PKCS1
+                        - PKCS8
+                        type: string
+                      rotationPolicy:
+                        description: |-
+                          RotationPolicy controls how private keys should be regenerated when a
+                          re-issuance is being processed.
+
+                          If set to `Never`, a private key will only be generated if one does not
+                          already exist in the target `spec.secretName`. If one does exist but it
+                          does not have the correct algorithm or size, a warning will be raised
+                          to await user intervention.
+                          If set to `Always`, a private key matching the specified requirements
+                          will be generated whenever a re-issuance occurs.
+                          Default is `Always`.
+                          The default was changed from `Never` to `Always` in cert-manager >=v1.18.0.
+                        enum:
+                        - Never
+                        - Always
+                        type: string
+                      size:
+                        description: |-
+                          Size is the key bit size of the corresponding private key for this certificate.
+
+                          If `algorithm` is set to `RSA`, valid values are `2048`, `4096` or `8192`,
+                          and will default to `2048` if not specified.
+                          If `algorithm` is set to `ECDSA`, valid values are `256`, `384` or `521`,
+                          and will default to `256` if not specified.
+                          If `algorithm` is set to `Ed25519`, Size is ignored.
+                          No other values are allowed.
+                        type: integer
+                    type: object
+                  renewBefore:
+                    type: string
+                  secretTemplate:
+                    description: |-
+                      CertificateSecretTemplate defines the default labels and annotations
+                      to be copied to the Kubernetes Secret resource named in `CertificateSpec.secretName`.
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: Annotations is a key value map to be copied to
+                          the target Kubernetes Secret.
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: Labels is a key value map to be copied to the
+                          target Kubernetes Secret.
+                        type: object
+                    type: object
+                  subject:
+                    description: X509Subject Full X509 name specification
+                    properties:
+                      countries:
+                        description: Countries to be used on the Certificate.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      localities:
+                        description: Cities to be used on the Certificate.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      organizationalUnits:
+                        description: Organizational Units to be used on the Certificate.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      organizations:
+                        description: Organizations to be used on the Certificate.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      postalCodes:
+                        description: Postal codes to be used on the Certificate.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      provinces:
+                        description: State/Provinces to be used on the Certificate.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      serialNumber:
+                        description: Serial number to be used on the Certificate.
+                        type: string
+                      streetAddresses:
+                        description: Street addresses to be used on the Certificate.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  usages:
+                    items:
+                      description: |-
+                        KeyUsage specifies valid usage contexts for keys.
+                        See:
+                        https://tools.ietf.org/html/rfc5280#section-4.2.1.3
+                        https://tools.ietf.org/html/rfc5280#section-4.2.1.12
+
+                        Valid KeyUsage values are as follows:
+                        "signing",
+                        "digital signature",
+                        "content commitment",
+                        "key encipherment",
+                        "key agreement",
+                        "data encipherment",
+                        "cert sign",
+                        "crl sign",
+                        "encipher only",
+                        "decipher only",
+                        "any",
+                        "server auth",
+                        "client auth",
+                        "code signing",
+                        "email protection",
+                        "s/mime",
+                        "ipsec end system",
+                        "ipsec tunnel",
+                        "ipsec user",
+                        "timestamping",
+                        "ocsp signing",
+                        "microsoft sgc",
+                        "netscape sgc"
+                      enum:
+                      - signing
+                      - digital signature
+                      - content commitment
+                      - key encipherment
+                      - key agreement
+                      - data encipherment
+                      - cert sign
+                      - crl sign
+                      - encipher only
+                      - decipher only
+                      - any
+                      - server auth
+                      - client auth
+                      - code signing
+                      - email protection
+                      - s/mime
+                      - ipsec end system
+                      - ipsec tunnel
+                      - ipsec user
+                      - timestamping
+                      - ocsp signing
+                      - microsoft sgc
+                      - netscape sgc
+                      type: string
+                    type: array
+                type: object
+                x-kubernetes-validations:
+                - message: certificateTemplate 至少需要 dnsNames 或 commonName 之一
+                  rule: (has(self.dnsNames) && size(self.dnsNames) > 0) || (has(self.commonName)
+                    && self.commonName != "")
+              retention:
+                default: {}
+                description: RetentionSpec 控制 CAS 中保留多少代证书。
+                properties:
+                  keepLast:
+                    default: 2
+                    description: current + history 的总代数。
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  minAge:
+                    default: 24h
+                    description: 代次自上传起未满 minAge 不回收。
+                    type: string
+                type: object
+              secretName:
+                description: cert-manager 写入证书的 Secret 名；缺省 "<metadata.name>-tls"。
                 type: string
+            required:
+            - aliyun
+            - certificateTemplate
             type: object
           status:
-            description: AliyunCertificateStatus defines the observed state of AliyunCertificate.
+            description: AliyunCertificateStatus 定义观测状态。
+            properties:
+              casProbedAt:
+                format: date-time
+                type: string
+              certManagerCertificateName:
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              current:
+                description: CertificateGeneration 是一代已上传（或已观测）的证书；不含 PEM。
+                properties:
+                  casName:
+                    type: string
+                  certId:
+                    description: uploadToCAS=false 时为空。
+                    format: int64
+                    type: integer
+                  fingerprint:
+                    description: SHA-256(leaf DER)，小写 hex。
+                    type: string
+                  notAfter:
+                    format: date-time
+                    type: string
+                  notBefore:
+                    format: date-time
+                    type: string
+                  uploadedAt:
+                    format: date-time
+                    type: string
+                required:
+                - fingerprint
+                - notAfter
+                - notBefore
+                - uploadedAt
+                type: object
+              effectiveIssuerRef:
+                description: 实际生效并被固化（Pin）的 issuer。
+                properties:
+                  group:
+                    description: |-
+                      Group of the issuer being referred to.
+                      Defaults to 'cert-manager.io'.
+                    type: string
+                  kind:
+                    description: |-
+                      Kind of the issuer being referred to.
+                      Defaults to 'Issuer'.
+                    type: string
+                  name:
+                    description: Name of the issuer being referred to.
+                    type: string
+                required:
+                - name
+                type: object
+              history:
+                description: 最多 keepLast-1 条。
+                items:
+                  description: CertificateGeneration 是一代已上传（或已观测）的证书；不含 PEM。
+                  properties:
+                    casName:
+                      type: string
+                    certId:
+                      description: uploadToCAS=false 时为空。
+                      format: int64
+                      type: integer
+                    fingerprint:
+                      description: SHA-256(leaf DER)，小写 hex。
+                      type: string
+                    notAfter:
+                      format: date-time
+                      type: string
+                    notBefore:
+                      format: date-time
+                      type: string
+                    uploadedAt:
+                      format: date-time
+                      type: string
+                  required:
+                  - fingerprint
+                  - notAfter
+                  - notBefore
+                  - uploadedAt
+                  type: object
+                type: array
+              issuance:
+                description: IssuanceStatus 镜像 cert-manager Certificate 的关键 status
+                  字段。
+                properties:
+                  failedIssuanceAttempts:
+                    type: integer
+                  lastFailureTime:
+                    format: date-time
+                    type: string
+                  renewalTime:
+                    format: date-time
+                    type: string
+                  revision:
+                    type: integer
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              pendingUpload:
+                description: PendingUpload 是 CAS 上传的 write-ahead 记录，成功后清空。
+                properties:
+                  casName:
+                    type: string
+                  clientToken:
+                    type: string
+                  fingerprint:
+                    type: string
+                  startedAt:
+                    format: date-time
+                    type: string
+                required:
+                - casName
+                - clientToken
+                - fingerprint
+                - startedAt
+                type: object
+              secretName:
+                type: string
             type: object
         type: object
     served: true

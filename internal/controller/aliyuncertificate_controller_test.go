@@ -52,6 +52,15 @@ var _ = Describe("AliyunCertificate Controller", func() {
 						Namespace: "default",
 					},
 					// TODO(user): Specify other spec details if needed.
+					Spec: certsv1alpha1.AliyunCertificateSpec{
+						CertificateTemplate: certsv1alpha1.CertificateTemplate{
+							DNSNames: []string{"api.example.com"},
+						},
+						Aliyun: certsv1alpha1.AliyunSpec{
+							CredentialsRef: certsv1alpha1.LocalSecretReference{Name: "aliyun"},
+							Region:         "cn-hangzhou",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
