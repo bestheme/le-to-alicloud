@@ -1,6 +1,14 @@
 package aliyun
 
-import "testing"
+import (
+	"errors"
+	"net"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/alibabacloud-go/tea/dara"
+)
 
 // shouldFetchNextPage 是 FindUploaded 唯一的分页决策点，单独测它就不必起 httptest。
 func TestShouldFetchNextPage(t *testing.T) {
@@ -39,4 +47,75 @@ func TestShouldFetchNextPage_IgnoresTotalCount(t *testing.T) {
 			t.Fatalf("第 %d 页满页时应继续翻页", page)
 		}
 	}
+}
+
+// callCode 是 aliyuncert_aliyun_api_requests_total 的 code label 的唯一来源，
+// 它的取值集合必须有界，且绝不能夹带 SDK Message。
+func TestCallCode(t *testing.T) {
+	const leaky = "response body must not become a label"
+	code, status := "Throttling.User", 400
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"成功", nil, "OK"},
+		{"服务端错误码", Classify("Upload", &dara.SDKError{Code: &code, StatusCode: &status, Message: dara.String(leaky)}), "Throttling.User"},
+		{"网络超时", Classify("Upload", &net.OpError{Op: "dial", Err: syscall.ETIMEDOUT}), "NetTimeout"},
+		{"连接被拒", Classify("Upload", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}), "NetError"},
+		{"未分类错误", Classify("Upload", errors.New(leaky)), "Unknown"},
+		{"未经 Classify 的裸错误", errors.New(leaky), "Unknown"},
+		{"Code 为空的 *Error", &Error{Class: ClassPermanent, Op: "Upload"}, "Unknown"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := callCode(tc.err)
+			if got != tc.want {
+				t.Errorf("callCode(%v) = %q, 期望 %q", tc.err, got, tc.want)
+			}
+			if got == leaky {
+				t.Errorf("code label 泄漏了错误正文")
+			}
+		})
+	}
+}
+
+// observe 是三个方法共用的上报点：钩子为 nil 时必须静默跳过，否则给出 action + code。
+func TestSDKCASObserve(t *testing.T) {
+	t.Run("nil 钩子不 panic", func(t *testing.T) {
+		s := &sdkCAS{}
+		s.observe(ActionUploadUserCertificate, time.Now(), nil)
+	})
+
+	t.Run("按 action 与 code 上报", func(t *testing.T) {
+		type call struct {
+			action, code string
+			d            time.Duration
+		}
+		var got []call
+		s := &sdkCAS{cfg: CASClientConfig{OnCall: func(action, code string, d time.Duration) {
+			got = append(got, call{action, code, d})
+		}}}
+		start := time.Now().Add(-2 * time.Millisecond)
+		s.observe(ActionListUserCertificateOrder, start, nil)
+		s.observe(ActionListUserCertificateOrder, start, nil)
+		s.observe(ActionDeleteUserCertificate, start, &Error{Class: ClassNotFound, Op: "Delete", Code: "CertNotExist"})
+
+		want := []call{
+			{action: ActionListUserCertificateOrder, code: "OK"},
+			{action: ActionListUserCertificateOrder, code: "OK"},
+			{action: ActionDeleteUserCertificate, code: "CertNotExist"},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("上报次数 = %d，期望 %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i].action != want[i].action || got[i].code != want[i].code {
+				t.Errorf("第 %d 次 = %s/%s，期望 %s/%s", i, got[i].action, got[i].code, want[i].action, want[i].code)
+			}
+			if got[i].d <= 0 {
+				t.Errorf("第 %d 次耗时 = %v，应为正数", i, got[i].d)
+			}
+		}
+	})
 }

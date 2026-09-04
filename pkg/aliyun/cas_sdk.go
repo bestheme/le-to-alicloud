@@ -21,11 +21,49 @@ type CASClientConfig struct {
 	Timeout         time.Duration
 	Limiters        *Limiters
 	LimiterKey      string
+	// OnCall 在每次 OpenAPI 调用返回后被调用一次，用于记录调用计数与耗时。
+	// 可选；nil 表示不观测。
+	//
+	// 刻意做成回调而不是在本包里直接注册 Prometheus 指标：pkg/aliyun 是一个纯 SDK
+	// 封装，不该依赖 controller-runtime 的 metrics registry。action 是 OpenAPI 的
+	// 动作名，code 由 callCode 折叠成有界取值，d 是该次调用的耗时（不含限流等待）。
+	OnCall func(action, code string, d time.Duration)
 }
+
+// OpenAPI 动作名。作为指标 label 使用，取值必须是常量。
+const (
+	ActionUploadUserCertificate    = "UploadUserCertificate"
+	ActionDeleteUserCertificate    = "DeleteUserCertificate"
+	ActionListUserCertificateOrder = "ListUserCertificateOrder"
+)
 
 type sdkCAS struct {
 	c   *cas.Client
 	cfg CASClientConfig
+}
+
+// callCode 把一次调用的结果折叠成有界的 code label。
+//
+// 只取 *Error 的 Code——它来自服务端错误码或本包定义的固定字符串，取值集合有界。
+// 绝不取 Message：它可能夹带 request id、证书内容之类每次都不同的东西，进了 label
+// 就会在 Prometheus 侧长出永不消失的 series。
+func callCode(err error) string {
+	if err == nil {
+		return "OK"
+	}
+	var e *Error
+	if errors.As(err, &e) && e.Code != "" {
+		return e.Code
+	}
+	return "Unknown"
+}
+
+// observe 上报一次 OpenAPI 调用。err 必须是已经过 Classify 的错误。
+func (s *sdkCAS) observe(action string, start time.Time, err error) {
+	if s.cfg.OnCall == nil {
+		return
+	}
+	s.cfg.OnCall(action, callCode(err), time.Since(start))
 }
 
 // NewCASClient 用 SDK v4 构造 CASClient。所有调用走 WithContext 方法并受限流器约束。
@@ -74,9 +112,14 @@ func (s *sdkCAS) Upload(ctx context.Context, name string, certPEM, keyPEM []byte
 	if s.cfg.ResourceGroupID != "" {
 		req.ResourceGroupId = dara.String(s.cfg.ResourceGroupID)
 	}
+	start := time.Now()
 	resp, err := s.c.UploadUserCertificateWithContext(ctx, req, &dara.RuntimeOptions{})
-	if err != nil {
-		return 0, Classify("Upload", err)
+	cerr := Classify("Upload", err)
+	// 观测的是这次 OpenAPI 调用本身。下面的 EmptyResponse 是「调用成功但响应不可用」，
+	// 归 API 指标会把它算成服务端拒绝；那一档由 aliyuncert_cas_upload_total 覆盖。
+	s.observe(ActionUploadUserCertificate, start, cerr)
+	if cerr != nil {
+		return 0, cerr
 	}
 	if resp == nil || resp.Body == nil || resp.Body.CertId == nil {
 		return 0, &Error{Class: ClassRetryable, Op: "Upload", Code: "EmptyResponse", Err: errors.New("响应缺少 CertId")}
@@ -95,8 +138,11 @@ func (s *sdkCAS) Delete(ctx context.Context, certID int64, clientToken string) e
 	if clientToken != "" {
 		req.ClientToken = dara.String(clientToken)
 	}
+	start := time.Now()
 	_, err := s.c.DeleteUserCertificateWithContext(ctx, req, &dara.RuntimeOptions{})
-	return Classify("Delete", err)
+	cerr := Classify("Delete", err)
+	s.observe(ActionDeleteUserCertificate, start, cerr)
+	return cerr
 }
 
 const (
@@ -142,10 +188,14 @@ func (s *sdkCAS) FindUploaded(ctx context.Context, domainHint string) ([]CertSum
 		if s.cfg.ResourceGroupID != "" {
 			req.ResourceGroupId = dara.String(s.cfg.ResourceGroupID)
 		}
+		start := time.Now()
 		resp, err := s.c.ListUserCertificateOrderWithContext(cctx, req, &dara.RuntimeOptions{})
 		cancel()
-		if err != nil {
-			return nil, Classify("ListUserCertificateOrder", err)
+		cerr := Classify("ListUserCertificateOrder", err)
+		// 每页各记一次：翻页就是多次真实的 OpenAPI 调用，而 list 通道恰恰是限流最紧的。
+		s.observe(ActionListUserCertificateOrder, start, cerr)
+		if cerr != nil {
+			return nil, cerr
 		}
 		if resp == nil || resp.Body == nil {
 			break

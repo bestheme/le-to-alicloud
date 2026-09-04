@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/alibabacloud-go/tea/dara"
@@ -112,6 +113,49 @@ func TestClassify_NetTimeout(t *testing.T) {
 		if errors.As(got, &e) && e.Code != c.code {
 			t.Errorf("%s: Code = %q, want %q", c.name, e.Code, c.code)
 		}
+	}
+}
+
+// nonTimeoutErr 实现 net.Error 但 Timeout() 为 false，对应 connection reset 一类。
+type nonTimeoutErr struct{}
+
+func (nonTimeoutErr) Error() string   { return "connection reset by peer" }
+func (nonTimeoutErr) Timeout() bool   { return false }
+func (nonTimeoutErr) Temporary() bool { return false }
+
+// 非超时的传输层错误同样是瞬时故障。判成 Permanent 的话，一次 connection refused
+// 就要等满一个 resync 周期（默认 1h）才重试，期间 Ready 一直是 0。
+func TestClassify_NetNonTimeout(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  error
+	}{
+		{"connection refused", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}},
+		{"DNS 解析失败", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}},
+		{"custom net.Error", nonTimeoutErr{}},
+	} {
+		// 先确认前提：确实是 net.Error 且 Timeout() 为 false，否则这个用例测的不是它想测的东西
+		var ne net.Error
+		if !errors.As(c.err, &ne) || ne.Timeout() {
+			t.Fatalf("%s: 前提不成立，应实现 net.Error 且 Timeout()==false", c.name)
+		}
+		got := aliyun.Classify("FindUploaded", c.err)
+		if aliyun.ClassOf(got) != aliyun.ClassRetryable {
+			t.Errorf("%s: class = %v, want Retryable (%v)", c.name, aliyun.ClassOf(got), got)
+		}
+		var e *aliyun.Error
+		if errors.As(got, &e) && e.Code != "NetError" {
+			t.Errorf("%s: Code = %q, want %q", c.name, e.Code, "NetError")
+		}
+	}
+}
+
+// context.Canceled 刻意不归 Retryable：它意味着调用方主动放弃（manager 正在关停），
+// 重试没有意义。这条断言把现状钉住，免得日后有人顺手把它也扫进网络错误分支。
+func TestClassify_ContextCanceledStaysPermanent(t *testing.T) {
+	got := aliyun.Classify("Upload", context.Canceled)
+	if aliyun.ClassOf(got) != aliyun.ClassPermanent {
+		t.Errorf("context.Canceled class = %v, want Permanent", aliyun.ClassOf(got))
 	}
 }
 

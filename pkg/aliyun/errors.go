@@ -70,9 +70,17 @@ func Classify(op string, err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &Error{Class: ClassRetryable, Op: op, Code: "Timeout", Err: err}
 	}
+	// 传输层错误一律 Retryable。超时之外还有 connection refused、DNS 解析失败、
+	// connection reset by peer——它们的 Timeout() 都返回 false，但按定义同样是瞬时故障。
+	// 把它们丢进下面的 Unknown（=Permanent）分支，一次网络抖动就要等满一个 resync
+	// 周期才重试，而整个 operator 的重试故事都建立在 ClassRetryable 上。
+	// 真正的永久失败带着服务端 Code，走的是下面的 SDKError 分支，不会落到这里。
 	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return &Error{Class: ClassRetryable, Op: op, Code: "NetTimeout", Err: err}
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return &Error{Class: ClassRetryable, Op: op, Code: "NetTimeout", Err: err}
+		}
+		return &Error{Class: ClassRetryable, Op: op, Code: "NetError", Err: err}
 	}
 
 	// dara.SDKError 是 SDK 内层的错误类型。

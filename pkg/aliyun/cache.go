@@ -4,19 +4,27 @@ import "sync"
 
 // ClientKey 决定 client 何时必须重建：凭证 Secret 的 resourceVersion 一变就重建，
 // 否则轮换后的 AK 直到 Pod 重启才生效。
+//
+// Region / Endpoint / ResourceGroupID 都必须进 identity()：三者都会改变同一份凭证
+// 构造出来的 client 的实际行为。尤其是 ResourceGroupID——它决定证书被传进哪个资源组、
+// 存在性探测又在哪个资源组里查——漏掉它会让同 namespace、同凭证、同 region 但不同
+// 资源组的两个 CR 串用一个 client：证书落进别人的资源组，探测再也找不到它，于是每轮
+// 都判定「被人删了」并重传。
 type ClientKey struct {
 	Namespace       string
 	Name            string
 	ResourceVersion string
 	Region          string
 	Endpoint        string
+	ResourceGroupID string
 }
 
 func (k ClientKey) identity() string {
-	return k.Namespace + "/" + k.Name + "/" + k.Region + "/" + k.Endpoint
+	return k.Namespace + "/" + k.Name + "/" + k.Region + "/" + k.Endpoint + "/" + k.ResourceGroupID
 }
 
-// ClientCache 每个 (namespace, name, region, endpoint) 只保留最新 resourceVersion 的 client。
+// ClientCache 每个 (namespace, name, region, endpoint, resourceGroupId) 只保留最新
+// resourceVersion 的 client。
 type ClientCache struct {
 	mu sync.Mutex
 	m  map[string]entry
