@@ -55,18 +55,25 @@ func NewCASFactory(reader client.Reader, cache *aliyun.ClientCache, limiters *al
 		if err != nil {
 			return nil, &credentialsError{certsv1alpha1.ReasonCredentialsInvalid, err}
 		}
+		// key 必须囊括 build 闭包里读到的每一个会改变 client 行为的字段——
+		// ResourceGroupID 也在内，否则同 namespace、同凭证、同 region 但不同资源组的两个
+		// CR 会串用同一个 client：证书传进别人的资源组，探测又在错误的资源组里找不到它。
 		key := aliyun.ClientKey{
 			Namespace: s.Namespace, Name: s.Name, ResourceVersion: s.ResourceVersion,
 			Region: ac.Spec.Aliyun.EffectiveCASRegion(), Endpoint: ac.Spec.Aliyun.EndpointOverride,
+			ResourceGroupID: ac.Spec.Aliyun.ResourceGroupID,
 		}
 		return cache.GetOrBuild(key, func() (aliyun.CASClient, error) {
 			cred, err := creds.Build()
 			if err != nil {
 				return nil, &credentialsError{certsv1alpha1.ReasonCredentialsInvalid, err}
 			}
+			// 一律读 key 而不是 ac：缓存命中与否只由 key 决定，闭包里再从 ac 取值就等于
+			// 把没进 key 的字段偷偷带进 client，正是上面那个 bug 的形状。
 			return aliyun.NewCASClient(cred, aliyun.CASClientConfig{
-				Region: key.Region, Endpoint: key.Endpoint, ResourceGroupID: ac.Spec.Aliyun.ResourceGroupID,
+				Region: key.Region, Endpoint: key.Endpoint, ResourceGroupID: key.ResourceGroupID,
 				Timeout: timeout, Limiters: limiters, LimiterKey: creds.LimiterKey(),
+				OnCall: recordAliyunAPICall,
 			})
 		})
 	}

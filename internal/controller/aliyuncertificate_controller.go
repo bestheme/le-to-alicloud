@@ -198,24 +198,41 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	// 4. 镜像 cert-manager status；未 Ready 则等 watch
 	mirrorIssuance(ac, cert)
+	// 停滞只置 condition + 事件，绝不结束本轮（spec §5.2 步骤 4 也只要求这三样）。
+	// 续期停滞是能持续好几天的场景（LE 速率限制、DNS-01 solver 坏掉），而这期间
+	// status.current 指着的仍是一张有效、正在服役的证书。早退会让 operator 在这几天里
+	// 完全停止维护它：不探测 CAS 存在性、不按保留策略回收、不复读 Secret。
+	stalled := false
 	if issuing, since := certIssuingSince(cert); issuing && !since.IsZero() && r.now().Sub(since) > r.IssuanceStallThreshold {
 		setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionFalse, certsv1alpha1.ReasonIssuanceStalled,
 			fmt.Sprintf("cert-manager Issuing 已持续 %s", r.now().Sub(since).Truncate(time.Minute)))
 		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonIssuanceStalled, "cert-manager issuance stalled")
-		r.aggregateReady(ac)
-		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+		stalled = true
 	}
 	if !certReady(cert) {
-		setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionFalse, certsv1alpha1.ReasonCertificateNotReady, "等待 cert-manager 签发")
+		// 停滞时不覆写 Issued：CertificateNotReady 会把「已经卡了好几个小时」这条信息
+		// 抹平成「正在签发」，aliyuncert_certificate_issuance_stalled 也跟着掉回 0。
+		if !stalled {
+			setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionFalse, certsv1alpha1.ReasonCertificateNotReady, "等待 cert-manager 签发")
+		}
 		r.aggregateReady(ac)
+		if stalled {
+			// 首次签发就停滞：Certificate 还没 Ready，没有任何 watch 会因为「又过了一小时」
+			// 而唤醒我们，只能定时重来。
+			return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+		}
 		return ctrl.Result{}, r.patchStatus(ctx, ac, orig)
 	}
 
-	return r.reconcileIssued(ctx, ac, orig, cert)
+	return r.reconcileIssued(ctx, ac, orig, cert, stalled)
 }
 
 // reconcileIssued 处理 Certificate Ready 之后的步骤 5–10。
-func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate) (ctrl.Result, error) {
+//
+// stalled 表示本轮已经判定签发停滞。此时 Secret 里躺着的仍是上一代次那张有效证书，
+// 校验会照常通过——但 Issued 必须保持 False/IssuanceStalled，否则「续期已经卡了三天」
+// 这件事在 condition 与指标上都消失了。除这一句之外，后面的探测 / 上传 / 回收全都照跑。
+func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate, stalled bool) (ctrl.Result, error) {
 	// 5. 读 Secret 并校验
 	b, me := loadMaterial(ctx, r.Client, ac, cert)
 	if me != nil {
@@ -227,7 +244,9 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 		// 不清空 status.current：Secret 短暂异常不能被当成新代次
 		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
 	}
-	setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "Secret 通过校验")
+	if !stalled {
+		setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "Secret 通过校验")
+	}
 
 	// 9. CAS 存在性探测（12h 节流）。spec 把它列在上传之后，代码里必须提前到这里：探测
 	// 的全部作用就是清空 certId 与指纹，好让紧接着的 ensureUploaded 把它当成新代次重传；

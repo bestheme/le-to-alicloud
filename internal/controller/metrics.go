@@ -19,6 +19,7 @@ package controller
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -64,11 +65,38 @@ var (
 		Name: "aliyuncert_cleanup_abandoned_total",
 		Help: "Number of AliyunCertificate deletions that abandoned CAS cleanup",
 	}, []string{"region", "reason"})
+	// spec §10.1 的两个 API 级指标。casUploadTotal / casDeleteTotal 只覆盖写通道，
+	// 而 ListUserCertificateOrder 才是限流最紧（QPS 8、burst 1）也最容易被 RAM 权限
+	// 卡住的那一条：没有它就没人答得上「探测是不是一直在失败」「list 配额打满没有」。
+	aliyunAPIRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aliyuncert_aliyun_api_requests_total",
+		Help: "Aliyun OpenAPI calls by service, action and result code",
+	}, []string{"service", "action", "code"})
+	aliyunAPIDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "aliyuncert_aliyun_api_duration_seconds",
+		Help:    "Aliyun OpenAPI call latency in seconds",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"service", "action"})
 )
+
+// serviceCAS 是 service label 目前唯一的取值：Plan 1 只调 CAS。
+const serviceCAS = "cas"
 
 func init() {
 	metrics.Registry.MustRegister(certNotAfter, certReadyGauge, certIssuanceStalled, issuerDefaultDiverged,
-		casUploadTotal, casDeleteTotal, certManagerCertRecreatedTotal, cleanupAbandonedTotal)
+		casUploadTotal, casDeleteTotal, certManagerCertRecreatedTotal, cleanupAbandonedTotal,
+		aliyunAPIRequestsTotal, aliyunAPIDuration)
+}
+
+// recordAliyunAPICall 是接给 aliyun.CASClientConfig.OnCall 的钩子。
+//
+// 走回调而不是让 pkg/aliyun 直接注册指标：那是一个纯 SDK 封装包，不该依赖
+// controller-runtime 的 metrics registry。label 基数由调用方保证有界——action 是包里
+// 的常量，code 来自 aliyun.callCode（服务端错误码或固定字符串），两者都不含 Message、
+// certId、指纹这类每次都不同的值。
+func recordAliyunAPICall(action, code string, d time.Duration) {
+	aliyunAPIRequestsTotal.WithLabelValues(serviceCAS, action, code).Inc()
+	aliyunAPIDuration.WithLabelValues(serviceCAS, action).Observe(d.Seconds())
 }
 
 // recordCertMetrics 在每次 status patch 前刷新 gauge。
