@@ -30,9 +30,12 @@ import (
 var _ = Describe("AliyunCertificate CRD 校验", func() {
 	ctx := context.Background()
 
+	var ns string
+	BeforeEach(func() { ns = newNamespace(ctx) })
+
 	newAC := func(name string) *certsv1alpha1.AliyunCertificate {
 		return &certsv1alpha1.AliyunCertificate{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: certsv1alpha1.AliyunCertificateSpec{
 				CertificateTemplate: certsv1alpha1.CertificateTemplate{
 					DNSNames: []string{"api.example.com"},
@@ -49,7 +52,7 @@ var _ = Describe("AliyunCertificate CRD 校验", func() {
 		ac := newAC("defaults")
 		Expect(k8sClient.Create(ctx, ac)).To(Succeed())
 		got := &certsv1alpha1.AliyunCertificate{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "defaults", Namespace: "default"}, got)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "defaults", Namespace: ns}, got)).To(Succeed())
 		Expect(got.Spec.Retention.KeepLast).To(Equal(int32(2)))
 		Expect(got.Spec.Retention.MinAge).NotTo(BeNil())
 		Expect(got.Spec.Retention.MinAge.Duration.Hours()).To(Equal(24.0))

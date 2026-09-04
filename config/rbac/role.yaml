@@ -5,6 +5,40 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - delete
+  - get
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - certs.bestheme.ac.cn
+  resources:
+  - aliyuncertificatebindings
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - certs.bestheme.ac.cn
   resources:
   - aliyuncertificates

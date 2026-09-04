@@ -30,9 +30,12 @@ import (
 var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 	ctx := context.Background()
 
+	var ns string
+	BeforeEach(func() { ns = newNamespace(ctx) })
+
 	newBinding := func(name string) *certsv1alpha1.AliyunCertificateBinding {
 		return &certsv1alpha1.AliyunCertificateBinding{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: certsv1alpha1.AliyunCertificateBindingSpec{
 				CertificateRef: certsv1alpha1.LocalObjectReference{Name: "cert"},
 				Target: certsv1alpha1.BindingTarget{
@@ -49,7 +52,7 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 		b := newBinding("defaults")
 		Expect(k8sClient.Create(ctx, b)).To(Succeed())
 		got := &certsv1alpha1.AliyunCertificateBinding{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "defaults", Namespace: "default"}, got)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "defaults", Namespace: ns}, got)).To(Succeed())
 		Expect(got.Spec.DeletionPolicy).To(Equal(certsv1alpha1.DeletionPolicyOrphan))
 		Expect(got.TargetKey()).To(Equal("FC3CustomDomain/cn-hangzhou/api.example.com"))
 	})

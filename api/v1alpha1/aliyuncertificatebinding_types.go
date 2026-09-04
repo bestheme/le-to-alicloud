@@ -112,6 +112,7 @@ type AliyunCertificateBinding struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// +kubebuilder:validation:Required
 	Spec   AliyunCertificateBindingSpec   `json:"spec,omitempty"`
 	Status AliyunCertificateBindingStatus `json:"status,omitempty"`
 }

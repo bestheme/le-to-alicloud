@@ -18,22 +18,31 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -46,7 +55,35 @@ var (
 	testEnv   *envtest.Environment
 	cfg       *rest.Config
 	k8sClient client.Client
+
+	reconciler *AliyunCertificateReconciler
+	fakeCAS    *fake.CAS
+	fakeMu     sync.Mutex
+	nsCounter  int
 )
+
+// currentCAS 让每个测试可以替换 fakeCAS 而 manager 无需重启。
+func currentCAS() *fake.CAS { fakeMu.Lock(); defer fakeMu.Unlock(); return fakeCAS }
+
+// resetCAS 换上一个全新的 fake，返回它以便用例直接断言。
+func resetCAS() *fake.CAS {
+	fakeMu.Lock()
+	defer fakeMu.Unlock()
+	fakeCAS = fake.NewCAS()
+	return fakeCAS
+}
+
+// newNamespace 为每个用例创建独立 namespace，避免资源名冲突。
+func newNamespace(ctx context.Context) string {
+	nsCounter++
+	name := fmt.Sprintf("t%d-%d", GinkgoParallelProcess(), nsCounter)
+	ExpectWithOffset(1, k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}})).To(Succeed())
+	return name
+}
+
+func eventually(fn func() bool) {
+	EventuallyWithOffset(1, fn, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
+}
 
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -88,6 +125,40 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	By("starting the controller manager")
+	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+		Client: client.Options{Cache: &client.CacheOptions{
+			DisableFor: []client.Object{&corev1.Secret{}}, // 与生产一致：Secret 不进 cache
+		}},
+	})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(RegisterIndexes(k8sManager)).To(Succeed())
+
+	resetCAS()
+	reconciler = &AliyunCertificateReconciler{
+		Client:    k8sManager.GetClient(),
+		APIReader: k8sManager.GetAPIReader(),
+		Scheme:    k8sManager.GetScheme(),
+		Recorder:  k8sManager.GetEventRecorderFor("aliyuncertificate"),
+		CASFactory: func(context.Context, *certsv1alpha1.AliyunCertificate) (aliyun.CASClient, error) {
+			return currentCAS(), nil
+		},
+		ResyncInterval:         time.Hour,
+		CASProbeInterval:       12 * time.Hour,
+		IssuanceStallThreshold: 6 * time.Hour,
+		CleanupGracePeriod:     15 * time.Minute,
+		CleanupFailurePolicy:   CleanupPolicyAbandon,
+	}
+	reconciler.SetIssuerDefaults(IssuerDefaults{Name: "letsencrypt-prod", Kind: "ClusterIssuer"})
+	Expect(reconciler.SetupWithManager(k8sManager)).To(Succeed())
+
+	go func() {
+		defer GinkgoRecover()
+		Expect(k8sManager.Start(ctx)).To(Succeed())
+	}()
 })
 
 var _ = AfterSuite(func() {

@@ -212,6 +212,7 @@ type AliyunCertificate struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// +kubebuilder:validation:Required
 	Spec   AliyunCertificateSpec   `json:"spec,omitempty"`
 	Status AliyunCertificateStatus `json:"status,omitempty"`
 }
