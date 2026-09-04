@@ -85,7 +85,7 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	if names := activeBindingNames(bindings); len(names) > 0 {
 		msg := "仍被 Binding 引用: " + strings.Join(names, ", ")
 		setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonDeletionBlocked, msg)
-		r.Recorder.Event(ac, corev1.EventTypeWarning, "DeletionBlocked", msg)
+		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonDeletionBlocked, msg)
 		return ctrl.Result{}, r.patchStatus(ctx, ac, orig) // Binding 变化会通过 watch 唤醒
 	}
 
@@ -111,11 +111,22 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 			return ctrl.Result{}, err // 指数退避
 		}
 		// Abandon：把足以人工兜底的信息留在日志里，然后继续走完删除。
-		ids := remainingCertIDs(ac)
 		region := ac.Spec.Aliyun.EffectiveCASRegion()
-		log.Error(err, "cleanup abandoned", "region", region, "certIds", ids, "gracePeriod", r.CleanupGracePeriod)
+		kv := []any{"region", region, "certIds", remainingCertIDs(ac), "gracePeriod", r.CleanupGracePeriod}
+		if p := ac.Status.PendingUpload; p != nil {
+			// 这一张没有 certId 可报，名字是人工去 CAS 里找到它的唯一线索。
+			kv = append(kv, "pendingCASName", p.CASName)
+		}
+		log.Error(err, "cleanup abandoned", kv...)
 		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonCleanupAbandoned, cleanupAbandonedMessage)
 		cleanupAbandonedTotal.WithLabelValues(region, aliyun.ClassOf(err).String()).Inc()
+	}
+
+	// CAS 侧的进展必须先落盘再往下走。否则下一轮会对着同一批 certId 再删一次（靠
+	// NotFound 吸收），而临近宽限期到期时，那多出来的一次调用只要撞上限流，就会被
+	// 当成「清理仍在失败」而误报 CleanupAbandoned。
+	if err := r.patchStatus(ctx, ac, orig); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// c. 显式删除 Certificate 并等它消失。ownerRef 级联删除是异步的，而 cert-manager
@@ -151,9 +162,8 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 
 // remainingCertIDs 返回 status 中仍记着 certId 的代次。
 //
-// status.pendingUpload 没有 certId——那条记录存在恰恰是因为上传结果没拿到。若清理时
-// 正好卡在这个窗口，那张证书只能靠 CAS 探测（Task 14 的 FindUploaded）或人工兜底，
-// 这里报不出它的 ID，是 Abandon 路径的已知边界。
+// 只覆盖 current 与 history：pendingUpload 那一张按定义还没有 certId，它由
+// cleanupPendingUpload 按名字单独认领，Abandon 时也单独记 pendingCASName。
 func remainingCertIDs(ac *certsv1alpha1.AliyunCertificate) []int64 {
 	var ids []int64
 	if ac.Status.Current != nil && ac.Status.Current.CertID != nil {
@@ -167,10 +177,12 @@ func remainingCertIDs(ac *certsv1alpha1.AliyunCertificate) []int64 {
 	return ids
 }
 
-// cleanupCAS 删除 status 中记录的全部代次；成功的把 certId 清空，任一失败立即返回。
-// 调用方在失败路径上会 patch status，于是已经删掉的代次不会在下一轮被重复删除。
+// cleanupCAS 删除 status 记录的全部代次，外加一次 in-flight 的 pendingUpload；成功的
+// 把 certId / pendingUpload 清空，任一失败立即返回。调用方两条路径上都会 patch status，
+// 于是已经删掉的东西不会在下一轮被重复删除。
 func (r *AliyunCertificateReconciler) cleanupCAS(ctx context.Context, ac *certsv1alpha1.AliyunCertificate) error {
-	if len(remainingCertIDs(ac)) == 0 {
+	// pendingUpload 也算「还有事可做」：那次上传可能已经在服务端落地了，只是响应丢了。
+	if len(remainingCertIDs(ac)) == 0 && ac.Status.PendingUpload == nil {
 		return nil
 	}
 	cas, err := r.casClient(ctx, ac)
@@ -181,11 +193,8 @@ func (r *AliyunCertificateReconciler) cleanupCAS(ctx context.Context, ac *certsv
 		if gen == nil || gen.CertID == nil {
 			return nil
 		}
-		token := naming.ClientToken(ac.UID, gen.Fingerprint) + "d" // 与上传 token 区分
-		if len(token) > 64 {
-			token = token[:64]
-		}
-		if err := cas.Delete(ctx, *gen.CertID, token); err != nil && aliyun.ClassOf(err) != aliyun.ClassNotFound {
+		if err := cas.Delete(ctx, *gen.CertID, deleteToken(naming.ClientToken(ac.UID, gen.Fingerprint))); err != nil &&
+			aliyun.ClassOf(err) != aliyun.ClassNotFound {
 			return err
 		}
 		gen.CertID = nil
@@ -196,5 +205,57 @@ func (r *AliyunCertificateReconciler) cleanupCAS(ctx context.Context, ac *certsv
 			return err
 		}
 	}
-	return del(ac.Status.Current)
+	if err := del(ac.Status.Current); err != nil {
+		return err
+	}
+	return r.cleanupPendingUpload(ctx, cas, ac)
+}
+
+// cleanupPendingUpload 回收 write-ahead 记录指向的那一张证书。
+//
+// pendingUpload 存在，恰恰意味着上传的结果没拿到：证书可能已经在服务端落地，也可能
+// 根本没建成，status 里没有 certId 可用。删除路径不会再走 upload.go 的解析逻辑，所以
+// 这里必须自己按名字去云上认领一次，否则那张证书会被永久且无痕地孤儿化。
+func (r *AliyunCertificateReconciler) cleanupPendingUpload(ctx context.Context, cas aliyun.CASClient, ac *certsv1alpha1.AliyunCertificate) error {
+	p := ac.Status.PendingUpload
+	if p == nil {
+		return nil
+	}
+	list, err := cas.FindUploaded(ctx, casDomainHint(ac))
+	if err != nil {
+		return err
+	}
+	for _, c := range list {
+		if c.Name != p.CASName {
+			continue
+		}
+		if err := cas.Delete(ctx, c.CertID, deleteToken(p.ClientToken)); err != nil &&
+			aliyun.ClassOf(err) != aliyun.ClassNotFound {
+			return err
+		}
+		break
+	}
+	// 认领并删掉了，或者列表里根本没有这个名字——后者说明那次上传从未在服务端落地，
+	// 同样没有东西需要回收。两种情形都可以把记录抹掉。
+	ac.Status.PendingUpload = nil
+	return nil
+}
+
+// casDomainHint 返回 FindUploaded 的 Keyword。删除路径读不到 Secret 里的 SAN（Secret
+// 可能已经不在了），只能退回 spec 声明的域名。
+func casDomainHint(ac *certsv1alpha1.AliyunCertificate) string {
+	if names := ac.Spec.CertificateTemplate.DNSNames; len(names) > 0 {
+		return names[0]
+	}
+	return ac.Spec.CertificateTemplate.CommonName
+}
+
+// deleteToken 由上传 token 派生出删除用的幂等令牌：加后缀与上传区分，并守住 CAS 的
+// 64 字符上限。
+func deleteToken(uploadToken string) string {
+	t := uploadToken + "d"
+	if len(t) > 64 {
+		t = t[:64]
+	}
+	return t
 }

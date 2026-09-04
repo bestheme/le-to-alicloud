@@ -34,6 +34,7 @@ import (
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki/testutil"
 )
 
@@ -46,6 +47,88 @@ func TestActiveBindingNames(t *testing.T) {
 	got := activeBindingNames(bs)
 	if len(got) != 1 || got[0] != "alive" {
 		t.Fatalf("正在删除中的 Binding 不应计入: %v", got)
+	}
+}
+
+// uploadOnceThenFail 精确制造出 in-flight 窗口：第一次 Upload 照常打到底层 fake（服务端
+// 真的落地一张证书）但返回 retryable 错误，模拟「服务端成功、响应丢失」；之后每一次都在
+// 到达 fake 之前失败，免得 ClientToken 幂等把 pendingUpload 又自动接上。
+//
+// 用包装器而不是 fake 的 QueueUploadErr：排队的错误在 fake 里是最先被 pop 的，会抢在
+// 写入之前返回，那样服务端上根本不会有证书，也就没有孤儿可回收了。
+type uploadOnceThenFail struct {
+	aliyun.CASClient
+	mu   sync.Mutex
+	done bool
+}
+
+func (u *uploadOnceThenFail) Upload(ctx context.Context, name string, certPEM, keyPEM []byte, token string) (int64, error) {
+	u.mu.Lock()
+	first := !u.done
+	u.done = true
+	u.mu.Unlock()
+
+	lost := &aliyun.Error{Class: aliyun.ClassRetryable, Op: "Upload", Code: "Timeout", Err: errors.New("response lost")}
+	if !first {
+		return 0, lost
+	}
+	if _, err := u.CASClient.Upload(ctx, name, certPEM, keyPEM, token); err != nil {
+		return 0, err
+	}
+	return 0, lost
+}
+
+// TestCleanupPendingUploadNotOnServer 覆盖「write-ahead 记录存在，但那次上传其实从未在
+// 服务端落地」：CAS 上没有同名证书，应当直接把记录抹掉，既不报错也不乱删别人的证书。
+func TestCleanupPendingUploadNotOnServer(t *testing.T) {
+	ctx := context.Background()
+	f := fake.NewCAS()
+	// 云上放一张同域名的别的证书，确保「通过」不是因为列表本来就是空的
+	other, err := f.Upload(ctx, "api_other_0011223344", nil, nil, "tok-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &AliyunCertificateReconciler{
+		CASFactory: func(context.Context, *certsv1alpha1.AliyunCertificate) (aliyun.CASClient, error) { return f, nil },
+	}
+	ac := &certsv1alpha1.AliyunCertificate{
+		Spec: certsv1alpha1.AliyunCertificateSpec{
+			CertificateTemplate: certsv1alpha1.CertificateTemplate{DNSNames: []string{"api.example.com"}},
+		},
+		Status: certsv1alpha1.AliyunCertificateStatus{
+			PendingUpload: &certsv1alpha1.PendingUpload{CASName: "api_deadbeefcafe", ClientToken: "tok"},
+		},
+	}
+
+	if err := r.cleanupCAS(ctx, ac); err != nil {
+		t.Fatalf("列表里没有同名证书说明从未上传成功，不该报错: %v", err)
+	}
+	if ac.Status.PendingUpload != nil {
+		t.Error("pendingUpload 应被清空")
+	}
+	if f.FindCalls() != 1 {
+		t.Errorf("FindCalls = %d, want 1（必须真的去云上认领过一次）", f.FindCalls())
+	}
+	if f.DeleteCalls() != 0 {
+		t.Errorf("DeleteCalls = %d, want 0（不该误删同域名的其它证书）", f.DeleteCalls())
+	}
+	if !f.Has(other) {
+		t.Error("别人的证书不该被删掉")
+	}
+}
+
+// TestCasDomainHint 固定 hint 的回退顺序：dnsNames[0] → commonName。
+func TestCasDomainHint(t *testing.T) {
+	tmpl := func(dns []string, cn string) *certsv1alpha1.AliyunCertificate {
+		return &certsv1alpha1.AliyunCertificate{Spec: certsv1alpha1.AliyunCertificateSpec{
+			CertificateTemplate: certsv1alpha1.CertificateTemplate{DNSNames: dns, CommonName: cn},
+		}}
+	}
+	if got := casDomainHint(tmpl([]string{"a.example.com", "b.example.com"}, "cn.example.com")); got != "a.example.com" {
+		t.Errorf("有 dnsNames 时应取第一个，得到 %q", got)
+	}
+	if got := casDomainHint(tmpl(nil, "cn.example.com")); got != "cn.example.com" {
+		t.Errorf("没有 dnsNames 时应回退 commonName，得到 %q", got)
 	}
 }
 
@@ -114,6 +197,44 @@ var _ = Describe("证书 controller：删除", func() {
 		Expect(currentCAS().Has(certID)).To(BeFalse())
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "del"}, &cmapi.Certificate{}))).To(BeTrue())
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "del-tls"}, &corev1.Secret{}))).To(BeTrue())
+	})
+
+	// in-flight 的 pendingUpload：证书已经在服务端落地，响应却丢了，status 上只有
+	// write-ahead 记录、没有 certId。删除路径不会再走 upload.go 的解析，必须自己按名字
+	// 去云上认领，否则这张证书会被永久且无痕地孤儿化。
+	It("pendingUpload 在删除时被清理", func() {
+		ns := newNamespace(ctx)
+		// CR 名字决定 CAS 名（naming.CASName 用的是 CR 名，不是域名），而 fake 的
+		// FindUploaded 只能拿名字近似 Keyword 匹配（它不解析 PEM）。取 "api" 才能让
+		// fake 表现得和真实 CAS 一样：那张证书的 SAN 确实是 api.example.com。
+		Expect(k8sClient.Create(ctx, baseAC(ns, "api"))).To(Succeed())
+
+		wrapped := &uploadOnceThenFail{CASClient: currentCAS()}
+		prev := reconciler.CASFactory
+		reconciler.CASFactory = func(context.Context, *certsv1alpha1.AliyunCertificate) (aliyun.CASClient, error) {
+			return wrapped, nil
+		}
+		DeferCleanup(func() { reconciler.CASFactory = prev })
+
+		crt, key := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
+		simulateIssuance(ctx, ns, "api", 1, crt, key)
+
+		eventually(func() bool {
+			a := getAC(ctx, ns, "api")
+			return a.Status.PendingUpload != nil && a.Status.Current == nil
+		})
+		Expect(currentCAS().Certs()).To(HaveLen(1), "服务端应已落地一张无人认领的证书")
+		orphan := currentCAS().Certs()[0].ID
+		Expect(getAC(ctx, ns, "api").Status.PendingUpload.CASName).To(Equal(currentCAS().Certs()[0].Name))
+
+		Expect(k8sClient.Delete(ctx, getAC(ctx, ns, "api"))).To(Succeed())
+
+		eventually(func() bool {
+			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "api"}, &certsv1alpha1.AliyunCertificate{})
+			return apierrors.IsNotFound(err)
+		})
+		Expect(currentCAS().Has(orphan)).To(BeFalse(), "in-flight 的那张证书必须被回收，不能静默孤儿化")
+		Expect(currentCAS().FindCalls()).To(BeNumerically(">=", 1), "回收它只能靠按名字去云上认领")
 	})
 
 	It("有活着的 Binding 引用时阻塞，Binding 删除后继续", func() {
