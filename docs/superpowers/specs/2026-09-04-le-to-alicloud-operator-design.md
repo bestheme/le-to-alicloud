@@ -754,7 +754,7 @@ type FC3Client interface {
 | 6 | 给 TLS Secret 追加指向 AliyunCertificate 的 ownerRef，cert-manager 的 SSA 是否保留 | 若保留，可消掉 `secrets: delete` 和 finalizer 顺序难题 |
 | 7 | Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision` | 不缓存 Secret 决定的盲区大小 |
 | 8 | CAS 单账号上传证书数量配额 | `cleanup_abandoned_total` 是否必须配告警 |
-| 9 | CAS endpoint 是否 region 化 | `casRegion` 语义 |
+| 9 | ~~CAS endpoint 是否 region 化~~ **已核实**（Go SDK v4 内置 `EndpointMap`）：全部中国区域及 `eu-west-1` / `us-east-1` / `us-west-1` 映射到同一个 `cas.aliyuncs.com`；`ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `me-central-1` / `ap-south-1` / `me-east-1` 各有独立 endpoint（`cas.<region>.aliyuncs.com`）。结论：CAS **部分 region 化**，`casRegion` 字段保留；实现上把 `casRegion` 作为 SDK `RegionId` 传入，由 SDK 的 `EndpointRule=regional` 自动选 endpoint，`endpointOverride` 非空时直接覆盖 | `casRegion` 语义已定；仍需实测同一账号在 `cas.aliyuncs.com` 与 `cas.ap-southeast-1.aliyuncs.com` 上传的证书是否互相可见 |
 | 10 | FC3 API 账号级频控阈值与 Throttling 错误码 | drift 1h 在数百 Binding 下是否安全；错误分类表 |
 | 11 | cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在 | `SecretNameConflict` 判定依据 |
 
