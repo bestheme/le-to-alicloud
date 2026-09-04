@@ -149,7 +149,9 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if conflict {
 			setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonSecretNameConflict,
 				fmt.Sprintf("Secret %q 已存在且不属于本证书", secretNameFor(ac)))
-			return ctrl.Result{}, r.patchStatus(ctx, ac, orig)
+			// 这条路径上没有任何 watch 能唤醒我们：Certificate 从未创建（Owns 无对象），
+			// Secret 刻意不进 cache 也不 watch。占用者被删掉后只能靠定时重试自愈。
+			return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
 		}
 	}
 

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
@@ -148,17 +149,30 @@ var _ = Describe("证书 controller：基础 reconcile", func() {
 	})
 
 	It("目标 Secret 已被占用时 Ready=False/SecretNameConflict", func() {
+		// 冲突分支没有 watch 能唤醒它，只能靠 RequeueAfter 自愈；requeue 的时长在冲突那一次
+		// reconcile 时就定死了，所以必须在创建 CR 之前把周期调短，否则要等满 1h。
+		reconciler.ResyncInterval = 500 * time.Millisecond
+		DeferCleanup(func() { reconciler.ResyncInterval = time.Hour })
+
 		ns := newNamespace(ctx)
-		Expect(k8sClient.Create(ctx, &corev1.Secret{
+		occupied := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "taken-tls", Namespace: ns},
 			Data:       map[string][]byte{"foo": []byte("bar")},
-		})).To(Succeed())
+		}
+		Expect(k8sClient.Create(ctx, occupied)).To(Succeed())
 		Expect(k8sClient.Create(ctx, baseAC(ns, "taken"))).To(Succeed())
 		eventually(func() bool {
 			return condReason(getAC(ctx, ns, "taken"), certsv1alpha1.ConditionReady) == certsv1alpha1.ReasonSecretNameConflict
 		})
 		_, err := getCert(ctx, ns, "taken")
 		Expect(err).To(HaveOccurred())
+
+		// 占用者被删掉后，下一次 requeue 应当自愈：创建 Certificate、脱离 SecretNameConflict。
+		Expect(k8sClient.Delete(ctx, occupied)).To(Succeed())
+		eventually(func() bool { _, err := getCert(ctx, ns, "taken"); return err == nil })
+		eventually(func() bool {
+			return condReason(getAC(ctx, ns, "taken"), certsv1alpha1.ConditionReady) != certsv1alpha1.ReasonSecretNameConflict
+		})
 	})
 
 	It("Certificate Ready 后 Issued=True（Secret 校验由 Task 11 收紧）", func() {
