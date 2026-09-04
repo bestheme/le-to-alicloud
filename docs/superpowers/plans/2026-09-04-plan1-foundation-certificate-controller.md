@@ -5372,10 +5372,10 @@ type operatorOptions struct {
 	WatchNamespaces                                             []string
 }
 
-func parseOperatorFlags(args []string) (*operatorOptions, error) {
-	fs := flag.NewFlagSet("operator", flag.ContinueOnError)
+// registerOperatorFlags 把 flag 注册到给定 FlagSet；main 传 flag.CommandLine，测试传新建的 FlagSet。
+// 返回的 options 在 fs.Parse 之后才有值，随后必须调用 validate()。
+func registerOperatorFlags(fs *flag.FlagSet) *operatorOptions {
 	o := &operatorOptions{}
-	var ns string
 	fs.StringVar(&o.DefaultIssuerName, "default-issuer-name", "", "Name of the Issuer to use when spec.certificateTemplate.issuerRef is not set")
 	fs.StringVar(&o.DefaultIssuerKind, "default-issuer-kind", "Issuer", "Kind of the default issuer")
 	fs.StringVar(&o.DefaultIssuerGroup, "default-issuer-group", "cert-manager.io", "Group of the default issuer")
@@ -5386,34 +5386,39 @@ func parseOperatorFlags(args []string) (*operatorOptions, error) {
 	fs.DurationVar(&o.CloudCallTimeout, "cloud-call-timeout", 30*time.Second, "Timeout for every Alibaba Cloud API call")
 	fs.DurationVar(&o.CleanupGracePeriod, "cleanup-grace-period", 15*time.Minute, "How long to retry cloud cleanup in finalizers before applying cleanup-failure-policy")
 	fs.StringVar(&o.CleanupFailurePolicy, "cleanup-failure-policy", "Abandon", "Abandon | Block")
-	fs.StringVar(&ns, "watch-namespaces", "", "Comma-separated namespaces to watch; empty = all")
+	fs.StringVar(&o.watchNamespacesRaw, "watch-namespaces", "", "Comma-separated namespaces to watch; empty = all")
+	return o
+}
+
+// validate 在 Parse 之后校验并展开派生字段。
+func (o *operatorOptions) validate() error {
+	if o.CleanupFailurePolicy != controller.CleanupPolicyAbandon && o.CleanupFailurePolicy != controller.CleanupPolicyBlock {
+		return fmt.Errorf("--cleanup-failure-policy 必须是 Abandon 或 Block，得到 %q", o.CleanupFailurePolicy)
+	}
+	o.WatchNamespaces = nil
+	for _, n := range strings.Split(o.watchNamespacesRaw, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			o.WatchNamespaces = append(o.WatchNamespaces, n)
+		}
+	}
+	return nil
+}
+
+// parseOperatorFlags 供测试使用：独立 FlagSet 上注册、解析、校验。
+func parseOperatorFlags(args []string) (*operatorOptions, error) {
+	fs := flag.NewFlagSet("operator", flag.ContinueOnError)
+	o := registerOperatorFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
-	if o.CleanupFailurePolicy != controller.CleanupPolicyAbandon && o.CleanupFailurePolicy != controller.CleanupPolicyBlock {
-		return nil, fmt.Errorf("--cleanup-failure-policy 必须是 Abandon 或 Block，得到 %q", o.CleanupFailurePolicy)
-	}
-	if ns != "" {
-		for _, n := range strings.Split(ns, ",") {
-			if n = strings.TrimSpace(n); n != "" {
-				o.WatchNamespaces = append(o.WatchNamespaces, n)
-			}
-		}
+	if err := o.validate(); err != nil {
+		return nil, err
 	}
 	return o, nil
 }
 ```
 
-因为脚手架用全局 `flag.CommandLine`，在 `main()` 中把两组 flag 合并：先把 operator 的 flag 也注册到 `flag.CommandLine`（复用同一个注册函数，签名改为接受 `*flag.FlagSet`），或者最简单——`parseOperatorFlags` 接受 `fs *flag.FlagSet`，`main()` 传 `flag.CommandLine`，测试传新建的 FlagSet。以下 `main()` 片段按后者写：
 
-```go
-	opts, err := registerOperatorFlags(flag.CommandLine) // 返回指针，值在 flag.Parse() 后填充
-	// ...脚手架原有 flag 注册...
-	flag.Parse()
-	if err := opts.validate(); err != nil { setupLog.Error(err, "invalid flags"); os.Exit(1) }
-```
-
-（测试文件中的 `parseOperatorFlags(args)` 实现为：新建 FlagSet → `registerOperatorFlags` → `Parse(args)` → `validate()`。）
 
 manager 构造：
 
