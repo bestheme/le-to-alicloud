@@ -75,6 +75,38 @@ func TestFake_DeleteNotFound(t *testing.T) {
 	}
 }
 
+// TestFake_DeleteClearsToken 固定 Task 14 依赖的行为：证书被删后，同一 ClientToken
+// 再次 Upload 必须当作全新上传，返回新的 ID，而不是那个已经消失的旧 ID。
+func TestFake_DeleteClearsToken(t *testing.T) {
+	f := fake.NewCAS()
+	ctx := context.Background()
+
+	id1, err := f.Upload(ctx, "tok_reuse", nil, nil, "same-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Delete(ctx, id1, ""); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	id2, err := f.Upload(ctx, "tok_reuse", nil, nil, "same-token")
+	if err != nil {
+		t.Fatalf("删除后重传应成功: %v", err)
+	}
+	if id2 == id1 {
+		t.Fatalf("删除后同 token 重传应得到新 ID，仍是 %d", id2)
+	}
+	if !f.Has(id2) {
+		t.Errorf("Has(%d) 应为 true", id2)
+	}
+	if f.Has(id1) {
+		t.Errorf("旧 ID %d 不应复活", id1)
+	}
+	if len(f.Certs()) != 1 {
+		t.Errorf("应只剩 1 张证书，得到 %d", len(f.Certs()))
+	}
+}
+
 func TestFake_DeleteRemoves(t *testing.T) {
 	f := fake.NewCAS()
 	ctx := context.Background()

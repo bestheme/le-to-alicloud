@@ -175,7 +175,7 @@ var _ = Describe("证书 controller：基础 reconcile", func() {
 		})
 	})
 
-	It("Certificate Ready 后 Issued=True（Secret 校验由 Task 11 收紧）", func() {
+	It("Certificate Ready 但 Secret 缺失时 Issued=False/SecretNotFound", func() {
 		ns := newNamespace(ctx)
 		Expect(k8sClient.Create(ctx, baseAC(ns, "ready"))).To(Succeed())
 		eventually(func() bool { _, err := getCert(ctx, ns, "ready"); return err == nil })
@@ -184,9 +184,12 @@ var _ = Describe("证书 controller：基础 reconcile", func() {
 		cert.Status.Revision = &rev
 		cert.Status.Conditions = []cmapi.CertificateCondition{{Type: cmapi.CertificateConditionReady, Status: cmmeta.ConditionTrue, LastTransitionTime: &metav1.Time{Time: metav1.Now().Time}}}
 		Expect(k8sClient.Status().Update(ctx, cert)).To(Succeed())
+		// Certificate Ready 只是必要条件：Secret 还没落地，Issued 必须留在 False。
 		eventually(func() bool {
 			ac := getAC(ctx, ns, "ready")
-			return condTrue(ac, certsv1alpha1.ConditionIssued) && ac.Status.Issuance != nil && ac.Status.Issuance.Revision != nil && *ac.Status.Issuance.Revision == 1
+			return condReason(ac, certsv1alpha1.ConditionIssued) == certsv1alpha1.ReasonSecretNotFound &&
+				!condTrue(ac, certsv1alpha1.ConditionIssued) &&
+				ac.Status.Issuance != nil && ac.Status.Issuance.Revision != nil && *ac.Status.Issuance.Revision == 1
 		})
 	})
 })

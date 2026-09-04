@@ -125,6 +125,13 @@ func (f *CAS) Delete(_ context.Context, certID int64, _ string) error {
 		return &aliyun.Error{Class: aliyun.ClassNotFound, Op: "Delete", Code: "CertNotExist", Err: errors.New("not found")}
 	}
 	delete(f.certs, certID)
+	// 证书没了，指向它的幂等映射也必须失效：否则同 token 再次 Upload 会返回一个
+	// 已经不存在的 ID，controller 会以为「云上还在」而永远不重传。
+	for tok, id := range f.byToken {
+		if id == certID {
+			delete(f.byToken, tok)
+		}
+	}
 	return nil
 }
 

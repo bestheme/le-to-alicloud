@@ -1,0 +1,78 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki"
+)
+
+// materialError 是可直接写进 condition 的校验失败。
+type materialError struct {
+	Reason  string
+	Message string
+}
+
+// loadMaterial 直读 Secret（不经 cache），解析并校验。任何失败都不上传。
+func loadMaterial(ctx context.Context, reader client.Reader, ac *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate) (*pki.Bundle, *materialError) {
+	s := &corev1.Secret{}
+	err := reader.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: secretNameFor(ac)}, s)
+	if apierrors.IsNotFound(err) {
+		return nil, &materialError{certsv1alpha1.ReasonSecretNotFound, fmt.Sprintf("Secret %q 不存在", secretNameFor(ac))}
+	}
+	if err != nil {
+		return nil, &materialError{certsv1alpha1.ReasonSecretInvalid, "读取 Secret 失败: " + err.Error()}
+	}
+	b, err := pki.ParseBundle(s.Data[corev1.TLSCertKey], s.Data[corev1.TLSPrivateKeyKey])
+	if err != nil {
+		// pki 的错误只描述格式问题，不含密钥内容，可安全写入 message
+		return nil, &materialError{certsv1alpha1.ReasonSecretInvalid, err.Error()}
+	}
+	if me := validateMaterial(b, ac, cert); me != nil {
+		return nil, me
+	}
+	return b, nil
+}
+
+// validateMaterial 实施 spec §5.4 的规则 4–5（1–3 与 6 在 pki.ParseBundle 内完成）。
+func validateMaterial(b *pki.Bundle, ac *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate) *materialError {
+	// 规则 5：临时证书 = 自签 AND cert-manager 正在签发。
+	// 只用合取：SelfSigned issuer 的正式证书也是自签，但此时 Issuing=False，必须放行。
+	if issuing, _ := certIssuingSince(cert); issuing && b.IsSelfSigned() {
+		return &materialError{certsv1alpha1.ReasonSelfSignedDuringIssuance, "Secret 中是 cert-manager 的临时自签证书，等待正式签发"}
+	}
+
+	// 规则 4：leaf SANs 必须覆盖 spec 声明的全部域名。
+	required := append([]string(nil), ac.Spec.CertificateTemplate.DNSNames...)
+	if cn := ac.Spec.CertificateTemplate.CommonName; cn != "" {
+		required = append(required, cn)
+	}
+	if missing := pki.Missing(b.DNSNames(), required); len(missing) > 0 {
+		return &materialError{certsv1alpha1.ReasonSANsMismatch, "证书未覆盖: " + strings.Join(missing, ", ")}
+	}
+	return nil
+}

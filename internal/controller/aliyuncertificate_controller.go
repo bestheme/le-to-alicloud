@@ -18,13 +18,16 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -180,12 +183,12 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionFalse, certsv1alpha1.ReasonIssuanceStalled,
 			fmt.Sprintf("cert-manager Issuing 已持续 %s", r.now().Sub(since).Truncate(time.Minute)))
 		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonIssuanceStalled, "cert-manager issuance stalled")
-		setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonIssuanceStalled, "issuance stalled")
+		r.aggregateReady(ac)
 		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
 	}
 	if !certReady(cert) {
 		setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionFalse, certsv1alpha1.ReasonCertificateNotReady, "等待 cert-manager 签发")
-		setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonCertificateNotReady, "等待 cert-manager 签发")
+		r.aggregateReady(ac)
 		return ctrl.Result{}, r.patchStatus(ctx, ac, orig)
 	}
 
@@ -193,11 +196,92 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	return r.reconcileIssued(ctx, ac, orig, cert)
 }
 
-// reconcileIssued 是 Certificate Ready 之后的流程（Task 11 起替换本实现）。
-func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, _ *cmapi.Certificate) (ctrl.Result, error) {
-	setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "cert-manager Certificate Ready")
-	setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "")
+// reconcileIssued 处理 Certificate Ready 之后的步骤 5–10。
+func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate) (ctrl.Result, error) {
+	// 5. 读 Secret 并校验
+	b, me := loadMaterial(ctx, r.Client, ac, cert)
+	if me != nil {
+		setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionFalse, me.Reason, me.Message)
+		if me.Reason == certsv1alpha1.ReasonSelfSignedDuringIssuance {
+			r.Recorder.Event(ac, corev1.EventTypeWarning, me.Reason, me.Message)
+		}
+		r.aggregateReady(ac)
+		// 不清空 status.current：Secret 短暂异常不能被当成新代次
+		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+	}
+	setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "Secret 通过校验")
+
+	// 6–7. 上传（含短路）
+	if _, err := r.ensureUploaded(ctx, ac, b); err != nil {
+		return r.handleCloudError(ctx, ac, orig, "Upload", err)
+	}
+	r.setUploadedCondition(ac)
+
+	// 8–9. 回收与探测由 Task 12 / 14 接入
+	r.aggregateReady(ac)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+}
+
+// setUploadedCondition 依据 status.current 与 uploadToCAS 设置 Uploaded。
+func (r *AliyunCertificateReconciler) setUploadedCondition(ac *certsv1alpha1.AliyunCertificate) {
+	switch {
+	case !ac.Spec.Aliyun.UploadEnabled():
+		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionFalse, certsv1alpha1.ReasonUploadDisabled, "spec.aliyun.uploadToCAS=false")
+	case ac.Status.Current != nil && ac.Status.Current.CertID != nil:
+		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionTrue, certsv1alpha1.ReasonReady, fmt.Sprintf("certId=%d", *ac.Status.Current.CertID))
+	default:
+		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionFalse, certsv1alpha1.ReasonUploadFailed, "尚未上传")
+	}
+}
+
+// aggregateReady：Ready = Issued && (Uploaded || !uploadToCAS)。IssuerDefaultDiverged 不参与。
+func (r *AliyunCertificateReconciler) aggregateReady(ac *certsv1alpha1.AliyunCertificate) {
+	issued := condTrue(ac, certsv1alpha1.ConditionIssued)
+	uploadedOK := !ac.Spec.Aliyun.UploadEnabled() || condTrue(ac, certsv1alpha1.ConditionUploaded)
+	if issued && uploadedOK {
+		setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "")
+		return
+	}
+	reason := certsv1alpha1.ReasonCertificateNotReady
+	if c := meta.FindStatusCondition(ac.Status.Conditions, certsv1alpha1.ConditionIssued); c != nil && c.Status != metav1.ConditionTrue {
+		reason = c.Reason
+	} else if c := meta.FindStatusCondition(ac.Status.Conditions, certsv1alpha1.ConditionUploaded); c != nil && c.Status != metav1.ConditionTrue {
+		reason = c.Reason
+	}
+	setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, reason, "")
+}
+
+// handleCloudError 把阿里云 / 凭证错误映射为 condition 与 requeue 策略。
+func (r *AliyunCertificateReconciler) handleCloudError(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, op string, err error) (ctrl.Result, error) {
+	var ce *credentialsError
+	if errors.As(err, &ce) {
+		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionFalse, ce.Reason, ce.Error())
+		r.aggregateReady(ac)
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, r.patchStatus(ctx, ac, orig)
+	}
+	switch aliyun.ClassOf(err) {
+	case aliyun.ClassRetryable:
+		reason := certsv1alpha1.ReasonUploadFailed
+		var ae *aliyun.Error
+		if errors.As(err, &ae) && strings.HasPrefix(ae.Code, "Throttling") {
+			reason = certsv1alpha1.ReasonThrottled
+		}
+		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionFalse, reason, op+" 失败，将重试")
+		r.aggregateReady(ac)
+		if perr := r.patchStatus(ctx, ac, orig); perr != nil {
+			return ctrl.Result{}, perr
+		}
+		return ctrl.Result{}, err // 交给 controller-runtime 指数退避
+	case aliyun.ClassAuth:
+		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionFalse, certsv1alpha1.ReasonCredentialsInvalid, op+" 被拒绝: "+err.Error())
+		r.aggregateReady(ac)
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, r.patchStatus(ctx, ac, orig)
+	default:
+		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionFalse, certsv1alpha1.ReasonUploadFailed, op+" 失败: "+err.Error())
+		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonUploadFailed, op+" failed")
+		r.aggregateReady(ac)
+		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+	}
 }
 
 // reconcileDelete 是删除分支（Task 13 替换本实现）。

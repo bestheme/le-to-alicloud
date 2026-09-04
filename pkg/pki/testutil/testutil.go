@@ -11,9 +11,18 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"testing"
 	"time"
 )
+
+// TB 是 testutil 需要的最小测试接口。
+// 不用 testing.TB：Go 1.25 起 testing.TB 新增了 ArtifactDir，而 Ginkgo 的 GinkgoT()
+// 尚未实现它，envtest 用例就没法把 GinkgoT() 传进来。这三个方法 *testing.T 与
+// GinkgoT() 都提供。
+type TB interface {
+	Helper()
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+}
 
 // CA 是测试用中间 CA（自签根，直接签 leaf，模拟 LE 的 leaf+intermediate 形状时把它当 intermediate）。
 type CA struct {
@@ -21,7 +30,7 @@ type CA struct {
 	Key  crypto.Signer
 }
 
-func mustKey(t testing.TB) *ecdsa.PrivateKey {
+func mustKey(t TB) *ecdsa.PrivateKey {
 	t.Helper()
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -30,7 +39,7 @@ func mustKey(t testing.TB) *ecdsa.PrivateKey {
 	return k
 }
 
-func serial(t testing.TB) *big.Int {
+func serial(t TB) *big.Int {
 	t.Helper()
 	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
 	if err != nil {
@@ -40,7 +49,7 @@ func serial(t testing.TB) *big.Int {
 }
 
 // NewCA 生成一个自签 CA。
-func NewCA(t testing.TB) *CA {
+func NewCA(t TB) *CA {
 	t.Helper()
 	key := mustKey(t)
 	tmpl := &x509.Certificate{
@@ -64,7 +73,7 @@ func NewCA(t testing.TB) *CA {
 }
 
 // leafTemplate 是 leaf 证书模板，供 EC / RSA 两种签发路径共用。
-func leafTemplate(t testing.TB, dnsNames []string) *x509.Certificate {
+func leafTemplate(t TB, dnsNames []string) *x509.Certificate {
 	t.Helper()
 	return &x509.Certificate{
 		SerialNumber: serial(t),
@@ -78,7 +87,7 @@ func leafTemplate(t testing.TB, dnsNames []string) *x509.Certificate {
 }
 
 // issueLeaf 由 ca 用给定公钥签发 leaf，返回「leaf + ca」的证书 PEM。
-func issueLeaf(t testing.TB, ca *CA, pub crypto.PublicKey, dnsNames []string) []byte {
+func issueLeaf(t TB, ca *CA, pub crypto.PublicKey, dnsNames []string) []byte {
 	t.Helper()
 	der, err := x509.CreateCertificate(rand.Reader, leafTemplate(t, dnsNames), ca.Cert, pub, ca.Key)
 	if err != nil {
@@ -89,7 +98,7 @@ func issueLeaf(t testing.TB, ca *CA, pub crypto.PublicKey, dnsNames []string) []
 }
 
 // IssueLeaf 由 ca 签发 leaf，返回「leaf + ca」的证书 PEM 与 leaf 的 EC 私钥 PEM（SEC1）。
-func IssueLeaf(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte) {
+func IssueLeaf(t TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key := mustKey(t)
 	certPEM = issueLeaf(t, ca, key.Public(), dnsNames)
@@ -103,7 +112,7 @@ func IssueLeaf(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte
 
 // IssueLeafRSA 与 IssueLeaf 相同，但 leaf 用 2048 位 RSA 密钥（cert-manager 的默认密钥类型），
 // 私钥以 PKCS#1（"RSA PRIVATE KEY"）输出。
-func IssueLeafRSA(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte) {
+func IssueLeafRSA(t TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -115,7 +124,7 @@ func IssueLeafRSA(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []b
 }
 
 // SelfSigned 生成自签 leaf（模拟 cert-manager 临时证书或 SelfSigned issuer）。
-func SelfSigned(t testing.TB, dnsNames ...string) (certPEM, keyPEM []byte) {
+func SelfSigned(t TB, dnsNames ...string) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key := mustKey(t)
 	tmpl := &x509.Certificate{
@@ -138,7 +147,7 @@ func SelfSigned(t testing.TB, dnsNames ...string) (certPEM, keyPEM []byte) {
 
 // ToPKCS8 把 SEC1 EC 私钥 PEM（"EC PRIVATE KEY"）或 PKCS#1 RSA 私钥 PEM
 // （"RSA PRIVATE KEY"）转成 PKCS#8 PEM。
-func ToPKCS8(t testing.TB, keyPEM []byte) []byte {
+func ToPKCS8(t TB, keyPEM []byte) []byte {
 	t.Helper()
 	blk, _ := pem.Decode(keyPEM)
 	if blk == nil {
@@ -167,7 +176,7 @@ func ToPKCS8(t testing.TB, keyPEM []byte) []byte {
 }
 
 // Encrypted 返回一个带 Proc-Type: 4,ENCRYPTED 头的 PEM 块（内容随意，用于测试拒绝路径）。
-func Encrypted(t testing.TB) []byte {
+func Encrypted(t TB) []byte {
 	t.Helper()
 	return pem.EncodeToMemory(&pem.Block{
 		Type:    "RSA PRIVATE KEY",
