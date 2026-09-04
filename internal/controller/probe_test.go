@@ -205,17 +205,16 @@ var _ = Describe("证书 controller：Diverged 与 CAS 探测", func() {
 		// 探测把 current 清成了指纹为空的占位，它不指向任何证书，绝不能被推进 history：
 		// 三重护栏一条都拦不住它，只会白占一个 keepLast 槽位并逼着回收多删一代真证书。
 		Expect(got.Status.History).To(BeEmpty(), "重传前只有一代，占位不该进 history")
-		for _, h := range got.Status.History {
-			Expect(h.Fingerprint).NotTo(BeEmpty(), "history 里不该出现指纹为空的占位")
-		}
 
 		// 探测时间戳跟着推进：不会每一轮都去列一次，更不会反复重传
 		Consistently(func() int { return currentCAS().UploadCalls() }, "1500ms", "200ms").Should(Equal(2))
 	})
 
-	// R24：探测是旁路的一致性检查。RAM 少给一个 ListUserCertificateOrder 权限就够触发它，
-	// 而上传与删除完全正常——把一张健康的证书打成 Ready=False，会让 Binding 侧连锁停摆。
-	It("探测失败不降级 Ready / Uploaded，只发 ProbeFailed 事件", func() {
+	// R24 + R25：探测是旁路的一致性检查。RAM 少给一个 ListUserCertificateOrder 权限就够
+	// 触发它，而上传与删除完全正常。既不能把健康证书打成 Ready=False（会让 Binding 侧连锁
+	// 停摆），也不能就此结束本轮——casProbedAt 只在列表成功后推进，持续失败下每一轮都会
+	// 重新探测，早退就等于把续期签出来的新指纹永远挡在上传之外，而且完全无声。
+	It("探测持续失败不阻塞续期上传，只发 ProbeFailed 事件", func() {
 		ns := newNamespace(ctx)
 		freeze(time.Now())
 		Expect(k8sClient.Create(ctx, baseAC(ns, "apifail"))).To(Succeed())
@@ -225,24 +224,41 @@ var _ = Describe("证书 controller：Diverged 与 CAS 探测", func() {
 			a := getAC(ctx, ns, "apifail")
 			return a.Status.Current != nil && a.Status.Current.CertID != nil
 		})
-		id1 := *getAC(ctx, ns, "apifail").Status.Current.CertID
+		first := *getAC(ctx, ns, "apifail").Status.Current
+		id1 := *first.CertID
 
-		// 只有 List 失败：上传与删除的权限都好好的
-		currentCAS().QueueFindErr(&aliyun.Error{
-			Class: aliyun.ClassAuth, Op: "ListUserCertificateOrder", Code: "Forbidden.RAM", Err: errors.New("denied")})
+		// 此后每一次 List 都失败：只缺 ListUserCertificateOrder 权限，上传与删除照常
+		for i := 0; i < 20; i++ {
+			currentCAS().QueueFindErr(&aliyun.Error{
+				Class: aliyun.ClassAuth, Op: "ListUserCertificateOrder", Code: "Forbidden.RAM", Err: errors.New("denied")})
+		}
 		advance(13 * time.Hour)
 		touch(ns, "apifail", "1")
-
 		eventually(func() bool { return acEventMessage(ctx, ns, "apifail", "ProbeFailed") == probeFailedMessage })
+
+		// 列不出清单 ≠ 证书丢了：不许重传，也不许把 current 清掉
 		Consistently(func() bool {
 			a := getAC(ctx, ns, "apifail")
-			return condStatus(a, certsv1alpha1.ConditionUploaded) == metav1.ConditionTrue &&
+			return currentCAS().UploadCalls() == 1 &&
+				condStatus(a, certsv1alpha1.ConditionUploaded) == metav1.ConditionTrue &&
 				condStatus(a, certsv1alpha1.ConditionReady) == metav1.ConditionTrue
 		}, "1500ms", "200ms").Should(BeTrue())
-		// 列不出清单 ≠ 证书丢了：不许重传，也不许把 current 清掉
-		Expect(currentCAS().UploadCalls()).To(Equal(1))
 		Expect(currentCAS().Has(id1)).To(BeTrue())
 		Expect(*getAC(ctx, ns, "apifail").Status.Current.CertID).To(Equal(id1))
+
+		// 关键：探测仍在每轮失败，续期出的新指纹必须照常上传
+		crt2, key2 := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
+		simulateIssuance(ctx, ns, "apifail", 2, crt2, key2)
+		eventually(func() bool {
+			a := getAC(ctx, ns, "apifail")
+			return a.Status.Current != nil && a.Status.Current.CertID != nil &&
+				a.Status.Current.Fingerprint != first.Fingerprint
+		})
+		Expect(currentCAS().UploadCalls()).To(Equal(2))
+		Expect(currentCAS().FindCalls()).To(BeNumerically(">=", 1), "探测必须真的试过")
+		got := getAC(ctx, ns, "apifail")
+		Expect(condStatus(got, certsv1alpha1.ConditionUploaded)).To(Equal(metav1.ConditionTrue))
+		Expect(condStatus(got, certsv1alpha1.ConditionReady)).To(Equal(metav1.ConditionTrue))
 	})
 
 	It("current 已过期时跳过探测，不把过期证书误判成丢失", func() {

@@ -21,7 +21,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -74,15 +73,18 @@ func (r *AliyunCertificateReconciler) probeCAS(ctx context.Context, ac *certsv1a
 // 可能夹带 request id 之类的细节，那些只进日志。
 const probeFailedMessage = "failed to verify the CAS certificate still exists; the current certificate is unaffected"
 
-// handleProbeError 处理探测失败（控制器裁决 R24）。
+// noteProbeFailure 记下一次探测失败，然后什么也不做（控制器裁决 R24 + R25）。
 //
-// 探测是旁路的一致性检查，不是签发链路的一环：列不出证书清单，说明不了正在服役的这一张
-// 有任何问题。最常见的触发方式是 RAM 少给了一个 ListUserCertificateOrder 权限——上传与
-// 删除都好好的，却会每 12h 把证书打成 Ready=False 一次。所以按 R21 的先例只发事件。
+// 不碰 condition（R24）：探测是旁路的一致性检查，不是签发链路的一环。列不出证书清单，
+// 说明不了正在服役的这一张有任何问题。最常见的触发方式是 RAM 少给了一个
+// ListUserCertificateOrder 权限——上传与删除都好好的，不该因此把证书打成 Ready=False。
 //
-// casProbedAt 在列表失败时不会推进（probeCAS 在 FindUploaded 成功之后才写它），下一轮会
-// 重试；失败是 ClassAuth 这类不可重试的错误时，节奏由 ResyncInterval 兜住。
-func (r *AliyunCertificateReconciler) handleProbeError(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, err error) (ctrl.Result, error) {
+// 不 patch、不返回（R25）：本轮必须继续走到 ensureUploaded。casProbedAt 只在列表成功之后
+// 才推进，持续性失败下每一轮都会重新探测；这里一旦早退，续期签出来的新指纹就永远走不到
+// 上传那一步，而 condition 还停在上一轮的 True，整件事完全无声。
+//
+// 也不需要指数退避：casProbedAt 没推进，下一次 resync 自然会重试。
+func (r *AliyunCertificateReconciler) noteProbeFailure(ctx context.Context, ac *certsv1alpha1.AliyunCertificate, err error) {
 	kv := []any{}
 	if c := ac.Status.Current; c != nil {
 		kv = append(kv, "fingerprint", shortFP(c.Fingerprint))
@@ -90,5 +92,6 @@ func (r *AliyunCertificateReconciler) handleProbeError(ctx context.Context, ac, 
 			kv = append(kv, "certId", *c.CertID)
 		}
 	}
-	return r.handleNonFatalCloudError(ctx, ac, orig, err, "ProbeFailed", probeFailedMessage, "CAS 存在性探测失败", kv...)
+	logf.FromContext(ctx).Error(err, "CAS 存在性探测失败", kv...)
+	r.Recorder.Event(ac, corev1.EventTypeWarning, "ProbeFailed", probeFailedMessage)
 }

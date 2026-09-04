@@ -238,7 +238,11 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 	}
 	missing, err := r.probeCAS(ctx, ac, primary)
 	if err != nil {
-		return r.handleProbeError(ctx, ac, orig, err)
+		// R25：探测失败绝不能结束本轮。casProbedAt 只在列表成功后推进，所以「只缺一个
+		// ListUserCertificateOrder 权限」这类持续性失败会让每一轮都在这里重新探测；一旦
+		// 早退，续期签出来的新指纹就永远走不到 ensureUploaded，而 Uploaded / Ready 还停在
+		// 上一轮的 True —— 证书悄悄地再也不更新了。只记一笔，继续往下走。
+		r.noteProbeFailure(ctx, ac, err)
 	}
 	if missing {
 		// 探测的结论必须先落盘。ensureUploaded 会用 APIReader 直读 CR 把代次换成权威值，
