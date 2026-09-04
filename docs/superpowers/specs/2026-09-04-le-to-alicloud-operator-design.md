@@ -56,6 +56,8 @@
 | `GetUserCertificateDetail` **会返回私钥**。本设计不使用、不授权。 | [GetUserCertificateDetail](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-getusercertificatedetail) |
 | CAS 拒绝删除已部署到阿里云产品的证书；FC3 使用内联 PEM，CAS 侧不视为「已部署」。 | [吊销和删除证书](https://help.aliyun.com/zh/ssl-certificate/revoke-and-delete-a-certificate) |
 | **RAM code 为 `yundun-cert`，不是 `cas`**。全部 action 的资源类型为「全部资源」，**无法资源级收窄**。 | [CAS RAM](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-ram) |
+| **仅支持 PEM 编码**（「数字证书管理服务仅支持上传PEM格式编码（.pem和.crt后缀）的证书文件」）。证书链顺序：服务器证书 → 中间证书 → 根证书。私钥接受 `-----BEGIN RSA PRIVATE KEY-----`（PKCS#1）与 `-----BEGIN EC PRIVATE KEY-----`；**加密私钥被拒绝**（需 `openssl rsa -in encrypted.key -out decrypted.key` 解密）。证书与私钥不匹配时报「证书与私钥不匹配」。控制台的格式转换工具把「PFX、JKS、PKCS8」转为 PEM——暗示 PKCS#8 不是 CAS 的原生期望格式。 | [上传 SSL 证书](https://help.aliyun.com/zh/ssl-certificate/user-guide/upload-an-ssl-certificate) |
+| 阿里云统一的 PEM 规范（CDN 文档）：「将服务器证书放在第一位，中间证书放在第二位，证书之间不能有空行」；每行 64 字符；PKCS#8 私钥须用 `openssl rsa -in old.pem -out new.pem` 转为 PKCS#1；密钥长度建议 ≥ 2048。 | [CDN 证书格式](https://help.aliyun.com/zh/cdn/user-guide/certificate-formats) |
 
 ### 2.3 cert-manager
 
@@ -326,7 +328,7 @@ const (
     - 期望态比对后才 update，避免无谓写入（LE 速率限制护栏）
     - 绝不因为「Secret 内容不对」删除并重建 Certificate
     - secretTemplate 注入 label certs.bestheme.ac.cn/managed=true（排查用）
-    - privateKey.encoding 缺省填 PKCS1
+    - privateKey.encoding 缺省填 PKCS1（FC3 示例、CAS 私钥头列表、CDN 转换指引三处一致指向 PKCS#1）
  4. 镜像 Certificate.status 到 status.issuance
     - Issuing=True 持续超过 --issuance-stall-threshold（默认 6h）
       → Issued=False/IssuanceStalled + Warning event + metric
@@ -362,6 +364,7 @@ const (
 4. leaf SANs ⊇ `spec.certificateTemplate.dnsNames`（含 `commonName`）；不满足 → `SANsMismatch`
 5. **临时证书拒绝**：`leaf 自签（Issuer == Subject）AND Certificate.Issuing == True` → `SelfSignedDuringIssuance`。只用合取，不单独拒绝自签证书——`SelfSigned` issuer 是合法用法。
 6. 计算 SHA-256(DER) 指纹、`notBefore` / `notAfter`（**不使用** CAS 返回的 `EndDate`，它精度只到天）
+7. **PEM 规范化**：不信任 Secret 里的原始文本，从解析出的 DER **重新编码**生成 `CertMaterial.CertPEM` / `KeyPEM`——leaf 在前、中间证书按链顺序紧随、证书之间无空行、64 字符/行、无多余 bundle 注释；私钥必须是未加密的 PKCS#1（`RSA PRIVATE KEY`）或 SEC1（`EC PRIVATE KEY`），加密私钥或无法识别的 PEM 块 → `SecretInvalid`。这是阿里云 CAS / CDN / FC3 共同的 PEM 规范（§2.2），在 operator 内一次做对，下游 provider 全部受益。
 
 ### 5.5 CAS 上传与幂等
 
@@ -743,11 +746,11 @@ type FC3Client interface {
 
 | # | 待核实 | 影响 |
 |---|---|---|
-| 1 | FC3 `certConfig.privateKey` 接受 PKCS#1 / PKCS#8 / 两者 | 决定 6 的默认编码 |
+| 1 | FC3 与 CAS 各自对 PKCS#1 / PKCS#8 / `EC PRIVATE KEY` 私钥的接受情况（CAS 文档只列了 PKCS#1 与 EC，CDN 文档要求 PKCS#8 转 PKCS#1） | 决定 6 的默认编码；`privateKey.encoding: PKCS8` 是否要在 CRD 层直接拒绝 |
 | 2 | `UpdateCustomDomain` 全量替换 vs 部分合并（构造含 routeConfig+wafConfig+tlsConfig 的域名，只提交 certConfig） | read-modify-write 两种语义下都安全，但决定 last-write-wins 风险大小 |
 | 3 | CAS `ClientToken` 语义（同 token 重复上传返回同 certId？报错？有效期？） | write-ahead 幂等能否落地 |
 | 4 | CAS `Name` 是否接受 `-` / `.` | 命名 sanitize 规则 |
-| 5 | LE 链（leaf + intermediate，无 root）FC3 是否接受、顺序是否敏感 | PEM 组装 |
+| 5 | LE 链（leaf + intermediate，无 root）FC3 与 CAS 是否都接受、是否要求带根证书、顺序是否敏感 | §5.4 第 7 条 PEM 规范化的输出形状 |
 | 6 | 给 TLS Secret 追加指向 AliyunCertificate 的 ownerRef，cert-manager 的 SSA 是否保留 | 若保留，可消掉 `secrets: delete` 和 finalizer 顺序难题 |
 | 7 | Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision` | 不缓存 Secret 决定的盲区大小 |
 | 8 | CAS 单账号上传证书数量配额 | `cleanup_abandoned_total` 是否必须配告警 |
