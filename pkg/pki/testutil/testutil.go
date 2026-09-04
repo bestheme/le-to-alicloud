@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -62,11 +63,10 @@ func NewCA(t testing.TB) *CA {
 	return &CA{Cert: cert, Key: key}
 }
 
-// IssueLeaf 由 ca 签发 leaf，返回「leaf + ca」的证书 PEM 与 leaf 的 EC 私钥 PEM（SEC1）。
-func IssueLeaf(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte) {
+// leafTemplate 是 leaf 证书模板，供 EC / RSA 两种签发路径共用。
+func leafTemplate(t testing.TB, dnsNames []string) *x509.Certificate {
 	t.Helper()
-	key := mustKey(t)
-	tmpl := &x509.Certificate{
+	return &x509.Certificate{
 		SerialNumber: serial(t),
 		Subject:      pkix.Name{CommonName: dnsNames[0]},
 		DNSNames:     dnsNames,
@@ -75,17 +75,42 @@ func IssueLeaf(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, key.Public(), ca.Key)
+}
+
+// issueLeaf 由 ca 用给定公钥签发 leaf，返回「leaf + ca」的证书 PEM。
+func issueLeaf(t testing.TB, ca *CA, pub crypto.PublicKey, dnsNames []string) []byte {
+	t.Helper()
+	der, err := x509.CreateCertificate(rand.Reader, leafTemplate(t, dnsNames), ca.Cert, pub, ca.Key)
 	if err != nil {
 		t.Fatalf("签发 leaf 失败: %v", err)
 	}
-	certPEM = append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+	return append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Cert.Raw})...)
+}
+
+// IssueLeaf 由 ca 签发 leaf，返回「leaf + ca」的证书 PEM 与 leaf 的 EC 私钥 PEM（SEC1）。
+func IssueLeaf(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key := mustKey(t)
+	certPEM = issueLeaf(t, ca, key.Public(), dnsNames)
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatalf("编码私钥失败: %v", err)
 	}
 	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM
+}
+
+// IssueLeafRSA 与 IssueLeaf 相同，但 leaf 用 2048 位 RSA 密钥（cert-manager 的默认密钥类型），
+// 私钥以 PKCS#1（"RSA PRIVATE KEY"）输出。
+func IssueLeafRSA(t testing.TB, ca *CA, dnsNames ...string) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("生成 RSA 密钥失败: %v", err)
+	}
+	certPEM = issueLeaf(t, ca, key.Public(), dnsNames)
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	return certPEM, keyPEM
 }
 
@@ -111,13 +136,28 @@ func SelfSigned(t testing.TB, dnsNames ...string) (certPEM, keyPEM []byte) {
 	return certPEM, keyPEM
 }
 
-// ToPKCS8 把 SEC1 EC 私钥 PEM 转成 PKCS#8 PEM。
+// ToPKCS8 把 SEC1 EC 私钥 PEM（"EC PRIVATE KEY"）或 PKCS#1 RSA 私钥 PEM
+// （"RSA PRIVATE KEY"）转成 PKCS#8 PEM。
 func ToPKCS8(t testing.TB, keyPEM []byte) []byte {
 	t.Helper()
 	blk, _ := pem.Decode(keyPEM)
-	k, err := x509.ParseECPrivateKey(blk.Bytes)
+	if blk == nil {
+		t.Fatal("解析私钥失败: 未找到 PEM 块")
+	}
+	var (
+		k   crypto.PrivateKey
+		err error
+	)
+	switch blk.Type {
+	case "EC PRIVATE KEY":
+		k, err = x509.ParseECPrivateKey(blk.Bytes)
+	case "RSA PRIVATE KEY":
+		k, err = x509.ParsePKCS1PrivateKey(blk.Bytes)
+	default:
+		t.Fatalf("不支持的私钥 PEM 类型: %q", blk.Type)
+	}
 	if err != nil {
-		t.Fatalf("解析 EC 私钥失败: %v", err)
+		t.Fatalf("解析私钥失败: %v", err)
 	}
 	der, err := x509.MarshalPKCS8PrivateKey(k)
 	if err != nil {

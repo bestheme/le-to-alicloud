@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -121,6 +122,56 @@ func parsePrivateKey(keyPEM []byte) (crypto.Signer, error) {
 	default:
 		return nil, ErrUnsupportedKey
 	}
+}
+
+// redactedKey 是私钥在任何格式化输出里的占位符。
+const redactedKey = "<redacted>"
+
+// Bundle 里的 Signer 持有私钥，而全局约束要求私钥绝不出现在日志 / event / status。
+// 下面三个方法是这条约束的护栏：Bundle 一旦被整体格式化或序列化，只会吐出安全字段。
+//
+// 真正的泄漏面是 JSON：controller-runtime 的 zap logger 对未知类型走反射 JSON 编码器，
+// 而 *rsa.PrivateKey / *ecdsa.PrivateKey 的私有标量 D（以及 RSA 的 Primes）都是导出字段，
+// 于是 log.Info("bundle", "b", bundle) 会把私钥原样写进日志。MarshalJSON 堵的就是这个洞。
+// fmt 的 %v/%+v/%#v 反而不会递归进指针（只打印地址），String / GoString 属于顺带加固，
+// 同时让人读日志时能看到有用的摘要。
+//
+// 三个方法都用值接收者，这样 Bundle 与 *Bundle 都被覆盖——只在 *Bundle 上实现的话，
+// 一次 fmt.Sprintf("%+v", *b) 或 json.Marshal(*b) 就会绕过护栏。
+func (b Bundle) redactedFields() (fingerprint string, dnsNames []string, intermediates int) {
+	if b.Leaf != nil {
+		dnsNames = b.DNSNames()
+	}
+	return b.Fingerprint, dnsNames, len(b.Intermediates)
+}
+
+// String 实现 fmt.Stringer：只输出指纹前 8 位、SANs 与中间证书数量，绝不输出私钥。
+func (b Bundle) String() string {
+	fp, names, n := b.redactedFields()
+	if len(fp) > 8 {
+		fp = fp[:8]
+	}
+	return fmt.Sprintf("pki.Bundle{fingerprint=%s, dnsNames=%v, intermediates=%d, key=%s}",
+		fp, names, n, redactedKey)
+}
+
+// GoString 实现 fmt.GoStringer，让 %#v 同样走脱敏路径。
+func (b Bundle) GoString() string { return b.String() }
+
+// MarshalJSON 实现 json.Marshaler，让结构化日志（zap / logr）无法序列化出私钥。
+func (b Bundle) MarshalJSON() ([]byte, error) {
+	fp, names, n := b.redactedFields()
+	return json.Marshal(struct {
+		Fingerprint   string   `json:"fingerprint"`
+		DNSNames      []string `json:"dnsNames"`
+		Intermediates int      `json:"intermediates"`
+		Key           string   `json:"key"`
+	}{
+		Fingerprint:   fp,
+		DNSNames:      names,
+		Intermediates: n,
+		Key:           redactedKey,
+	})
 }
 
 // IsSelfSigned 判断 leaf 是否自签（Issuer == Subject 且签名可由自身公钥验证）。
