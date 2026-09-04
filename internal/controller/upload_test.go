@@ -26,6 +26,7 @@ import (
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -123,6 +124,7 @@ var _ = Describe("证书 controller：上传", func() {
 
 	It("签发后上传一次，重复 reconcile 不重复上传", func() {
 		ns := newNamespace(ctx)
+		uploadsBefore := promtestutil.ToFloat64(casUploadTotal.WithLabelValues("success"))
 		Expect(k8sClient.Create(ctx, baseAC(ns, "up"))).To(Succeed())
 		crt, key := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
 		simulateIssuance(ctx, ns, "up", 1, crt, key)
@@ -136,6 +138,8 @@ var _ = Describe("证书 controller：上传", func() {
 		Expect(ac.Status.PendingUpload).To(BeNil())
 		Expect(ac.Status.CASProbedAt).NotTo(BeNil())
 		Expect(currentCAS().UploadCalls()).To(Equal(1))
+		Expect(promtestutil.ToFloat64(casUploadTotal.WithLabelValues("success"))).
+			To(BeNumerically(">", uploadsBefore), "成功的上传必须计入指标")
 
 		// 再触发一次 reconcile
 		ac.Annotations = map[string]string{"touch": "1"}

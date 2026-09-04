@@ -60,7 +60,9 @@ type AliyunCertificateReconciler struct {
 	Recorder  record.EventRecorder
 
 	CASFactory CASFactory
-	Now        func() time.Time
+	// Now 是时钟注入点，nil 表示用真实时间。构造时可以直接赋值；manager 跑起来之后
+	// 只许经 SetNow 改（测试会在运行中推进假时钟，而每一轮 reconcile 都在读它）。
+	Now func() time.Time
 
 	ResyncInterval         time.Duration
 	CASProbeInterval       time.Duration
@@ -85,9 +87,20 @@ func (r *AliyunCertificateReconciler) issuerDefaults() IssuerDefaults {
 	return r.defaults
 }
 
+// SetNow 线程安全地替换时钟。上一个 reconcile 的收尾常常还在跑（RequeueAfter 与 watch
+// 都会自己排队），换钟的那一刻它可能正好在读，所以必须走锁。
+func (r *AliyunCertificateReconciler) SetNow(fn func() time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Now = fn
+}
+
 func (r *AliyunCertificateReconciler) now() time.Time {
-	if r.Now != nil {
-		return r.Now()
+	r.mu.RLock()
+	fn := r.Now
+	r.mu.RUnlock()
+	if fn != nil {
+		return fn()
 	}
 	return time.Now()
 }
@@ -141,6 +154,7 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, r.patchStatus(ctx, ac, orig)
 	}
 	ac.Status.EffectiveIssuerRef = &issuer
+	r.detectIssuerDivergence(ac, source)
 	log.V(1).Info("issuer resolved", "name", issuer.Name, "kind", issuer.Kind, "source", source)
 
 	// 2. 首次创建前检查 Secret 名冲突
@@ -174,6 +188,11 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if op != controllerutil.OperationResultNone {
 		log.Info("cert-manager Certificate synced", "operation", op)
 	}
+	if op == controllerutil.OperationResultCreated && ac.Status.CertManagerCertificateName != "" {
+		// 之前已经创建过一次又不见了：重建会消耗 LE 配额，必须可观测
+		certManagerCertRecreatedTotal.WithLabelValues(ac.Namespace, ac.Name).Inc()
+		r.Recorder.Event(ac, corev1.EventTypeWarning, "CertificateRecreated", "cert-manager Certificate was recreated")
+	}
 	ac.Status.CertManagerCertificateName = cert.Name
 	ac.Status.SecretName = cert.Spec.SecretName
 
@@ -192,7 +211,6 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, r.patchStatus(ctx, ac, orig)
 	}
 
-	// 5–10 由 Task 11 / 12 / 14 接入
 	return r.reconcileIssued(ctx, ac, orig, cert)
 }
 
@@ -211,6 +229,26 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 	}
 	setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "Secret 通过校验")
 
+	// 9. CAS 存在性探测（12h 节流）。spec 把它列在上传之后，代码里必须提前到这里：探测
+	// 的全部作用就是清空 certId 与指纹，好让紧接着的 ensureUploaded 把它当成新代次重传；
+	// 排在上传之后的话，这一轮就什么也不会发生。
+	primary := ""
+	if names := b.DNSNames(); len(names) > 0 {
+		primary = names[0]
+	}
+	missing, err := r.probeCAS(ctx, ac, primary)
+	if err != nil {
+		return r.handleCloudError(ctx, ac, orig, "ListUserCertificateOrder", err)
+	}
+	if missing {
+		// 探测的结论必须先落盘。ensureUploaded 会用 APIReader 直读 CR 把代次换成权威值，
+		// 只清在内存里的 certId / 指纹会被原样读回来，于是重传永远不会发生。
+		if err := r.patchStatus(ctx, ac, orig); err != nil {
+			return ctrl.Result{}, err
+		}
+		orig = ac.DeepCopy()
+	}
+
 	// 6–7. 上传（含短路）
 	if _, err := r.ensureUploaded(ctx, ac, orig, b); err != nil {
 		return r.handleCloudError(ctx, ac, orig, "Upload", err)
@@ -222,9 +260,28 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 		return r.handleReclaimError(ctx, ac, orig, err)
 	}
 
-	// 9. CAS 探测由 Task 14 接入
+	// 10. 汇总 Ready 并落盘
 	r.aggregateReady(ac)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+}
+
+// detectIssuerDivergence：已 Pin 且 flag 当前值不同 → 打一个不参与 Ready 的 condition，
+// 并在跳变时发一次 Warning。改 flag 不该悄悄把所有证书重签一遍（那是 Pin 的意义），但也
+// 不该悄无声息——否则「改了默认却没生效」这件事只有下一次续期时才会被发现。
+func (r *AliyunCertificateReconciler) detectIssuerDivergence(ac *certsv1alpha1.AliyunCertificate, source IssuerSource) {
+	d := r.issuerDefaults().Ref()
+	diverged := source == IssuerSourceStatus && d != nil && !IssuerRefEqual(*d, *ac.Status.EffectiveIssuerRef)
+	was := condTrue(ac, certsv1alpha1.ConditionIssuerDefaultDiverged)
+	if diverged {
+		setCondition(ac, certsv1alpha1.ConditionIssuerDefaultDiverged, metav1.ConditionTrue, certsv1alpha1.ReasonIssuerDefaultDiverged,
+			fmt.Sprintf("已固化 %s/%s，operator 默认现为 %s/%s；如需切换请显式设置 spec.certificateTemplate.issuerRef",
+				ac.Status.EffectiveIssuerRef.Kind, ac.Status.EffectiveIssuerRef.Name, d.Kind, d.Name))
+		if !was {
+			r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonIssuerDefaultDiverged, "pinned issuer differs from operator default")
+		}
+		return
+	}
+	setCondition(ac, certsv1alpha1.ConditionIssuerDefaultDiverged, metav1.ConditionFalse, certsv1alpha1.ReasonReady, "")
 }
 
 // setUploadedCondition 依据 status.current 与 uploadToCAS 设置 Uploaded。

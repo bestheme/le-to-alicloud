@@ -22,7 +22,6 @@ import (
 	"time"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,20 +29,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/naming"
 )
-
-// cleanupAbandonedTotal 暂居于此，Task 14 会把它连同其它指标一起搬进 metrics.go。
-var cleanupAbandonedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Name: "aliyuncert_cleanup_abandoned_total",
-	Help: "Number of AliyunCertificate deletions that abandoned CAS cleanup",
-}, []string{"region", "reason"})
-
-func init() { metrics.Registry.MustRegister(cleanupAbandonedTotal) }
 
 // requeueDeletionWait 是等待 cert-manager Certificate 真正消失时的重试间隔。
 const requeueDeletionWait = 2 * time.Second
@@ -104,7 +94,9 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	if err := r.cleanupCAS(ctx, ac); err != nil {
 		elapsed := r.now().Sub(ac.Status.CleanupStartedAt.Time)
 		if r.CleanupFailurePolicy == CleanupPolicyBlock || elapsed < r.CleanupGracePeriod {
-			setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonUploadFailed, "CAS 清理失败，重试中: "+err.Error())
+			// 清理失败与上传失败是两码事：这条 reason 会出现在一个正在删除的对象上，
+			// 沿用 UploadFailed 会让人以为签发链路出了问题。
+			setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonCleanupFailed, "CAS 清理失败，重试中: "+err.Error())
 			if perr := r.patchStatus(ctx, ac, orig); perr != nil {
 				return ctrl.Result{}, perr
 			}
@@ -156,6 +148,8 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	if err := r.Update(ctx, ac); err != nil {
 		return ctrl.Result{}, err
 	}
+	// 对象没了，它的 gauge 也必须跟着消失：留下来的那条 Ready=0 会一直告警下去。
+	clearCertMetrics(ac.Namespace, ac.Name)
 	log.Info("deleted", "name", ac.Name)
 	return ctrl.Result{}, nil
 }
@@ -193,8 +187,9 @@ func (r *AliyunCertificateReconciler) cleanupCAS(ctx context.Context, ac *certsv
 		if gen == nil || gen.CertID == nil {
 			return nil
 		}
-		if err := cas.Delete(ctx, *gen.CertID, deleteToken(naming.ClientToken(ac.UID, gen.Fingerprint))); err != nil &&
-			aliyun.ClassOf(err) != aliyun.ClassNotFound {
+		err := cas.Delete(ctx, *gen.CertID, deleteToken(naming.ClientToken(ac.UID, gen.Fingerprint)))
+		recordCASDelete(err)
+		if err != nil && aliyun.ClassOf(err) != aliyun.ClassNotFound {
 			return err
 		}
 		gen.CertID = nil
@@ -221,33 +216,33 @@ func (r *AliyunCertificateReconciler) cleanupPendingUpload(ctx context.Context, 
 	if p == nil {
 		return nil
 	}
-	list, err := cas.FindUploaded(ctx, casDomainHint(ac))
+	hint := casFindHint(ac, "")
+	list, err := cas.FindUploaded(ctx, hint)
 	if err != nil {
 		return err
 	}
+	found := false
 	for _, c := range list {
 		if c.Name != p.CASName {
 			continue
 		}
-		if err := cas.Delete(ctx, c.CertID, deleteToken(p.ClientToken)); err != nil &&
-			aliyun.ClassOf(err) != aliyun.ClassNotFound {
-			return err
+		found = true
+		derr := cas.Delete(ctx, c.CertID, deleteToken(p.ClientToken))
+		recordCASDelete(derr)
+		if derr != nil && aliyun.ClassOf(derr) != aliyun.ClassNotFound {
+			return derr
 		}
 		break
 	}
-	// 认领并删掉了，或者列表里根本没有这个名字——后者说明那次上传从未在服务端落地，
-	// 同样没有东西需要回收。两种情形都可以把记录抹掉。
+	if !found {
+		// 列表里没有这个名字，说明那次上传从未在服务端落地。但「没找到」也可能是 hint
+		// 选错了域名，那就等于放走一张孤儿证书——把两个线索都记下来，人工才查得动。
+		logf.FromContext(ctx).Info("pendingUpload not found in CAS, dropping the record",
+			"CASName", p.CASName, "hint", hint)
+	}
+	// 认领并删掉了，或者根本没有东西需要回收。两种情形都可以把记录抹掉。
 	ac.Status.PendingUpload = nil
 	return nil
-}
-
-// casDomainHint 返回 FindUploaded 的 Keyword。删除路径读不到 Secret 里的 SAN（Secret
-// 可能已经不在了），只能退回 spec 声明的域名。
-func casDomainHint(ac *certsv1alpha1.AliyunCertificate) string {
-	if names := ac.Spec.CertificateTemplate.DNSNames; len(names) > 0 {
-		return names[0]
-	}
-	return ac.Spec.CertificateTemplate.CommonName
 }
 
 // deleteToken 由上传 token 派生出删除用的幂等令牌：加后缀与上传区分，并守住 CAS 的

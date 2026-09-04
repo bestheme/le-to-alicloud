@@ -156,6 +156,10 @@ type PendingUpload struct {
 	CASName     string      `json:"casName"`
 	ClientToken string      `json:"clientToken"`
 	StartedAt   metav1.Time `json:"startedAt"`
+	// 写下这条记录时 spec 声明的首个域名。CAS 只能按域名 Keyword 列出证书，而 spec
+	// 之后随时可能被改；不快照下来的话，改过域名的 CR 就再也认领不回这张证书。
+	// +optional
+	DomainHint string `json:"domainHint,omitempty"`
 }
 
 // IssuanceStatus 镜像 cert-manager Certificate 的关键 status 字段。

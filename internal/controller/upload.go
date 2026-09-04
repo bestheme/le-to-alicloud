@@ -43,7 +43,7 @@ const tokenPrefixLen = 40
 // orig 是本轮 patch 的基准快照。这里要能改它：write-ahead 记录是在本轮中途单独落盘的，
 // 基准若不跟着走，轮末的 MergeFrom 就算不出正确的差异（见 patchPendingUpload）。
 func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, b *pki.Bundle) (bool, error) {
-	log := logf.FromContext(ctx).WithValues("fingerprint", b.Fingerprint[:8])
+	log := logf.FromContext(ctx).WithValues("fingerprint", shortFP(b.Fingerprint))
 
 	if ac.Status.Current != nil && ac.Status.Current.Fingerprint == b.Fingerprint {
 		return false, nil // 指纹未变，短路
@@ -77,6 +77,9 @@ func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac, or
 				CASName:     naming.CASName(ac.Name, b.Fingerprint),
 				ClientToken: uploadToken(ac.UID, b.Fingerprint, startedAt),
 				StartedAt:   metav1.NewTime(startedAt),
+				// 快照下当时的域名：认领这张证书唯一的办法是按域名列出再比名字，而
+				// spec.dnsNames 在上传之后随时可能被改，改完就再也找不到它了。
+				DomainHint: casDomainHint(ac),
 			}
 			if err := r.patchPendingUpload(ctx, ac, orig, pending); err != nil {
 				return false, err
@@ -98,13 +101,14 @@ func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac, or
 			// 同名已存在 = 之前上传成功但响应丢失且 token 未命中：兜底按域名查找
 			if aliyun.ClassOf(err) == aliyun.ClassPermanent && isDuplicateName(err) {
 				if found, ferr := r.findByName(ctx, cas, b, ac.Status.PendingUpload.CASName); ferr == nil && found != 0 {
-					certID = found
-					err = nil
+					certID, err = found, nil
 				}
 			}
-			if err != nil {
-				return false, err
-			}
+		}
+		// 认领成功也算成功：那张证书确实在云上，这一次调用达成了目的。
+		casUploadTotal.WithLabelValues(casResult(err)).Inc()
+		if err != nil {
+			return false, err
 		}
 		gen.CertID = &certID
 		gen.CASName = ac.Status.PendingUpload.CASName
@@ -214,6 +218,41 @@ func isDuplicateName(err error) bool {
 	}
 	// 阿里云真实错误码待实测确认；fake 使用 CertNameDuplicated
 	return e.Code == "CertNameDuplicated" || e.Code == "DuplicateCertificateName" || e.Code == "CertNameExisted"
+}
+
+// shortFP 截取指纹前 8 位用于日志。status 里的指纹是 API 上可写的字段，被人手工改短
+// 之后，裸切片会 panic 并把 controller 打进崩溃循环——一次手滑不该拖垮整个 operator。
+func shortFP(fp string) string {
+	if len(fp) < 8 {
+		return fp
+	}
+	return fp[:8]
+}
+
+// casDomainHint 返回 FindUploaded 的 Keyword。CAS 不支持按名字查，只能拿域名当 Keyword
+// 拉一批回来再比名字。删除路径读不到 Secret 里的 SAN（Secret 可能已经不在了），只能退回
+// spec 声明的域名。
+func casDomainHint(ac *certsv1alpha1.AliyunCertificate) string {
+	if names := ac.Spec.CertificateTemplate.DNSNames; len(names) > 0 {
+		return names[0]
+	}
+	return ac.Spec.CertificateTemplate.CommonName
+}
+
+// casFindHint 决定这一次 FindUploaded 用哪个 Keyword。
+//
+// pendingUpload.DomainHint 优先级最高：它是写 write-ahead 记录那一刻的快照，而云上那张
+// 证书正是按当时的域名建的；spec.dnsNames 之后被改过的话，用它去找只会一无所获，那张
+// 证书就被无痕地孤儿化了。preferred 是调用方从 leaf SAN 现算出来的域名（只有拿得到
+// Secret 的路径才有）。两者都没有时回退 spec。
+func casFindHint(ac *certsv1alpha1.AliyunCertificate, preferred string) string {
+	if p := ac.Status.PendingUpload; p != nil && p.DomainHint != "" {
+		return p.DomainHint
+	}
+	if preferred != "" {
+		return preferred
+	}
+	return casDomainHint(ac)
 }
 
 // findByName 用域名做 Keyword 拉取后按 Name 过滤（CAS 不支持按名查）。

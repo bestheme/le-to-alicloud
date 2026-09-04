@@ -93,7 +93,7 @@ func (r *AliyunCertificateReconciler) reclaimOldGenerations(ctx context.Context,
 		oldest := ac.Status.History[len(ac.Status.History)-1]
 		ok, why := reclaimable(oldest, now, minAge, bindings)
 		if !ok {
-			log.V(1).Info("skip reclaim", "fingerprint", oldest.Fingerprint[:8], "why", why)
+			log.V(1).Info("skip reclaim", "fingerprint", shortFP(oldest.Fingerprint), "why", why)
 			return nil
 		}
 		if oldest.CertID != nil {
@@ -107,13 +107,14 @@ func (r *AliyunCertificateReconciler) reclaimOldGenerations(ctx context.Context,
 				token = token[:64]
 			}
 			err := cas.Delete(ctx, *oldest.CertID, token)
+			recordCASDelete(err)
 			if err != nil && aliyun.ClassOf(err) != aliyun.ClassNotFound {
 				// 唯一一处知道「删的是哪一张」的地方；错误详情只到日志为止，事件里不带。
-				log.Error(err, "delete CAS certificate failed", "certId", *oldest.CertID, "fingerprint", oldest.Fingerprint[:8])
+				log.Error(err, "delete CAS certificate failed", "certId", *oldest.CertID, "fingerprint", shortFP(oldest.Fingerprint))
 				return err
 			}
 			r.Recorder.Event(ac, corev1.EventTypeNormal, "Reclaimed", "old CAS certificate reclaimed")
-			log.Info("reclaimed CAS certificate", "certId", *oldest.CertID, "fingerprint", oldest.Fingerprint[:8])
+			log.Info("reclaimed CAS certificate", "certId", *oldest.CertID, "fingerprint", shortFP(oldest.Fingerprint))
 		}
 		ac.Status.History = ac.Status.History[:len(ac.Status.History)-1]
 		excess--

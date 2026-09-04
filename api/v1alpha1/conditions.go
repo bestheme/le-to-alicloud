@@ -42,6 +42,7 @@ const (
 	ReasonUploadFailed             = "UploadFailed"
 	ReasonThrottled                = "Throttled"
 	ReasonDeletionBlocked          = "DeletionBlockedByBindings"
+	ReasonCleanupFailed            = "CleanupFailed"
 	ReasonCleanupAbandoned         = "CleanupAbandoned"
 	ReasonUploadDisabled           = "UploadDisabled"
 	ReasonReady                    = "Ready"

@@ -26,6 +26,7 @@ import (
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -137,10 +138,9 @@ var _ = Describe("证书 controller：删除", func() {
 	var ca *testutil.CA
 
 	// 假时钟必须带锁：Abandon 用例要在 reconciler 正忙着重试的时候把时钟推过宽限期，
-	// 而 reconciler 每一轮都在自己的 goroutine 里通过 r.now() 读它。直接改
-	// reconciler.Now 这个字段（或一个裸变量）会被 -race 抓个正着，所以字段只在用例
-	// 之间安静的时候写一次，用例内部一律只动锁保护的 clock。
-	// 零值表示「跟随真实时间」，与 reconciler.Now == nil 的语义一致。
+	// 而 reconciler 每一轮都在自己的 goroutine 里通过 r.now() 读它。裸变量会被 -race
+	// 抓个正着；换钟本身也一样，所以走 SetNow 而不是直接写字段。
+	// 零值表示「跟随真实时间」，与 Now == nil 的语义一致。
 	var clockMu sync.Mutex
 	var clock time.Time
 	fakeNow := func() time.Time {
@@ -168,8 +168,8 @@ var _ = Describe("证书 controller：删除", func() {
 		reconciler.CleanupFailurePolicy = CleanupPolicyAbandon
 		reconciler.CleanupGracePeriod = 15 * time.Minute
 		freeze(time.Time{})
-		reconciler.Now = fakeNow
-		DeferCleanup(func() { reconciler.Now = nil })
+		reconciler.SetNow(fakeNow)
+		DeferCleanup(func() { reconciler.SetNow(nil) })
 		ca = testutil.NewCA(GinkgoT())
 	})
 
@@ -299,6 +299,9 @@ var _ = Describe("证书 controller：删除", func() {
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "abandon-tls"}, &corev1.Secret{}))).To(BeTrue())
 		// 放弃必须留下痕迹，否则孤儿证书就无声无息了
 		Expect(acEventMessage(ctx, ns, "abandon", certsv1alpha1.ReasonCleanupAbandoned)).To(Equal(cleanupAbandonedMessage))
+		// 事件会随 namespace 一起过期，指标才是能长期告警的那一份痕迹
+		Expect(promtestutil.ToFloat64(cleanupAbandonedTotal.WithLabelValues("cn-hangzhou", aliyun.ClassAuth.String()))).
+			To(BeNumerically(">=", 1))
 	})
 
 	It("Block 策略下持续失败不摘 finalizer", func() {
@@ -318,7 +321,7 @@ var _ = Describe("证书 controller：删除", func() {
 		}, "2s", "200ms").Should(BeTrue())
 
 		// CAS 恢复后必须能自愈：Block 是「一直重试」，不是「永远卡死」。顺带避免把一个
-		// 永不结束的重试循环泄漏给后面的用例——它会和 BeforeEach 里写 reconciler.Now
+		// 永不结束的重试循环泄漏给后面的用例——它会和 BeforeEach 里换钟
 		// 撞成 data race。
 		resetCAS()
 		touchAC(ctx, ns, "block") // watch 事件直接入队，绕开已经涨到几秒的退避

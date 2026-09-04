@@ -45,7 +45,11 @@ func condTrue(ac *certsv1alpha1.AliyunCertificate, condType string) bool {
 }
 
 // patchStatus 用 MergeFrom 补丁提交 status，避免整对象 Update 的冲突。
+//
+// gauge 在这里统一刷新：每一条 return 路径最终都要经过一次 patchStatus，挂在这里就不会
+// 漏掉哪一条分支，指标与落盘的 status 也永远是同一份判定。
 func (r *AliyunCertificateReconciler) patchStatus(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate) error {
+	recordCertMetrics(ac)
 	return r.Status().Patch(ctx, ac, client.MergeFrom(orig))
 }
 
