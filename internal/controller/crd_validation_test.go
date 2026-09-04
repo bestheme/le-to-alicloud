@@ -61,18 +61,21 @@ var _ = Describe("AliyunCertificate CRD 校验", func() {
 		ac := newAC("keeplast-zero")
 		// keepLast=0 会被 omitempty 省略进而被默认成 2，所以用 -1 触发 minimum
 		ac.Spec.Retention.KeepLast = -1
-		Expect(k8sClient.Create(ctx, ac)).NotTo(Succeed())
+		Expect(k8sClient.Create(ctx, ac)).To(MatchError(ContainSubstring(
+			"spec.retention.keepLast in body should be greater than or equal to 1")))
 	})
 
 	It("拒绝 dnsNames 与 commonName 都为空", func() {
 		ac := newAC("no-names")
 		ac.Spec.CertificateTemplate.DNSNames = nil
-		Expect(k8sClient.Create(ctx, ac)).NotTo(Succeed())
+		Expect(k8sClient.Create(ctx, ac)).To(MatchError(ContainSubstring(
+			"spec.certificateTemplate: Invalid value: certificateTemplate 至少需要 dnsNames 或 commonName 之一")))
 	})
 
 	It("拒绝缺少 credentialsRef.name", func() {
 		ac := newAC("no-creds")
 		ac.Spec.Aliyun.CredentialsRef.Name = ""
-		Expect(k8sClient.Create(ctx, ac)).NotTo(Succeed())
+		Expect(k8sClient.Create(ctx, ac)).To(MatchError(ContainSubstring(
+			"spec.aliyun.credentialsRef.name in body should be at least 1 chars long")))
 	})
 })
