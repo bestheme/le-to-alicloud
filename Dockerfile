@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM golang:1.24 AS builder
+FROM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -15,6 +15,7 @@ RUN go mod download
 COPY cmd/main.go cmd/main.go
 COPY api/ api/
 COPY internal/ internal/
+COPY pkg/ pkg/
 
 # Build
 # the GOARCH has not a default value to allow the binary be built according to the host where the command
@@ -28,6 +29,6 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
-USER 65532:65532
+# 故意不写 USER：镜像基底已是 nonroot，OpenShift 的 restricted-v2 SCC 会注入自己的 UID。
 
 ENTRYPOINT ["/manager"]

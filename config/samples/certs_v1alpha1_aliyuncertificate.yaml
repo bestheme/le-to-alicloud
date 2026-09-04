@@ -1,9 +1,12 @@
 apiVersion: certs.bestheme.ac.cn/v1alpha1
 kind: AliyunCertificate
 metadata:
-  labels:
-    app.kubernetes.io/name: le-to-alicloud
-    app.kubernetes.io/managed-by: kustomize
-  name: aliyuncertificate-sample
+  name: timehorse-api
 spec:
-  # TODO(user): Add fields here
+  certificateTemplate:
+    dnsNames: [api.timehorse.bestheme.ac.cn]
+  aliyun:
+    credentialsRef: { name: aliyun-cas-credentials }
+    region: cn-hangzhou
+  retention:
+    keepLast: 2

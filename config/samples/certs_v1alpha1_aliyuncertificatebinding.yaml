@@ -1,9 +1,12 @@
 apiVersion: certs.bestheme.ac.cn/v1alpha1
 kind: AliyunCertificateBinding
 metadata:
-  labels:
-    app.kubernetes.io/name: le-to-alicloud
-    app.kubernetes.io/managed-by: kustomize
-  name: aliyuncertificatebinding-sample
+  name: timehorse-api-fc3
 spec:
-  # TODO(user): Add fields here
+  certificateRef:
+    name: timehorse-api
+  target:
+    type: FC3CustomDomain
+    fc3CustomDomain:
+      region: cn-hangzhou
+      domainName: api.timehorse.bestheme.ac.cn

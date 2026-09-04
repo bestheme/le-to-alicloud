@@ -54,6 +54,7 @@ spec:
         # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
         # This ensures that deployments meet the highest security requirements for Kubernetes.
         # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        # 故意不设 runAsUser / runAsGroup：OpenShift 的 restricted-v2 SCC 会注入 namespace 自己的 UID 区间。
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
@@ -63,11 +64,14 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --default-issuer-name=letsencrypt-prod
+          - --default-issuer-kind=ClusterIssuer
         image: controller:latest
         name: manager
         ports: []
         securityContext:
           allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
           capabilities:
             drop:
             - "ALL"

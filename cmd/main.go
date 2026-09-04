@@ -19,18 +19,25 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -39,6 +46,7 @@ import (
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/internal/controller"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -50,8 +58,75 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
+	// cert-manager 的 Certificate 由本 operator 创建并 watch，必须进 scheme。
+	utilruntime.Must(cmapi.AddToScheme(scheme))
+
 	utilruntime.Must(certsv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
+}
+
+// operatorOptions 是本 operator 自有 flag（spec §9）。
+type operatorOptions struct {
+	DefaultIssuerName, DefaultIssuerKind, DefaultIssuerGroup     string
+	ResyncInterval, DriftCheckInterval, CASProbeInterval         time.Duration
+	IssuanceStallThreshold, CloudCallTimeout, CleanupGracePeriod time.Duration
+	CleanupFailurePolicy                                         string
+	WatchNamespaces                                              []string
+
+	// watchNamespacesRaw 是 --watch-namespaces 的原始逗号分隔值，由 validate 展开。
+	watchNamespacesRaw string
+}
+
+// registerOperatorFlags 把 flag 注册到给定 FlagSet；main 传 flag.CommandLine，测试传新建的 FlagSet。
+// 返回的 options 在 fs.Parse 之后才有值，随后必须调用 validate()。
+func registerOperatorFlags(fs *flag.FlagSet) *operatorOptions {
+	o := &operatorOptions{}
+	fs.StringVar(&o.DefaultIssuerName, "default-issuer-name", "",
+		"Name of the Issuer to use when spec.certificateTemplate.issuerRef is not set")
+	fs.StringVar(&o.DefaultIssuerKind, "default-issuer-kind", "Issuer", "Kind of the default issuer")
+	fs.StringVar(&o.DefaultIssuerGroup, "default-issuer-group", "cert-manager.io", "Group of the default issuer")
+	fs.DurationVar(&o.ResyncInterval, "certificate-resync-interval", time.Hour,
+		"Periodic resync of AliyunCertificate (Secret drift detection channel)")
+	fs.DurationVar(&o.DriftCheckInterval, "drift-check-interval", time.Hour,
+		"Periodic Observe of binding targets (used by Plan 2)")
+	fs.DurationVar(&o.CASProbeInterval, "cas-probe-interval", 12*time.Hour,
+		"How often to verify the current certificate still exists in CAS")
+	fs.DurationVar(&o.IssuanceStallThreshold, "issuance-stall-threshold", 6*time.Hour,
+		"Issuing=True longer than this marks IssuanceStalled")
+	fs.DurationVar(&o.CloudCallTimeout, "cloud-call-timeout", 30*time.Second,
+		"Timeout for every Alibaba Cloud API call")
+	fs.DurationVar(&o.CleanupGracePeriod, "cleanup-grace-period", 15*time.Minute,
+		"How long to retry cloud cleanup in finalizers before applying cleanup-failure-policy")
+	fs.StringVar(&o.CleanupFailurePolicy, "cleanup-failure-policy", "Abandon", "Abandon | Block")
+	fs.StringVar(&o.watchNamespacesRaw, "watch-namespaces", "", "Comma-separated namespaces to watch; empty = all")
+	return o
+}
+
+// validate 在 Parse 之后校验并展开派生字段。
+func (o *operatorOptions) validate() error {
+	if o.CleanupFailurePolicy != controller.CleanupPolicyAbandon && o.CleanupFailurePolicy != controller.CleanupPolicyBlock {
+		return fmt.Errorf("--cleanup-failure-policy 必须是 Abandon 或 Block，得到 %q", o.CleanupFailurePolicy)
+	}
+	o.WatchNamespaces = nil
+	for _, n := range strings.Split(o.watchNamespacesRaw, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			o.WatchNamespaces = append(o.WatchNamespaces, n)
+		}
+	}
+	return nil
+}
+
+// parseOperatorFlags 供测试使用：独立 FlagSet 上注册、解析、校验。
+func parseOperatorFlags(args []string) (*operatorOptions, error) {
+	fs := flag.NewFlagSet("operator", flag.ContinueOnError)
+	o := registerOperatorFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if err := o.validate(); err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
 // nolint:gocyclo
@@ -64,6 +139,8 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	// 值在 flag.Parse() 之后才填充。
+	opts := registerOperatorFlags(flag.CommandLine)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -81,13 +158,18 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	opts := zap.Options{
+	zapOpts := zap.Options{
 		Development: true,
 	}
-	opts.BindFlags(flag.CommandLine)
+	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
+
+	if err := opts.validate(); err != nil {
+		setupLog.Error(err, "invalid flags")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -178,34 +260,59 @@ func main() {
 		})
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgrOpts := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "ae3d60a3.bestheme.ac.cn",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
-	})
+		LeaderElectionID:       "certs.bestheme.ac.cn",
+		// manager 停止后本进程立刻退出，所以主动让出 lease 是安全的，也让接班的副本不必
+		// 空等一整个 LeaseDuration。
+		LeaderElectionReleaseOnCancel: true,
+		Client: client.Options{Cache: &client.CacheOptions{
+			// Secret 不进 cache：零副本，RBAC 不需要 list/watch。
+			DisableFor: []client.Object{&corev1.Secret{}},
+		}},
+	}
+	if len(opts.WatchNamespaces) > 0 {
+		mgrOpts.Cache.DefaultNamespaces = map[string]cache.Config{}
+		for _, ns := range opts.WatchNamespaces {
+			mgrOpts.Cache.DefaultNamespaces[ns] = cache.Config{}
+		}
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	if err := (&controller.AliyunCertificateReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	if err := controller.RegisterIndexes(mgr); err != nil {
+		setupLog.Error(err, "unable to register indexes")
+		os.Exit(1)
+	}
+	limiters := aliyun.NewLimiters()
+	casCache := aliyun.NewClientCache()
+	certReconciler := &controller.AliyunCertificateReconciler{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("aliyuncertificate"),
+		// Secret 已 DisableFor，mgr.GetClient() 对它就是直读。
+		CASFactory:             controller.NewCASFactory(mgr.GetClient(), casCache, limiters, opts.CloudCallTimeout),
+		ResyncInterval:         opts.ResyncInterval,
+		CASProbeInterval:       opts.CASProbeInterval,
+		IssuanceStallThreshold: opts.IssuanceStallThreshold,
+		CleanupGracePeriod:     opts.CleanupGracePeriod,
+		CleanupFailurePolicy:   opts.CleanupFailurePolicy,
+	}
+	certReconciler.SetIssuerDefaults(controller.IssuerDefaults{
+		Name:  opts.DefaultIssuerName,
+		Kind:  opts.DefaultIssuerKind,
+		Group: opts.DefaultIssuerGroup,
+	})
+	if err := certReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AliyunCertificate")
 		os.Exit(1)
 	}
