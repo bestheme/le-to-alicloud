@@ -349,6 +349,10 @@ spec:
                 type: string
               certManagerCertificateName:
                 type: string
+              cleanupStartedAt:
+                description: 首次进入删除分支的时间，用于 --cleanup-grace-period 计时。
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

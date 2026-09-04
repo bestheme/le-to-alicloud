@@ -192,6 +192,9 @@ type AliyunCertificateStatus struct {
 	PendingUpload *PendingUpload `json:"pendingUpload,omitempty"`
 	// +optional
 	CASProbedAt *metav1.Time `json:"casProbedAt,omitempty"`
+	// 首次进入删除分支的时间，用于 --cleanup-grace-period 计时。
+	// +optional
+	CleanupStartedAt *metav1.Time `json:"cleanupStartedAt,omitempty"`
 	// +optional
 	// +listType=map
 	// +listMapKey=type

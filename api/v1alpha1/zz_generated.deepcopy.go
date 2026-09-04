@@ -249,6 +249,10 @@ func (in *AliyunCertificateStatus) DeepCopyInto(out *AliyunCertificateStatus) {
 		in, out := &in.CASProbedAt, &out.CASProbedAt
 		*out = (*in).DeepCopy()
 	}
+	if in.CleanupStartedAt != nil {
+		in, out := &in.CleanupStartedAt, &out.CleanupStartedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

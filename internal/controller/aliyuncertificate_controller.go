@@ -110,7 +110,7 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 	orig := ac.DeepCopy()
 
-	// 0. 删除分支（Task 13 实现完整清理；此处先保证 finalizer 可被摘除）
+	// 0. 删除分支（deletion.go）
 	if !ac.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, ac, orig)
 	}
@@ -287,15 +287,6 @@ func (r *AliyunCertificateReconciler) handleCloudError(ctx context.Context, ac, 
 		r.aggregateReady(ac)
 		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
 	}
-}
-
-// reconcileDelete 是删除分支（Task 13 替换本实现）。
-func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, _ *certsv1alpha1.AliyunCertificate) (ctrl.Result, error) {
-	if controllerutil.ContainsFinalizer(ac, certsv1alpha1.FinalizerName) {
-		controllerutil.RemoveFinalizer(ac, certsv1alpha1.FinalizerName)
-		return ctrl.Result{}, r.Update(ctx, ac)
-	}
-	return ctrl.Result{}, nil
 }
 
 // secretNameConflict 判断目标 Secret 是否已被别人占用。
