@@ -122,8 +122,12 @@ func (r *AliyunCertificateReconciler) ensureUploaded(ctx context.Context, ac, or
 		log.Info("uploaded to CAS", "certId", certID)
 	}
 
-	if ac.Status.Current != nil {
-		ac.Status.History = append([]certsv1alpha1.CertificateGeneration{*ac.Status.Current}, ac.Status.History...)
+	// 指纹为空的 current 是探测留下的占位（probeCAS 判定云上那张已经不在了，就把 certId
+	// 与指纹一起清空好触发重传），它不指向任何一张证书，绝不能进 history：三重护栏一条都
+	// 拦不住它（空串不等于任何 appliedFingerprint，uploadedAt 也早过了 minAge），于是它会
+	// 白占一个 keepLast 槽位，还把 excess 抬高一位，逼着回收多删一代真正的旧证书。
+	if c := ac.Status.Current; c != nil && c.Fingerprint != "" {
+		ac.Status.History = append([]certsv1alpha1.CertificateGeneration{*c}, ac.Status.History...)
 	}
 	ac.Status.Current = &gen
 	return true, nil

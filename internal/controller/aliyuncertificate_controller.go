@@ -238,7 +238,7 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 	}
 	missing, err := r.probeCAS(ctx, ac, primary)
 	if err != nil {
-		return r.handleCloudError(ctx, ac, orig, "ListUserCertificateOrder", err)
+		return r.handleProbeError(ctx, ac, orig, err)
 	}
 	if missing {
 		// 探测的结论必须先落盘。ensureUploaded 会用 APIReader 直读 CR 把代次换成权威值，
@@ -344,6 +344,33 @@ func (r *AliyunCertificateReconciler) handleCloudError(ctx context.Context, ac, 
 		r.aggregateReady(ac)
 		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
 	}
+}
+
+// handleNonFatalCloudError 处理「云调用失败了，但当前这张证书没有任何问题」的那一类错误
+// （控制器裁决 R21 回收失败、R24 探测失败）。
+//
+// 这两件事都是旁路动作：当前代次早就上传成功、正在服役。删不掉一张没人引用的旧证书、
+// 或者列不出证书清单，都说明不了它有任何问题。若沿用 handleCloudError，一次失败就会把
+// Uploaded / Ready 打成 False，Binding 侧会跟着认为证书不可用而连锁停摆——用一个无害的
+// 失败换来一场真实的故障。RAM 只少给一个 ListUserCertificateOrder 权限就足以触发这条路径，
+// 而且每 12h 复发一次。所以这里一个 condition 都不碰，只发一条 Warning 事件。
+//
+// logMsg 与 kv 只进日志：事件是广播给用户的对象，云错误原文可能夹带 request id 之类的细节。
+func (r *AliyunCertificateReconciler) handleNonFatalCloudError(
+	ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate,
+	err error, reason, message, logMsg string, kv ...any,
+) (ctrl.Result, error) {
+	logf.FromContext(ctx).Error(err, logMsg, kv...)
+	r.Recorder.Event(ac, corev1.EventTypeWarning, reason, message)
+	// aggregateReady 只读 Issued / Uploaded，上面没动过，判定与成功时完全一致。
+	r.aggregateReady(ac)
+	if perr := r.patchStatus(ctx, ac, orig); perr != nil {
+		return ctrl.Result{}, perr
+	}
+	if aliyun.ClassOf(err) == aliyun.ClassRetryable {
+		return ctrl.Result{}, err // 交给 controller-runtime 指数退避
+	}
+	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
 // secretNameConflict 判断目标 Secret 是否已被别人占用。

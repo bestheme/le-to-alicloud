@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -67,4 +68,27 @@ func (r *AliyunCertificateReconciler) probeCAS(ctx context.Context, ac *certsv1a
 	ac.Status.Current.CertID = nil
 	ac.Status.Current.Fingerprint = ""
 	return true, nil
+}
+
+// probeFailedMessage 是 ProbeFailed 事件的固定文案。事件是广播给用户的对象，云错误原文
+// 可能夹带 request id 之类的细节，那些只进日志。
+const probeFailedMessage = "failed to verify the CAS certificate still exists; the current certificate is unaffected"
+
+// handleProbeError 处理探测失败（控制器裁决 R24）。
+//
+// 探测是旁路的一致性检查，不是签发链路的一环：列不出证书清单，说明不了正在服役的这一张
+// 有任何问题。最常见的触发方式是 RAM 少给了一个 ListUserCertificateOrder 权限——上传与
+// 删除都好好的，却会每 12h 把证书打成 Ready=False 一次。所以按 R21 的先例只发事件。
+//
+// casProbedAt 在列表失败时不会推进（probeCAS 在 FindUploaded 成功之后才写它），下一轮会
+// 重试；失败是 ClassAuth 这类不可重试的错误时，节奏由 ResyncInterval 兜住。
+func (r *AliyunCertificateReconciler) handleProbeError(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate, err error) (ctrl.Result, error) {
+	kv := []any{}
+	if c := ac.Status.Current; c != nil {
+		kv = append(kv, "fingerprint", shortFP(c.Fingerprint))
+		if c.CertID != nil {
+			kv = append(kv, "certId", *c.CertID)
+		}
+	}
+	return r.handleNonFatalCloudError(ctx, ac, orig, err, "ProbeFailed", probeFailedMessage, "CAS 存在性探测失败", kv...)
 }

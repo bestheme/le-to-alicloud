@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki/testutil"
 )
 
@@ -200,8 +202,47 @@ var _ = Describe("证书 controller：Diverged 与 CAS 探测", func() {
 		Expect(got.Status.PendingUpload).To(BeNil())
 		Expect(condTrue(got, certsv1alpha1.ConditionReady)).To(BeTrue())
 
+		// 探测把 current 清成了指纹为空的占位，它不指向任何证书，绝不能被推进 history：
+		// 三重护栏一条都拦不住它，只会白占一个 keepLast 槽位并逼着回收多删一代真证书。
+		Expect(got.Status.History).To(BeEmpty(), "重传前只有一代，占位不该进 history")
+		for _, h := range got.Status.History {
+			Expect(h.Fingerprint).NotTo(BeEmpty(), "history 里不该出现指纹为空的占位")
+		}
+
 		// 探测时间戳跟着推进：不会每一轮都去列一次，更不会反复重传
 		Consistently(func() int { return currentCAS().UploadCalls() }, "1500ms", "200ms").Should(Equal(2))
+	})
+
+	// R24：探测是旁路的一致性检查。RAM 少给一个 ListUserCertificateOrder 权限就够触发它，
+	// 而上传与删除完全正常——把一张健康的证书打成 Ready=False，会让 Binding 侧连锁停摆。
+	It("探测失败不降级 Ready / Uploaded，只发 ProbeFailed 事件", func() {
+		ns := newNamespace(ctx)
+		freeze(time.Now())
+		Expect(k8sClient.Create(ctx, baseAC(ns, "apifail"))).To(Succeed())
+		crt, key := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
+		simulateIssuance(ctx, ns, "apifail", 1, crt, key)
+		eventually(func() bool {
+			a := getAC(ctx, ns, "apifail")
+			return a.Status.Current != nil && a.Status.Current.CertID != nil
+		})
+		id1 := *getAC(ctx, ns, "apifail").Status.Current.CertID
+
+		// 只有 List 失败：上传与删除的权限都好好的
+		currentCAS().QueueFindErr(&aliyun.Error{
+			Class: aliyun.ClassAuth, Op: "ListUserCertificateOrder", Code: "Forbidden.RAM", Err: errors.New("denied")})
+		advance(13 * time.Hour)
+		touch(ns, "apifail", "1")
+
+		eventually(func() bool { return acEventMessage(ctx, ns, "apifail", "ProbeFailed") == probeFailedMessage })
+		Consistently(func() bool {
+			a := getAC(ctx, ns, "apifail")
+			return condStatus(a, certsv1alpha1.ConditionUploaded) == metav1.ConditionTrue &&
+				condStatus(a, certsv1alpha1.ConditionReady) == metav1.ConditionTrue
+		}, "1500ms", "200ms").Should(BeTrue())
+		// 列不出清单 ≠ 证书丢了：不许重传，也不许把 current 清掉
+		Expect(currentCAS().UploadCalls()).To(Equal(1))
+		Expect(currentCAS().Has(id1)).To(BeTrue())
+		Expect(*getAC(ctx, ns, "apifail").Status.Current.CertID).To(Equal(id1))
 	})
 
 	It("current 已过期时跳过探测，不把过期证书误判成丢失", func() {
