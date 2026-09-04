@@ -14,11 +14,29 @@ spec:
     singular: aliyuncertificatebinding
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Applied")].status
+      name: Applied
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Conflict")].status
+      name: Conflict
+      type: string
+    - jsonPath: .spec.certificateRef.name
+      name: Certificate
+      type: string
+    - jsonPath: .spec.target.fc3CustomDomain.domainName
+      name: Target
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: AliyunCertificateBinding is the Schema for the aliyuncertificatebindings
-          API.
+        description: AliyunCertificateBinding 把一张 AliyunCertificate 部署到一个阿里云目标。
         properties:
           apiVersion:
             description: |-
@@ -38,17 +56,147 @@ spec:
           metadata:
             type: object
           spec:
-            description: AliyunCertificateBindingSpec defines the desired state of
-              AliyunCertificateBinding.
+            description: AliyunCertificateBindingSpec 定义期望状态。
             properties:
-              foo:
-                description: Foo is an example field of AliyunCertificateBinding.
-                  Edit aliyuncertificatebinding_types.go to remove/update
+              certificateRef:
+                description: LocalObjectReference 引用同 namespace 的 AliyunCertificate。
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              credentialsRef:
+                description: 缺省继承 certificateRef 所指证书的 aliyun.credentialsRef。
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              deletionPolicy:
+                default: Orphan
+                description: DeletionPolicy 决定删除 Binding 时是否解绑云侧证书。
+                enum:
+                - Orphan
+                - Unbind
                 type: string
+              target:
+                description: 不可变：改目标请新建 Binding。
+                properties:
+                  fc3CustomDomain:
+                    description: FC3CustomDomainTarget 指向一个 FC3 自定义域名。证书归属于域名，与函数无关。
+                    properties:
+                      domainName:
+                        minLength: 1
+                        type: string
+                      ensureHTTPSProtocol:
+                        description: 为 true 且域名当前 protocol 不含 HTTPS 时，才把 protocol
+                          改为 "HTTP,HTTPS"。默认不动。
+                        type: boolean
+                      region:
+                        minLength: 1
+                        type: string
+                    required:
+                    - domainName
+                    - region
+                    type: object
+                  type:
+                    enum:
+                    - FC3CustomDomain
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: target 不可变，请新建 Binding
+                  rule: self == oldSelf
+                - message: fc3CustomDomain 必须且只能在 type=FC3CustomDomain 时设置
+                  rule: 'self.type == ''FC3CustomDomain'' ? has(self.fc3CustomDomain)
+                    : !has(self.fc3CustomDomain)'
+            required:
+            - certificateRef
+            - target
             type: object
           status:
-            description: AliyunCertificateBindingStatus defines the observed state
-              of AliyunCertificateBinding.
+            description: AliyunCertificateBindingStatus 定义观测状态。
+            properties:
+              appliedFingerprint:
+                description: 目标上实际生效的证书指纹。
+                type: string
+              boundAccountId:
+                description: 首次成功 Apply 时固化，用于账号 fencing。
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastAppliedTime:
+                format: date-time
+                type: string
+              lastObservedTime:
+                format: date-time
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
             type: object
         type: object
     served: true
