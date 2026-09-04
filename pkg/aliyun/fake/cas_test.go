@@ -23,8 +23,8 @@ func TestFake_TokenIdempotent(t *testing.T) {
 	if len(f.Certs()) != 1 {
 		t.Errorf("只应有 1 张证书")
 	}
-	if f.UploadCalls != 2 {
-		t.Errorf("UploadCalls = %d, want 2", f.UploadCalls)
+	if f.UploadCalls() != 2 {
+		t.Errorf("UploadCalls = %d, want 2", f.UploadCalls())
 	}
 	if !f.Has(id1) {
 		t.Errorf("Has(%d) 应为 true", id1)
@@ -88,8 +88,8 @@ func TestFake_DeleteRemoves(t *testing.T) {
 	if f.Has(id) {
 		t.Errorf("删除后 Has 应为 false")
 	}
-	if f.DeleteCalls != 1 {
-		t.Errorf("DeleteCalls = %d, want 1", f.DeleteCalls)
+	if f.DeleteCalls() != 1 {
+		t.Errorf("DeleteCalls = %d, want 1", f.DeleteCalls())
 	}
 }
 
@@ -121,6 +121,47 @@ func TestFake_QueuedErrors(t *testing.T) {
 	}
 }
 
+// TestFake_ConcurrentCounters 模拟 Tasks 10-14 的 envtest 形态：
+// 一个 goroutine 扮演 reconciler 调用 fake，另一个扮演 Ginkgo 的 Eventually 读计数。
+// 计数字段导出为裸 int 时，这个测试在 -race 下必然报 data race。
+func TestFake_ConcurrentCounters(t *testing.T) {
+	f := fake.NewCAS()
+	ctx := context.Background()
+
+	const n = 50
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < n; i++ {
+			_, _ = f.Upload(ctx, "c", nil, nil, "t")
+			_ = f.Delete(ctx, 1, "")
+			_, _ = f.FindUploaded(ctx, "")
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			if got := f.UploadCalls(); got != n {
+				t.Errorf("UploadCalls = %d, want %d", got, n)
+			}
+			if got := f.DeleteCalls(); got != n {
+				t.Errorf("DeleteCalls = %d, want %d", got, n)
+			}
+			if got := f.FindCalls(); got != n {
+				t.Errorf("FindCalls = %d, want %d", got, n)
+			}
+			return
+		default:
+			// 与写入并发地读，正是 race detector 要抓的模式
+			_ = f.UploadCalls()
+			_ = f.DeleteCalls()
+			_ = f.FindCalls()
+			_ = f.Certs()
+		}
+	}
+}
+
 func TestFake_FindUploaded(t *testing.T) {
 	f := fake.NewCAS()
 	ctx := context.Background()
@@ -147,7 +188,7 @@ func TestFake_FindUploaded(t *testing.T) {
 		t.Errorf("按域名应只命中一张，得到 %v", hit)
 	}
 
-	if f.FindCalls != 2 {
-		t.Errorf("FindCalls = %d, want 2", f.FindCalls)
+	if f.FindCalls() != 2 {
+		t.Errorf("FindCalls = %d, want 2", f.FindCalls())
 	}
 }

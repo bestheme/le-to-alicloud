@@ -22,8 +22,9 @@ type Cert struct {
 	Token   string
 }
 
-// CAS 实现 aliyun.CASClient。内部状态请通过 Certs / Has 读取；
-// 计数字段 UploadCalls / DeleteCalls / FindCalls 无锁保护，仅在调用静止后读取。
+// CAS 实现 aliyun.CASClient。所有状态都在 mu 之下；
+// 请通过 Certs / Has / UploadCalls / DeleteCalls / FindCalls 读取，
+// 这些方法持锁，可以安全地在 reconciler goroutine 与测试 goroutine 之间并发使用。
 type CAS struct {
 	mu sync.Mutex
 
@@ -37,9 +38,9 @@ type CAS struct {
 
 	failAfterCommit error
 
-	UploadCalls int
-	DeleteCalls int
-	FindCalls   int
+	uploadCalls int
+	deleteCalls int
+	findCalls   int
 }
 
 func NewCAS() *CAS {
@@ -86,7 +87,7 @@ func pop(q *[]error) error {
 func (f *CAS) Upload(_ context.Context, name string, certPEM, keyPEM []byte, token string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.UploadCalls++
+	f.uploadCalls++
 	if err := pop(&f.uploadErrs); err != nil {
 		return 0, err
 	}
@@ -116,7 +117,7 @@ func (f *CAS) Upload(_ context.Context, name string, certPEM, keyPEM []byte, tok
 func (f *CAS) Delete(_ context.Context, certID int64, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.DeleteCalls++
+	f.deleteCalls++
 	if err := pop(&f.deleteErrs); err != nil {
 		return err
 	}
@@ -130,7 +131,7 @@ func (f *CAS) Delete(_ context.Context, certID int64, _ string) error {
 func (f *CAS) FindUploaded(_ context.Context, domainHint string) ([]aliyun.CertSummary, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.FindCalls++
+	f.findCalls++
 	if err := pop(&f.findErrs); err != nil {
 		return nil, err
 	}
@@ -161,5 +162,14 @@ func (f *CAS) Certs() []Cert {
 	}
 	return out
 }
+
+// UploadCalls 返回 Upload 的调用次数。持锁，可与 reconciler goroutine 并发调用。
+func (f *CAS) UploadCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.uploadCalls }
+
+// DeleteCalls 返回 Delete 的调用次数。持锁，可与 reconciler goroutine 并发调用。
+func (f *CAS) DeleteCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.deleteCalls }
+
+// FindCalls 返回 FindUploaded 的调用次数。持锁，可与 reconciler goroutine 并发调用。
+func (f *CAS) FindCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.findCalls }
 
 var _ aliyun.CASClient = (*CAS)(nil)

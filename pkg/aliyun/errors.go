@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/alibabacloud-go/tea/dara"
+	tea "github.com/alibabacloud-go/tea/tea"
 )
 
 // ErrClass 决定 controller 如何处置错误。
@@ -74,22 +75,36 @@ func Classify(op string, err error) error {
 		return &Error{Class: ClassRetryable, Op: op, Code: "NetTimeout", Err: err}
 	}
 
-	var sdkErr *dara.SDKError
-	if errors.As(err, &sdkErr) {
-		code := ""
-		if sdkErr.Code != nil {
-			code = *sdkErr.Code
-		}
-		status := 0
-		if sdkErr.StatusCode != nil {
-			status = *sdkErr.StatusCode
-		}
-		// 只保留 Code 与 StatusCode，丢弃 Message/Data 以免回显请求体
-		safe := fmt.Errorf("sdk error code=%s status=%d", code, status)
-		return &Error{Class: classifyCode(code, status), Op: op, Code: code, Err: safe}
+	// dara.SDKError 是 SDK 内层的错误类型。
+	var daraErr *dara.SDKError
+	if errors.As(err, &daraErr) {
+		return fromSDKError(op, daraErr.Code, daraErr.StatusCode)
+	}
+
+	// tea.SDKError 是 darabonba-openapi 实际返回给调用方的类型：client.go 在
+	// DisableSDKError 未设置时对每个错误调用 dara.TeaSDKError()，把 *dara.SDKError
+	// 转成独立的 *tea.SDKError。真实 CAS 调用走的是这一条分支。
+	var teaErr *tea.SDKError
+	if errors.As(err, &teaErr) {
+		return fromSDKError(op, teaErr.Code, teaErr.StatusCode)
 	}
 
 	return &Error{Class: ClassPermanent, Op: op, Code: "Unknown", Err: err}
+}
+
+// fromSDKError 由 SDK 错误的 Code / StatusCode 构造分类错误。
+// 只保留这两项，丢弃 Message/Data/Detail 以免把请求体回显进日志。
+func fromSDKError(op string, codePtr *string, statusPtr *int) error {
+	code := ""
+	if codePtr != nil {
+		code = *codePtr
+	}
+	status := 0
+	if statusPtr != nil {
+		status = *statusPtr
+	}
+	safe := fmt.Errorf("sdk error code=%s status=%d", code, status)
+	return &Error{Class: classifyCode(code, status), Op: op, Code: code, Err: safe}
 }
 
 func classifyCode(code string, status int) ErrClass {
