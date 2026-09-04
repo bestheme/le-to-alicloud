@@ -5418,7 +5418,17 @@ func parseOperatorFlags(args []string) (*operatorOptions, error) {
 }
 ```
 
+`operatorOptions` 结构体需增加非导出字段 `watchNamespacesRaw string`。`main()` 中把 operator 的 flag 注册到全局 `flag.CommandLine`，与脚手架自带的 flag 一起 `flag.Parse()`：
 
+```go
+	opts := registerOperatorFlags(flag.CommandLine) // 值在 flag.Parse() 之后才填充
+	// ...脚手架原有的 metrics / probe / leader-election flag 注册保持不动...
+	flag.Parse()
+	if err := opts.validate(); err != nil {
+		setupLog.Error(err, "invalid flags")
+		os.Exit(1)
+	}
+```
 
 manager 构造：
 
