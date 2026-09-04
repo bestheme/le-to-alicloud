@@ -64,6 +64,10 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          # 关掉 zap 的 development 模式：它把日志级别降到 Debug 并换成 console 编码，
+          # 采集侧就再也解析不出结构化字段了（spec §13 要求生产不采集 debug 级）。
+          # 代码里保留 Development: true 的默认值，`make run` 本地开发仍然好读。
+          - --zap-devel=false
           - --default-issuer-name=letsencrypt-prod
           - --default-issuer-kind=ClusterIssuer
         image: controller:latest
