@@ -230,6 +230,14 @@ spec:
 status:
   observedGeneration: 2
   appliedFingerprint: "ab12cd34…"             # 目标上实际生效的指纹
+  driftedFingerprint: "ef56ab78…"             # 可选；上一轮观测到的「漂移证书」指纹
+                                              # （既不是我们上次写的，也不是当前该写的）；
+                                              # 未观测到漂移时为空。存在的唯一理由是给
+                                              # DriftCorrected 事件与 drift 计数器一个
+                                              # 「上一轮」的比较基准——漂移在 Apply 修好
+                                              # 之前每一轮都还在，没有这条痕迹事件就会
+                                              # 随重试节奏一轮一轮重发（§10.2「只在状态
+                                              # 跃迁时发」）
   lastAppliedTime: "…"
   lastObservedTime: "…"                       # 最近一次 Observe 的时间（drift 检测）
   boundAccountId: "1234567890"                # 首次成功 Apply 时固化，用于账号 fencing
@@ -287,7 +295,9 @@ const (
     ReasonUploadFailed             = "UploadFailed"
     ReasonThrottled                = "Throttled"
     ReasonDeletionBlocked          = "DeletionBlockedByBindings"
+    ReasonCleanupFailed            = "CleanupFailed"
     ReasonCleanupAbandoned         = "CleanupAbandoned"
+    ReasonUploadDisabled           = "UploadDisabled"            // uploadToCAS=false 时 Uploaded 的 reason
     ReasonReady                    = "Ready"
 )
 
@@ -298,8 +308,10 @@ const (
     ReasonTargetNotFound      = "TargetNotFound"
     ReasonDomainNotCovered    = "DomainNotCovered"
     ReasonConflictingBinding  = "ConflictingBinding"
+    ReasonNoConflict          = "NoConflict"        // Conflict=False 的 reason：同目标只有自己，或自己是仲裁胜者
     ReasonAccountMismatch     = "AccountMismatch"
     ReasonApplyFailed         = "ApplyFailed"
+    ReasonObserveFailed       = "ObserveFailed"     // Observe 失败；旁路 reason，只在 Applied 已存在时覆写
     ReasonDriftCorrected      = "DriftCorrected"
     ReasonApplied             = "Applied"
 )
@@ -331,8 +343,11 @@ const (
     - privateKey.encoding 缺省填 PKCS1（FC3 示例、CAS 私钥头列表、CDN 转换指引三处一致指向 PKCS#1）
  4. 镜像 Certificate.status 到 status.issuance
     - Issuing=True 持续超过 --issuance-stall-threshold（默认 6h）
-      → Issued=False/IssuanceStalled + Warning event + metric
-    - Certificate 未 Ready → Issued=False/CertificateNotReady，return（靠 watch）
+      → Issued=False/IssuanceStalled + Warning event + metric，**但不结束本轮**：
+        status.current 指向的仍是一张有效、正在服役的证书，探测 / 回收 / 复读 Secret
+        都必须照常进行（与 §5.2 步骤 9 旁路化、§5.7 回收失败不降级同一条原则）
+    - Certificate 未 Ready → Issued=False/CertificateNotReady，return（靠 watch）；
+      停滞时不覆写这个 reason，否则「已经卡了几小时」这条信息会被抹平
  5. APIReader 读 Secret，校验（§5.4）；任一不通过 → Issued=False/<reason>，不上传，
     **不清空 status.current**（Secret 短暂消失再回来时不能被当作新代次）
  6. 指纹 == status.current.fingerprint → 跳到 8
@@ -495,8 +510,9 @@ type CertMaterial struct {
     DNSNames    []string
 }
 
+// 刻意没有 Exists 字段：「目标不存在」是一个错误（CodeTargetNotFound），不是一种观测
+// 结果——Observe 返回 nil error 就已经意味着目标在。
 type ObservedState struct {
-    Exists             bool
     CurrentFingerprint string // 目标实际证书的指纹；"" = 无证书
     Protocol           string
     AccountID          string // fencing
@@ -508,12 +524,16 @@ type Capabilities struct {
     RequiresCASUpload      bool // true ⇒ 强制 uploadToCAS，用户不可关
 }
 
+// Client 是通用层构造好、交给 provider 使用的云客户端；具体类型由 provider 自行断言
+// （FC3 断言为 aliyun.FC3Client），与 Target.Spec 同构。
+type Client any
+
 type Provider interface {
     Name() string
     Capabilities() Capabilities
-    Observe(ctx context.Context, t Target, c Credentials) (ObservedState, error)
-    Apply(ctx context.Context, t Target, c Credentials, m CertMaterial, o ApplyOptions) error
-    Cleanup(ctx context.Context, t Target, c Credentials, policy DeletionPolicy) error
+    Observe(ctx context.Context, t Target, c Client) (ObservedState, error)
+    Apply(ctx context.Context, t Target, c Client, m CertMaterial, o ApplyOptions) error
+    Cleanup(ctx context.Context, t Target, c Client, policy DeletionPolicy) error
 }
 
 type ApplyOptions struct {
@@ -540,6 +560,8 @@ type ProviderError struct {
 | CAS 上传 | 通用层；`RequiresCASUpload` ⇒ 强制 |
 | 重试 / 退避 / status / event | 通用层；provider 只返回分类过的 error |
 | 凭证与 client 构造 | 通用层；provider 收到已构造的 client |
+
+**三个方法的第三形参为什么是 `Client`（`any`）而不是 `Credentials`**：不同 provider 需要的是不同的云 client（FC3 要 `FC3Client`，将来的 CDN / CLB 要各自的），而注册表把它们放在同一个 `map[string]Provider` 里——**注册表是异构的，不能给 `Provider` 加类型参数**，否则这个 map 无法成立。所以接口收的是一个已经构造好的 `Client`，由 provider 自己断言成它要的具体类型（断言失败返回 `CodeInvalidClient`，属接线错误而非运行时错误），而不是原始 `Credentials`；凭证解析与 client 构造留在通用层，与上表最后一行一致。
 
 **注册**：`init()` 中 `provider.Register(&fc3.Provider{})`，通用层 `map[string]Provider`。新增 provider = 一个包 + 一个 CRD 内嵌字段 + 一条 CEL 规则，不动状态机。新增 provider 需 CRD 与 operator 同版本发布（sync-wave 已覆盖）。
 
@@ -635,7 +657,7 @@ rules:
 | `--cleanup-grace-period` | `15m` | finalizer 内云侧清理的有界时长 |
 | `--cleanup-failure-policy` | `Abandon` | `Abandon` / `Block` |
 | `--watch-namespaces` | 空（全集群） | 逗号分隔；配合 namespace 级 Role |
-| `--leader-elect` | `true` | `LeaderElectionReleaseOnCancel: true` |
+| `--leader-elect` | `false`（部署清单显式传 `--leader-elect` 开启） | `LeaderElectionReleaseOnCancel: true` |
 
 ---
 
@@ -647,7 +669,8 @@ rules:
 # 到期与新鲜度——最重要的两个
 aliyuncert_certificate_not_after_timestamp_seconds{namespace,name}     gauge
 aliyuncert_binding_applied_age_seconds{namespace,name,provider}        gauge
-  # 目标上生效证书的年龄。独有失败模式：续期成功但没推到线上。必须告警。
+  # 滞后时长：证书 CR 的 status.current 推进后，Binding 尚未把该代应用到目标的持续秒数；
+  # 已同步时为 0。独有失败模式：续期成功但没推到线上。必须告警。
 
 # 状态
 aliyuncert_certificate_ready{namespace,name}                           gauge 0/1
@@ -673,16 +696,55 @@ aliyuncert_aliyun_api_duration_seconds{service,action}                 histogram
 
 ### 10.2 Events
 
-只在**状态跃迁**时发，Message 不含变量（避免 event 洪水，K8s 只聚合 Reason+Message 完全相同的事件）：
+只在**状态跃迁**时发，Message 为固定文案、不含变量（避免 event 洪水，K8s 只聚合
+Reason+Message 完全相同的事件）。下表是证书 controller 实际发出的全部事件，与
+`internal/controller/*.go` 的 `Recorder.Event` 调用一一对应。
 
-`Normal Uploaded` · `Warning UploadFailed` · `Normal Reclaimed` · `Normal Applied` · `Warning ApplyFailed` · `Warning DriftCorrected` · `Warning DeletionBlocked` · `Warning IssuerDefaultDiverged` · `Warning SelfSignedDuringIssuance` · `Warning CleanupAbandoned`
+| 类型 | Reason | 发出点 | 触发条件 |
+|---|---|---|---|
+| Warning | `CertificateRecreated` | `aliyuncertificate_controller.go` | 已建过的 cert-manager Certificate 又被创建了一次（LE 配额护栏，应恒为 0） |
+| Warning | `IssuanceStalled` | `aliyuncertificate_controller.go` | `Issuing=True` 超过 `--issuance-stall-threshold` |
+| Warning | `SelfSignedDuringIssuance` | `aliyuncertificate_controller.go` | Secret 里是自签临时证书且 `Issuing=True`；`loadMaterial` 的其它 reason 只置 condition 不发事件 |
+| Warning | `IssuerDefaultDiverged` | `aliyuncertificate_controller.go` | 固化的 issuer 与当前 `--default-issuer-*` 不一致 |
+| Warning | `UploadFailed` | `aliyuncertificate_controller.go` | `handleCloudError` 的 default 分支（不可重试的云错误）；Retryable 与 Auth 分支只置 condition，不发事件 |
+| Warning | `ReclaimFailed` | `retention.go` → `aliyuncertificate_controller.go` | 保留策略回收失败；不改 `Uploaded` / `Ready` |
+| Warning | `ProbeFailed` | `probe.go` | CAS 存在性探测失败；不改 condition、不中断本轮 |
+| Warning | `CASCertificateMissing` | `probe.go` | 探测发现 `current.certId` 已不在 CAS，将重新上传 |
+| Warning | `DeletionBlockedByBindings` | `deletion.go` | 删除被存活的 Binding 阻塞 |
+| Warning | `CleanupAbandoned` | `deletion.go` | 有界清理超时且策略为 `Abandon`，CAS 侧留下孤儿证书 |
+| Normal | `Reclaimed` | `retention.go` | 一代旧证书被回收 |
+| Normal | `Uploaded` | `upload.go` | 新代次上传成功 |
+
+**与早期草案的差异（以代码为准）**：`DeletionBlocked` 的实际 reason 是
+`DeletionBlockedByBindings`（`api/v1alpha1/conditions.go` 的 `ReasonDeletionBlocked`
+常量值）；`CertificateRecreated`、`CASCertificateMissing`、`ProbeFailed`、
+`ReclaimFailed`、`IssuanceStalled` 五个是实现期新增的。
+
+**绑定 controller 的事件**由 Plan 2 交付，reason 常量已在 `api/v1alpha1/conditions.go`
+中定义：
+
+| 类型 | Reason | 发出点 | 触发条件 |
+|---|---|---|---|
+| Normal | `Applied` | `binding_apply.go` | `Applied` condition 由「不存在 / False」跃迁到 True（健康对象每轮都发就成了噪声） |
+| Warning | `ApplyFailed` | `binding_apply.go` | Apply 失败，且失败 reason 相对上一轮发生了变化 |
+| Warning | `ObserveFailed` | `binding_observe.go` | Observe 失败，且失败 reason 相对上一轮发生了变化 |
+| Warning | `DriftCorrected` | `binding_observe.go` | 观测到的指纹既不是 `appliedFingerprint` 也不是 current（漂移），将纠正 |
+| Warning | `CleanupAbandoned` | `binding_deletion.go` | `Unbind` 解绑超出 `--cleanup-grace-period` 且策略为 `Abandon` |
+
+「reason 变化时才发」与表头那句「只在状态跃迁时发」是同一条规则：一个持续失败的目标不该
+每个 `--drift-check-interval` 就刷一条事件。跃迁的比较基准来自本轮开始前 API server 上的
+那一份 status——`ApplyFailed` 比 `Applied` condition 的 reason，`DriftCorrected` 比
+`status.driftedFingerprint`。`ObserveFailed` 额外受一条约束：`Applied` condition 尚不存在
+时（从没成功绑过的对象）不凭空造 `Applied=False`，因而也没有可收敛的基准，这一轮不发事件。
+
+`NoConflict` 是 `Conflict=False` 的 condition reason，**不发事件**（正常态无需广播）。
 
 ### 10.3 建议随附的 PrometheusRule
 
 两条独立告警，缺一不可：
 
 - `aliyuncert_certificate_not_after_timestamp_seconds - time() < 7*86400`（证书即将过期）
-- `aliyuncert_binding_applied_age_seconds > 86400 and on(namespace,name) aliyuncert_certificate_ready == 1`（证书更新了但线上没跟上）
+- `aliyuncert_binding_applied_age_seconds > 86400 and on(namespace,name) aliyuncert_certificate_ready == 1`（证书更新了但线上没跟上）。按滞后语义，该式子表示「证书已推进超过一天而线上仍是旧代」——同步完成时该指标归 0，因此不会对健康证书误报。
 
 以及 `increase(aliyuncert_certmanager_certificate_recreated_total[1d]) > 0`、`increase(aliyuncert_cleanup_abandoned_total[1d]) > 0`。
 
@@ -744,19 +806,27 @@ type FC3Client interface {
 
 ### 12.3 真实环境集成测试（必测清单——实现前先做，结论写入代码注释）
 
+编号是契约：`test/integration/` 的探针按这里的编号 `Record`，`test/integration/RESULTS.md`
+按同一套编号回填，因此**已定的编号不再改动**，新问题只在表末追加。**已核实的行以 `RESULTS.md` 为唯一依据**，不在此处推断超出实测的结论。
+
 | # | 待核实 | 影响 |
 |---|---|---|
-| 1 | FC3 与 CAS 各自对 PKCS#1 / PKCS#8 / `EC PRIVATE KEY` 私钥的接受情况（CAS 文档只列了 PKCS#1 与 EC，CDN 文档要求 PKCS#8 转 PKCS#1） | 决定 6 的默认编码；`privateKey.encoding: PKCS8` 是否要在 CRD 层直接拒绝 |
+| 1 | ~~CAS 对 PKCS#1 / PKCS#8 / `EC PRIVATE KEY` 私钥的接受情况~~ **CAS 侧已核实**：PKCS#1 RSA、SEC1 EC、PKCS#8 三种未加密编码**一律接受**（各自上传成功）；带 `Proc-Type: 4,ENCRYPTED` 头的私钥块被拒，错误码 `PrivateKeyFormatException`（Permanent）——CAS 报的是格式错误而非配对错误。**FC3 侧未测**（`CertConfig.privateKey` 的接受情况由 FC3 探针补测，仍记在本行下） | 决定 6 的默认编码；`privateKey.encoding: PKCS8` 是否要在 CRD 层直接拒绝。CAS 侧已确定三种编码都不需要转换 |
 | 2 | `UpdateCustomDomain` 全量替换 vs 部分合并（构造含 routeConfig+wafConfig+tlsConfig 的域名，只提交 certConfig） | read-modify-write 两种语义下都安全，但决定 last-write-wins 风险大小 |
-| 3 | CAS `ClientToken` 语义（同 token 重复上传返回同 certId？报错？有效期？） | write-ahead 幂等能否落地 |
-| 4 | CAS `Name` 是否接受 `-` / `.` | 命名 sanitize 规则 |
-| 5 | LE 链（leaf + intermediate，无 root）FC3 与 CAS 是否都接受、是否要求带根证书、顺序是否敏感 | §5.4 第 7 条 PEM 规范化的输出形状 |
-| 6 | 给 TLS Secret 追加指向 AliyunCertificate 的 ownerRef，cert-manager 的 SSA 是否保留 | 若保留，可消掉 `secrets: delete` 和 finalizer 顺序难题 |
-| 7 | Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision` | 不缓存 Secret 决定的盲区大小 |
-| 8 | CAS 单账号上传证书数量配额 | `cleanup_abandoned_total` 是否必须配告警 |
-| 9 | ~~CAS endpoint 是否 region 化~~ **已核实**（Go SDK v4 内置 `EndpointMap`）：全部中国区域及 `eu-west-1` / `us-east-1` / `us-west-1` 映射到同一个 `cas.aliyuncs.com`；`ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `me-central-1` / `ap-south-1` / `me-east-1` 各有独立 endpoint（`cas.<region>.aliyuncs.com`）。结论：CAS **部分 region 化**，`casRegion` 字段保留；实现上把 `casRegion` 作为 SDK `RegionId` 传入，由 SDK 的 `EndpointRule=regional` 自动选 endpoint，`endpointOverride` 非空时直接覆盖 | `casRegion` 语义已定；仍需实测同一账号在 `cas.aliyuncs.com` 与 `cas.ap-southeast-1.aliyuncs.com` 上传的证书是否互相可见 |
-| 10 | FC3 API 账号级频控阈值与 Throttling 错误码 | drift 1h 在数百 Binding 下是否安全；错误分类表 |
-| 11 | cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在 | `SecretNameConflict` 判定依据 |
+| 3 | ~~CAS `ClientToken` 语义（同 token 重复上传返回同 certId？报错？有效期？）~~ **已核实**：`ClientToken` **不做上传幂等**——同 token、同 Name 重传直接报 `NameRepeat`（Permanent），而不是回放首次的 certId | write-ahead 幂等能否落地；结论见 `test/integration/RESULTS.md`。既然不幂等，write-ahead 的崩溃恢复 100% 依赖 `isDuplicateName` → `findByName` 认领既有 certId 这条路径 |
+| 4 | ~~CAS `Name` 是否接受 `-` / `.`~~ **已核实**：两者都**接受**，且**原样保存、不做归一化**（回查云上存的名字与提交值逐字相同） | 命名 sanitize 规则；`findByName` 可以按提交的名字精确比对，无需考虑云侧改名 |
+| 5 | ~~LE 链（leaf + intermediate，无 root）FC3 与 CAS 是否都接受、是否要求带根证书、顺序是否敏感~~ **CAS 侧已核实**：leaf + 其签发 CA（两块）**接受**，**仅 leaf 也接受**（故不要求带根）；把 CA 放在 leaf 前面**被拒**（`NotMatch.CertificateAndPrivateKey`，Permanent）——**顺序敏感，leaf 必须在首位**。这两条合起来说明 LE 的「leaf + intermediate、无 root」形状在 CAS 可用。**FC3 侧未测**（由 FC3 探针补测，仍记在本行下） | §5.4 第 7 条 PEM 规范化的输出形状：只需保证 leaf 在首位，不需要补根 |
+| 6 | 给 TLS Secret 追加指向 AliyunCertificate 的 ownerRef，cert-manager 的 SSA 是否保留 | 若保留，可消掉 `secrets: delete` 和 finalizer 顺序难题。**仍未核实**：探针已写好，但集成环境的集群上 cert-manager 已不存在，本轮跳过 |
+| 7 | Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision` | 不缓存 Secret 决定的盲区大小。**仍未核实**：同 #6，集群上无 cert-manager |
+| 8 | ~~CAS 单账号上传证书数量配额~~ **部分核实**：空 `Keyword` 列举当前返回 **0 张**已上传证书（`Status` 留空的列举**不含已过期证书**；配了 `ALIYUN_RESOURCE_GROUP_ID` 时**仅限该资源组**）。**配额上限本身未实测**——撞上限会污染账号，需在控制台「数字证书管理服务 → 证书管理 → 上传证书」页核对账号总量与上限 | `cleanup_abandoned_total` 是否必须配告警。列举语义已定：存在性探测按 Name 客户端过滤时要意识到过期证书不在默认结果里 |
+| 9 | ~~CAS endpoint 是否 region 化~~ **已核实**（Go SDK v4 内置 `EndpointMap`）：全部中国区域及 `eu-west-1` / `us-east-1` / `us-west-1` 映射到同一个 `cas.aliyuncs.com`；`ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `me-central-1` / `ap-south-1` / `me-east-1` 各有独立 endpoint（`cas.<region>.aliyuncs.com`）。结论：CAS **部分 region 化**，`casRegion` 字段保留；实现上把 `casRegion` 作为 SDK `RegionId` 传入，由 SDK 的 `EndpointRule=regional` 自动选 endpoint，`endpointOverride` 非空时直接覆盖。**跨 endpoint 可见性也已核实**：两个 endpoint 的证书集合**互相隔离（双向验证）**——同一份 PEM 在 `cn-hangzhou` 与 `ap-southeast-1` 分别上传得到两个不在同一量级的 certId，各自在对方的列举里都看不见，是**两套独立的 ID 空间**而非复制延迟 | `casRegion` 语义已定。隔离意味着 `casRegion` 一旦改变，`status.current.certId` 在新 endpoint 上必然查不到，存在性探测会重新上传一次——这是预期行为，不是 bug |
+| 10 | FC3 API 账号级频控阈值与 Throttling 错误码，**特别是错误码是否以 `Throttling` 开头** | drift 1h 在数百 Binding 下是否安全；错误分类表。不以 `Throttling` 开头则 `aliyun.Classify` 会把限流判成不可重试，退避逻辑失效 |
+| 11 | cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在 | `SecretNameConflict` 判定依据。**仍未核实**：同 #6，集群上无 cert-manager |
+| 12 | ~~CAS `Keyword` 对通配符域名（`*.example.com`）的匹配行为~~ **已核实**：`Keyword` 对证书域名字符串做**任意子串匹配**，且**不做 DNS 通配符展开**。SAN 为 `*.it.integration.invalid` 的证书，用 `*.it.integration.invalid`、`it.integration.invalid`、`integration`、甚至非标签边界的 `ntegratio` 都能查到，而通配符本应覆盖的 `probe.it.integration.invalid` **查不到**。这同时排除了 DNS 通配符语义、后缀匹配、前缀匹配、按标签对齐的包含四种候选规则 | 通配符证书的首个 SAN 会被原样当 Keyword 传给 `ListUserCertificateOrder`；匹配不到就会让存在性探测持续误判「证书丢了」并反复重传。结论是安全的：原样传 SAN 一定能命中自己 |
+| 13 | ~~CAS 同名不同 `ClientToken` 上传返回的真实错误码~~ **已核实**：`NameRepeat`（Permanent）。**不在**生产代码原先猜的三个候选码里，已追加进 `internal/controller/upload.go` 的 `isDuplicateName` | 认错则 `DuplicateName → findByName` 的认领路径失效，write-ahead 崩溃恢复会退化成反复失败的上传 |
+| 14 | FC3 `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。认不出时需补 `pkg/aliyun/errors.go` 的 `classifyCode` |
+
+**FC3 侧的三项探测分别归到哪一行**（刻意不新开编号——同一个问题两个编号会让 `RESULTS.md` 的回填对不上）：`GetCustomDomain` 对不存在域名的错误码归 **#14**（新增）；限流错误码是否以 `Throttling` 开头归 **#10**（既有行，措辞已补全）；`CertConfig` 对 PKCS#1 / EC 私钥的接受情况归 **#1**、对 LE 链形状（leaf+intermediate、仅 leaf）的接受情况归 **#5**（两行本来就写的是「FC3 与 CAS 各自 / 都」，只是至今只测了 CAS 一侧）。
 
 ---
 
@@ -774,9 +844,11 @@ type FC3Client interface {
 1. FC3 Get/Update 之间无已确认的乐观锁，last-write-wins（§6.3）。
 2. `yundun-cert:*` 无法资源级收窄（§8.3）。
 3. 不缓存 Secret 的盲区：Secret 被替换为合法但不同的证书且 cert-manager 不 bump revision 时，最多延迟一个 resync 周期（1h）才被发现（§12.3 #7）。
-4. CAS 命名字符集、ClientToken 语义、region 化均待实测；其中 ClientToken 若不支持幂等，退化为 `ListUserCertificateOrder` 分页查询（QPS 10）。
+4. ~~CAS 命名字符集、ClientToken 语义、region 化均待实测~~ 三项均已实测（§12.3 #3 / #4 / #9）：`ClientToken` **不提供上传幂等**，write-ahead 的崩溃恢复已按预案退化为 `DuplicateName → findByName` 的认领路径（`ListUserCertificateOrder`，QPS 10）。
 5. `Abandon` 清理策略可能在 CAS 留下孤儿证书（有计数器和 event，需人工清理）。
 6. cert-manager 依赖是编译期的：pin module 版本，README 写明最低支持的 cert-manager 版本。
+7. CAS 证书名不含 namespace（`sanitize(CR名)[:50] + "_" + fingerprint[:12]`）。撞名的前提是两个不同 namespace 的同名 CR 持有完全相同的 leaf DER，cert-manager 正常签发不会产生这种形状；兜底是 `DuplicateName → findByName` 认领既有 certId，以及 12h 的存在性探测。**引入 `ReferencesCertByID: true` 的 provider（CDN / CLB / ALB）之前必须重新评估**——那时 certId 悬空的代价会大得多。
+8. `record.EventRecorder`（旧 events API）在 controller-runtime v0.24 已弃用。迁移到 `events.EventRecorder` 要改动全部事件调用点（证书侧 12 处 + 绑定侧 4 处）并为每条事件补一个 `action` 参数，属于行为变更，暂以 `.golangci.yml` 的一条排除规则挂起。
 
 ---
 
