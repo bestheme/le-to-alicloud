@@ -72,9 +72,16 @@ var (
 		Name: "aliyuncert_certmanager_certificate_recreated_total",
 		Help: "Times the cert-manager Certificate was (re)created after first creation; should stay 0",
 	}, crLabels)
+	// 两个 controller 共用这一个计数器，reason label 上因此跑着**两套词表**
+	// （见 providerErrClass 的注释）。help 文本必须自己说清楚这件事：代码注释给不到
+	// 看板与告警的作者，他们读到的只有这一行。
 	cleanupAbandonedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_cleanup_abandoned_total",
-		Help: "Number of AliyunCertificate deletions that abandoned CAS cleanup",
+		Help: "Deletions that abandoned cloud cleanup after the grace period: " +
+			"AliyunCertificate giving up on CAS certificate deletion, or " +
+			"AliyunCertificateBinding giving up on unbinding the certificate from its target. " +
+			"The reason label carries two vocabularies, one per controller " +
+			"(aliyun error class vs provider error code)",
 	}, []string{"region", "reason"})
 	// spec §10.1 的两个 API 级指标。casUploadTotal / casDeleteTotal 只覆盖写通道，
 	// 而 ListUserCertificateOrder 才是限流最紧（QPS 8、burst 1）也最容易被 RAM 权限

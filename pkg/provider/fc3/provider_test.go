@@ -77,7 +77,7 @@ func TestProvider_ObserveEmptyAndCertified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !obs.Exists || obs.CurrentFingerprint != "" || obs.Protocol != "HTTP" || obs.AccountID != "1234567890" {
+	if obs.CurrentFingerprint != "" || obs.Protocol != "HTTP" || obs.AccountID != "1234567890" {
 		t.Fatalf("空证书域名的观测不对: %+v", obs)
 	}
 
@@ -311,7 +311,7 @@ func TestProvider_ObserveUnparsableCertIsNoCert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("云上证书解析失败不该让 Observe 报错: %v", err)
 	}
-	if !obs.Exists || obs.CurrentFingerprint != "" || obs.Protocol != "HTTPS" {
+	if obs.CurrentFingerprint != "" || obs.Protocol != "HTTPS" {
 		t.Errorf("应观测成「域名在、但没有我们的证书」: %+v", obs)
 	}
 }

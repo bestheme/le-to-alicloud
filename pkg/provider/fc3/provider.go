@@ -63,7 +63,6 @@ func (p *Provider) Observe(ctx context.Context, t provider.Target, c provider.Cl
 			toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonObserveFailed)
 	}
 	obs := provider.ObservedState{
-		Exists:    true,
 		Protocol:  cd.Protocol,
 		AccountID: cd.AccountID,
 	}

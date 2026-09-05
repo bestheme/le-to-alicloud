@@ -36,8 +36,11 @@ type CertMaterial struct {
 }
 
 // ObservedState 是 Observe 的结论，也是幂等判断唯一的真相来源。
+//
+// 刻意没有 Exists 字段：「目标不存在」是一个**错误**（CodeTargetNotFound），不是一种
+// 观测结果——Observe 返回 nil error 就已经意味着目标在。留一个恒为 true 的布尔只会让
+// 下一个 provider 以为自己可以用它表达别的意思。
 type ObservedState struct {
-	Exists             bool
 	CurrentFingerprint string // 目标上实际证书的指纹；"" = 目标上没有证书
 	Protocol           string
 	AccountID          string // 账号 fencing 用
