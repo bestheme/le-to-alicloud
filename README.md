@@ -323,14 +323,422 @@ kubectl get aliyuncertificate,aliyuncertificatebinding -o wide
 
 ## Flags
 
+### operator 自有 flag
+
+注册在 `cmd/main.go` 的 `registerOperatorFlags`。
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--default-issuer-name` | 空 | `spec.certificateTemplate.issuerRef` 未写、且 `status.effectiveIssuerRef` 尚未固化时使用的 Issuer 名。为空且 CR 也没写，`Issued` 会停在 `NoIssuer` |
+| `--default-issuer-kind` | `Issuer` | 默认 issuer 的 Kind |
+| `--default-issuer-group` | `cert-manager.io` | 默认 issuer 的 Group |
+| `--certificate-resync-interval` | `1h` | 证书 controller 的周期 resync。**Secret 不进 cache，这是漂移检测的承重通道**——调大它等于按比例放大「Secret 被换掉但没人发现」的窗口 |
+| `--drift-check-interval` | `1h` | 绑定 controller 的周期 Observe：每隔这么久回读一次目标上实际生效的证书，发现漂移就纠正 |
+| `--cas-probe-interval` | `12h` | CAS 存在性探测的节流间隔：`status.current.certId` 是否还在云上 |
+| `--issuance-stall-threshold` | `6h` | cert-manager 的 `Issuing=True` 持续超过这个时长即判 `IssuanceStalled` |
+| `--cloud-call-timeout` | `30s` | 每一次阿里云 API 调用的 context 超时 |
+| `--cleanup-grace-period` | `15m` | finalizer 内云侧清理的有界时长，超时后按 `--cleanup-failure-policy` 处置 |
+| `--cleanup-failure-policy` | `Abandon` | `Abandon`：超时后放弃清理、计数并发 `Warning CleanupAbandoned`，对象照常删除；`Block`：保持 finalizer 持续重试，对象停在 Terminating。取值只有这两个，其它值 operator 启动即退出 |
+| `--watch-namespaces` | 空（全集群） | 逗号分隔的 namespace 列表。配合 namespace 级 Role 才能真正收窄 `secrets: get`；开启它会削弱跨 namespace 仲裁，见「已知限制」 |
+
+这些说明与 `/manager --help` 打印的英文 help 文本一一对应，例如 `--drift-check-interval` 的 help 是 `How often each AliyunCertificateBinding re-reads the certificate on its target to detect and correct drift`。
+
+### 脚手架 flag
+
+controller-runtime / kubebuilder 脚手架带来的 flag，注册在 `cmd/main.go` 的 `main`。
+
+| flag | 代码默认 | 说明 |
+|---|---|---|
+| `--metrics-bind-address` | `0`（关闭） | metrics 监听地址。`config/operator/manager_metrics_patch.yaml` 在部署时把它改成 `:8443` |
+| `--health-probe-bind-address` | `:8081` | healthz / readyz 监听地址；部署清单显式再传一次同值 |
+| `--leader-elect` | `false` | **代码默认关闭**，`config/manager/manager.yaml` 的 `args` 显式传 `--leader-elect` 打开。`LeaderElectionReleaseOnCancel: true`，进程退出即让出 lease |
+| `--metrics-secure` | `true` | metrics 走 HTTPS 并挂上 authn/authz filter |
+| `--enable-http2` | `false` | 默认关闭 HTTP/2，规避 Rapid Reset / Stream Cancellation 两个 CVE |
+| `--webhook-cert-path` / `--webhook-cert-name` / `--webhook-cert-key` | 空 / `tls.crt` / `tls.key` | 本版没有 webhook，留着是脚手架原样 |
+| `--metrics-cert-path` / `--metrics-cert-name` / `--metrics-cert-key` | 空 / `tls.crt` / `tls.key` | 不设 path 时 controller-runtime 自签一张 metrics 证书 |
+| `--kubeconfig` | 空 | 由 controller-runtime 的 client config 注册，只在集群外运行（`make run`）时需要 |
+| `--zap-devel` | `true` | 由 `zapOpts.BindFlags(flag.CommandLine)` 注册。`true` 时 encoder=console、logLevel=Debug |
+| `--zap-encoder` / `--zap-log-level` / `--zap-stacktrace-level` / `--zap-time-encoding` | 由 `--zap-devel` 推导 | 同上 |
+
+`config/manager/manager.yaml` 显式传了 `--zap-devel=false`：development 模式会把日志级别降到 Debug 并换成 console 编码，采集侧就解析不出结构化字段，而 debug 级日志在本项目里是要防的（见「威胁模型」）。代码里保留 `Development: true` 的默认值是为了 `make run` 本地开发好读。
+
+看一眼当前部署实际传了什么：
+
+```bash
+# oc
+oc -n le-to-alicloud-system get deploy le-to-alicloud-controller-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' | jq
+```
+
+```bash
+# kubectl
+kubectl -n le-to-alicloud-system get deploy le-to-alicloud-controller-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' | jq
+```
+
 ## 指标与告警
+
+全部自定义指标注册在 `internal/controller/metrics.go` 的 `init()`，共 15 条，前缀一律 `aliyuncert_`。controller-runtime 自带的 `controller_runtime_*` / `workqueue_*` / `rest_client_*` 照常暴露。
+
+**基数纪律**：`fingerprint` / `certId` 绝不进 label——它们每轮换一次就长出一条永不消失的 series。`result` 只有 `success` / `throttled` / `error` 三个取值。
+
+### 证书 controller
+
+| 指标 | 类型 | label | 含义 |
+|---|---|---|---|
+| `aliyuncert_certificate_not_after_timestamp_seconds` | gauge | `namespace`, `name` | 当前代次（`status.current`）的到期时间，Unix 秒 |
+| `aliyuncert_certificate_ready` | gauge | `namespace`, `name` | `Ready` condition 为 True 时 1 |
+| `aliyuncert_certificate_issuance_stalled` | gauge | `namespace`, `name` | `Issued` 的 reason 是 `IssuanceStalled` 时 1 |
+| `aliyuncert_issuer_default_diverged` | gauge | `namespace`, `name` | 固化的 issuer 与当前 `--default-issuer-*` 不一致时 1 |
+| `aliyuncert_cas_upload_total` | counter | `result` | CAS 上传尝试 |
+| `aliyuncert_cas_delete_total` | counter | `result` | CAS 删除尝试；`NotFound` 记为 `success`（删除的目的已经达到） |
+| `aliyuncert_certmanager_certificate_recreated_total` | counter | `namespace`, `name` | cert-manager `Certificate` 在首次创建之后又被创建了一次。**应恒为 0**：重建会消耗 ACME 配额 |
+| `aliyuncert_cleanup_abandoned_total` | counter | `region`, `reason` | 超出 `--cleanup-grace-period` 后放弃云侧清理的次数。**必须配告警**：每一次都意味着云上多一件需要人工收拾的孤儿。两个 controller 共用这一个计数器，`reason` 上跑着两套词表，见「已知限制」 |
+| `aliyuncert_aliyun_api_requests_total` | counter | `service`, `action`, `code` | 阿里云 OpenAPI 调用计数。`service` 取 `cas` / `fc` |
+| `aliyuncert_aliyun_api_duration_seconds` | histogram | `service`, `action` | 同上的时延，默认 bucket |
+
+`aliyun_api_*` 两条覆盖读写全通道，`cas_upload_total` / `cas_delete_total` 只覆盖写。`ListUserCertificateOrder` 是限流最紧、也最容易被 RAM 少给一条权限卡住的那一个动作，只有 `aliyuncert_aliyun_api_requests_total{action="ListUserCertificateOrder"}` 答得上「探测是不是一直在失败」。
+
+### 绑定 controller
+
+| 指标 | 类型 | label | 含义 |
+|---|---|---|---|
+| `aliyuncert_binding_applied_age_seconds` | gauge | `namespace`, `name`, `provider` | **滞后时长**：证书 CR 的 `status.current` 推进之后，本 Binding 尚未把该代应用到目标的持续秒数；已同步时为 0。**不是**「生效证书的年龄」 |
+| `aliyuncert_binding_ready` | gauge | `namespace`, `name` | Binding 的 `Ready` condition 为 True 时 1 |
+| `aliyuncert_binding_conflict` | gauge | `namespace`, `name` | Binding 的 `Conflict` condition 为 True（同一目标被多个 Binding 争用）时 1 |
+| `aliyuncert_binding_apply_total` | counter | `provider`, `result` | Apply 尝试 |
+| `aliyuncert_binding_drift_detected_total` | counter | `provider` | Observe 发现目标上的证书被 operator 之外改动的次数 |
+
+三个 gauge 的 `namespace` / `name` 指的是 **Binding 对象**，不是它引用的 `AliyunCertificate`。`provider` 的取值目前只有 `FC3CustomDomain`（`pkg/provider/fc3` 的 `Name()`）。
+
+抓一份看看：
+
+```bash
+# oc
+oc -n le-to-alicloud-system port-forward deploy/le-to-alicloud-controller-manager 8443:8443
+# 另开一个终端
+TOKEN=$(oc -n le-to-alicloud-system create token le-to-alicloud-controller-manager)
+curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/metrics | grep '^aliyuncert_'
+```
+
+```bash
+# kubectl
+kubectl -n le-to-alicloud-system port-forward deploy/le-to-alicloud-controller-manager 8443:8443
+# 另开一个终端
+TOKEN=$(kubectl -n le-to-alicloud-system create token le-to-alicloud-controller-manager)
+curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/metrics | grep '^aliyuncert_'
+```
+
+### 告警
+
+`config/prometheus/prometheusrule.yaml` 里四条，覆盖四种彼此独立的失败模式，删掉任何一条都会留下盲区。
+
+| alert | 表达式 | for | severity |
+|---|---|---|---|
+| `AliyunCertificateExpiringSoon` | `aliyuncert_certificate_not_after_timestamp_seconds - time() < 7 * 86400` | `1h` | critical |
+| `AliyunCertificateBindingStale` | `aliyuncert_binding_applied_age_seconds > 86400` | `1h` | critical |
+| `AliyunCertificateManagerCertRecreated` | `increase(aliyuncert_certmanager_certificate_recreated_total[1d]) > 0` | — | warning |
+| `AliyunCertificateCleanupAbandoned` | `increase(aliyuncert_cleanup_abandoned_total[1d]) > 0` | — | warning |
+
+**前两条为什么缺一不可。** 到期告警只看证书本身还有多久过期，它对「续期成功了但没推到线上」是沉默的：CAS 上的新证书好好的，`not_after` 一直很远，而 FC3 域名上挂的仍是旧的那张。新鲜度告警只看目标落后了多久，它对「根本没续上」是沉默的：一张压根没换代的证书，滞后恒为 0。两条各自覆盖对方的盲区。
+
+**`AliyunCertificateBindingStale` 刻意没有 `and on (namespace, name) aliyuncert_certificate_ready == 1` 这个守卫。** 两个指标的 `namespace` / `name` 指的不是同一个对象——前者是 Binding 的，后者是 `AliyunCertificate` 的。仓库自带样例就是证书 `timehorse-api` 配 Binding `timehorse-api-fc3`，`on` 匹配不上，加上守卫整条表达式恒为空，这条必配的告警会静默失效。去掉它是安全的：滞后时长在证书尚未签发（`status.current` 为 nil 或 fingerprint 为空）时直接是 0，产生不了非零 lag。**看到「少了个守卫」不要把它加回来。**
+
+离线核对四条规则在位：
+
+```bash
+./bin/kustomize build config/overlays/openshift | grep -c "alert:"
+```
+
+应输出 `4`。
+
+### OpenShift user-workload monitoring
+
+openshift overlay 里的 `ServiceMonitor` 与 `PrometheusRule` 落在用户 namespace（`le-to-alicloud-system`）。**OpenShift 默认的平台 Prometheus 不看用户 namespace 的这两类对象**——必须先打开 user-workload monitoring，规则才会被评估、指标才会被抓取。apply 成功但没有任何告警评估，最常见的原因就是这一条没开。
+
+先看现状：
+
+```bash
+# oc
+oc -n openshift-monitoring get configmap cluster-monitoring-config \
+  -o jsonpath='{.data.config\.yaml}'
+```
+
+```bash
+# kubectl
+kubectl -n openshift-monitoring get configmap cluster-monitoring-config \
+  -o jsonpath='{.data.config\.yaml}'
+```
+
+输出里必须有 `enableUserWorkload: true`。ConfigMap 不存在或没有这一行时，需要建出来 / 补上：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true
+```
+
+生效后 `openshift-user-workload-monitoring` namespace 里会起一组 Pod：
+
+```bash
+# oc
+oc -n openshift-user-workload-monitoring get pods
+```
+
+```bash
+# kubectl
+kubectl -n openshift-user-workload-monitoring get pods
+```
+
+**告警文案里的 label 名要按 UWM 的重标规则核对一遍。** UWM 抓取用户工作负载时 `honorLabels` 默认是 false（本仓库的 `config/prometheus/monitor.yaml` 也没有显式设置它），target 侧自带的 `namespace` / `name` 会与 Prometheus 注入的同名 label 冲突，冲突的一方被重命名成 `exported_namespace` / `exported_name`。前三条告警的 `summary` 里写的是 `{{ $labels.namespace }}` / `{{ $labels.name }}`（第四条用的是 `{{ $labels.region }}`，不受影响），在你的集群上它们可能指向 operator 所在的 namespace 而不是 CR 的 namespace。第一次接入后请拿一条真实告警核对渲染结果，必要时把文案改成 `{{ $labels.exported_namespace }}` / `{{ $labels.exported_name }}`，或在 `ServiceMonitor` 的 endpoint 上显式设 `honorLabels: true`。
 
 ## RAM 权限
 
+两份策略原文各自只有一个来源，**README 不复制它们的内容**——同一份策略抄两处迟早会漂移，而这类文件漂移的后果是线上权限配错。
+
+| 文件 | 给谁 | 内容 |
+|---|---|---|
+| `docs/ram/certificate-cas-policy.json` | 证书 controller（`spec.aliyun.uploadToCAS: true` 时需要） | `yundun-cert` 的 `UploadUserCertificate` / `DeleteUserCertificate` / `ListUserCertificateOrder` |
+| `docs/ram/binding-fc3-policy.json` | 绑定 controller | `fc:GetCustomDomain` / `fc:UpdateCustomDomain`，按域名 ARN 授权 |
+
+两份都需要时，把两个文件的 `Statement` 数组合并成一份策略，或者在 RAM 里给同一个用户挂两条自定义策略。`binding-fc3-policy.json` 里的 `cn-hangzhou`、`<accountId>` 与域名都是占位，按你的实际 region / 账号 / 域名替换。
+
+```bash
+jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
+```
+
+四点差异说明：
+
+- **`yundun-cert:*` 的资源类型是「全部资源」，无法资源级收窄。** 策略里的 `"Resource": "*"` 不是偷懒，是 CAS 只支持这一种写法。持有这个 AK 就能删掉账号下**任意**上传证书。这是不可回避的爆炸半径——**必须用一个独立的 RAM 子账号 + 独立 AK**，不要复用任何现有账号的凭证。
+- **`fc` 支持逐域名 ARN 授权**（`acs:fc:{regionId}:{accountId}:custom-domains/{domainName}`），必须用上，别偷懒写 `*`。多个域名就多列几条 ARN。
+- **不要授 `yundun-cert:GetUserCertificateDetail`。** 它的响应里带私钥，而 operator 完全不需要它——上传、删除、列举三个动作就够了。授出去只是白白扩大泄漏面。
+- **只用 FC3、不需要在 CAS 控制台里看到证书的用户**：设 `spec.aliyun.uploadToCAS: false`，只挂 `docs/ram/binding-fc3-policy.json`，`yundun-cert:*` 一个都不给。此时 operator 完全不碰 CAS（不上传、不回收、不探测），`Uploaded` condition 停在 `UploadDisabled` 且不参与 `Ready` 聚合。
+
 ## 威胁模型
+
+- **私钥流经 operator 内存，并写进 FC3 的 API 请求体。** `GetCustomDomain` 的响应里同样含明文私钥。也就是说：能读 operator 日志、能 dump 它的内存、能 `oc exec` / `oc debug` 进容器的主体，等价于持有全部被管证书的私钥。缓解手段是把 operator 放在独立 namespace、收紧该 namespace 的 `exec` / `debug` / `pods/log` 权限、并且日志采集不要收 debug 级——部署清单已经传了 `--zap-devel=false`，就是为了这一条。
+- **CAS 权限无法收窄**（见上一节）：AK 一旦泄漏，可删账号下任意上传证书。用独立子账号 + 独立 AK；只用 FC3 的场景用 `uploadToCAS: false` 彻底不授 `yundun-cert:*`。
+- **凭证的同 namespace 约束由类型系统保证。** `spec.aliyun.credentialsRef` 与 Binding 的 `spec.credentialsRef` 都**没有 namespace 字段**，CRD schema 里根本不存在这个字段，所以不存在「在 A namespace 建个 CR 去读 B namespace 的云凭证」这条路径。这不是 controller 里的一个检查，是 API 形状本身的性质。
+- **不越权改线上配置。** `target.fc3CustomDomain.ensureHTTPSProtocol` 默认 `false`（不动域名的 protocol），`deletionPolicy` 默认 `Orphan`（删 Binding 不动云侧），漂移纠正只改 `certConfig` 一个字段。一次误删 CR 不会打穿生产 HTTPS。
 
 ## 已知限制
 
+1. **FC3 的 Get 与 Update 之间没有已确认的乐观锁**，是 last-write-wins。别的写入方（控制台、另一套自动化）在这个窗口里改了同一个域名，改动会被覆盖。缓解是窗口极短、写入频率极低（正常一年 4–6 次）。怎么发现：`aliyuncert_binding_drift_detected_total` 持续增长，而你并没有在手工改域名。
+
+2. **`yundun-cert:*` 无法资源级收窄**，见「RAM 权限」。必须用独立子账号。
+
+3. **不缓存 Secret 的盲区。** Secret 被换成一张合法但不同的证书、且 cert-manager 没有 bump `revision` 时，operator 要到下一次周期 resync 才发现，最多延迟一个 `--certificate-resync-interval`（默认 1h）。这一条对应 spec §12.3 的 `#7`，属于集群侧探针，跑它需要 `INTEGRATION_KUBECONFIG`；**当前提交的 `test/integration/RESULTS.md` 里没有 `#7` 这一行**，也就是说这一条尚无真实集群的实测结论。怎么发现：`status.current.fingerprint` 与 Secret 里那张的实际指纹对不上。
+
+4. **CAS 的 `ClientToken` 不提供上传幂等。** 实测（`RESULTS.md` `#3` / `#13`）：同 token 重复上传返回 `NameRepeat` 而不是原 certId。write-ahead 的崩溃恢复因此走的是预案里的退化路径——`DuplicateName → findByName`，用 `ListUserCertificateOrder` 分页查询认领既有 certId，而这个接口 QPS 只有 10。名字字符集（`-` 与 `.` 均接受）与跨 region 可见性（**不可见**，两个 endpoint 的证书集合互相隔离）同样在 `RESULTS.md` 里，`#4` 与 `#9`。跨 region 那条的直接后果：`spec.aliyun.casRegion` 改了之后，旧 region 上的证书在新 region 一条都查不到。
+
+5. **`Abandon` 清理策略会在 CAS 留下孤儿证书。** 有计数器（`aliyuncert_cleanup_abandoned_total`）和事件（`Warning CleanupAbandoned`），**必须配告警**，否则孤儿会静默吃满账号配额。怎么发现：`AliyunCertificateCleanupAbandoned` 告警触发；处置是去 CAS 控制台按事件里记的 `casName` 手工删除。
+
+6. **cert-manager 依赖是编译期的**：module 钉在 v1.21.1，运行期建议同版本，更低版本未验证。
+
+7. **CAS 证书名不含 namespace。** 名字是 `sanitize(CR名)[:50] + "_" + fingerprint[:12]`，两个不同 namespace 的同名 CR 只要持有完全相同的 leaf DER（即同一把私钥、同一张证书），在 CAS 上就会撞名。cert-manager 正常签发不会产生这种形状（每次签发都是新私钥），但手工复制 Secret、或者两个 CR 指向同一个已存在的 Secret 就会。兜底是 `DuplicateName → findByName` 认领既有 certId，加上 12 小时一次的存在性探测。**引入 `ReferencesCertByID: true` 的 provider（CDN / CLB / ALB）之前必须重新评估这一条**——那时 certId 悬空的代价会大得多。
+
+8. **事件仍用已弃用的 `record.EventRecorder`（旧 events API）。** 迁移到 `events.EventRecorder` 要改动全部事件调用点（证书侧 12 处 + 绑定侧 4 处）并为每条补一个 `action` 参数，属于行为变更，暂以 `.golangci.yml` 的一条排除规则挂起。对使用者没有影响，`kubectl get events` 照常能看到。
+
+9. **FC3 不支持 `endpointOverride`。** `spec.aliyun.endpointOverride` 只作用于 CAS 客户端（`internal/controller/cas_factory.go`），FC3 客户端的 endpoint 恒由 region 推导，走公网默认地址（`internal/controller/provider_factory.go` 里 `Endpoint` 恒为空）。VPC 内网 / 专有云环境里 CAS 可以走内网而 FC3 不行，网络策略要为 FC3 单独放行出网。怎么发现：Binding 一直 `ApplyFailed` 且错误是连接超时，而同一个 CR 的 CAS 上传是成功的。
+
+10. **CAS 的 `Keyword` 是任意子串匹配，且不做 DNS 通配符展开。** 实测（`RESULTS.md` `#12`）：对一张 SAN 为 `*.example.com` 的证书，`Keyword` 传 `*.example.com`、`example.com`、甚至 `xampl` 这样的片段都能查到，因为它按字符串子串匹配；但传 `probe.example.com` 查不到，因为它不把通配符展开成具体子域。
+
+    现有实现（`casDomainHint` 取 `dnsNames[0]`）传的就是 `*.example.com`，**正常路径没有问题**，不存在「探测持续误判、每 12 小时重传一次」这种情况。要咬人的是反方向：把 `spec.dnsNames` 从 `*.example.com` 改成 `probe.example.com`（或任何不是它子串的域名），并且此时 `status.pendingUpload.domainHint` 这个快照已经因为上传成功而被清空——那么之后所有按 Keyword 去找旧证书的路径（存在性探测、保留策略回收、finalizer 清理）都会一无所获，CAS 上那张旧证书就被**无痕地孤儿化**，同时新域名的证书会被当成一张新证书重新上传。怎么发现：改过 `dnsNames` 之后去 CAS 控制台看，旧域名的证书还在，但没有任何 CR 的 `status` 指向它。处置：手工删除。
+
+11. **`--watch-namespaces` 生效时，跨 namespace 仲裁退化为跨已 watch namespace 仲裁。** 「同一个目标只能有一个 Binding 生效」这条约束靠 controller 自己看到的全量 Binding 列表来判定（`binding_conflict.go` 走的是带 cache 的 List）。限定 watch 范围之后，范围外的 Binding 看不见也就不参与仲裁，两个不同 namespace 的 Binding 可能同时认为自己是赢家、互相覆盖目标上的证书。怎么发现：`aliyuncert_binding_conflict` 恒为 0，而 FC3 域名上的证书在两代之间来回翻，`aliyuncert_binding_drift_detected_total` 两边都在涨。用 `--watch-namespaces` 时必须自己保证同一个 FC3 域名不被范围外的 Binding 引用。
+
+12. **`aliyuncert_cleanup_abandoned_total{reason}` 混用两套词表。** 两个 controller 共用这一个计数器：证书侧放弃清理时填的是 `aliyun.ErrClass`（`Permanent` / `Retryable` / `Auth` / `NotFound`），绑定侧填的是 `provider.Code*`（`TargetNotFound` / `Auth` / `Throttled` / `Retryable` / `Permanent` / `InvalidClient` / `InvalidTarget`）。同一个 label 上出现两套取值，其中 `Auth` / `Retryable` / `Permanent` 三个字面量还是重合的。按 `reason` 做聚合或告警时要把两套都列举出来，**不能假定它是一个封闭枚举**，也不能从 `reason` 反推是哪个 controller 放弃的——要区分请看 `region` 之外的上下文（事件与日志）。
+
 ## 故障排查
 
+### condition / reason 对照
+
+`AliyunCertificate` 的 condition 有 `Ready` / `Issued` / `Uploaded` / `IssuerDefaultDiverged`，`Ready` 是前几个的聚合。全部常量定义在 `api/v1alpha1/conditions.go`。
+
+| condition | reason | 含义 | 处置 |
+|---|---|---|---|
+| `Issued=False` | `NoIssuer` | 既没写 `issuerRef` 也没配 `--default-issuer-name` | 补 `spec.certificateTemplate.issuerRef`。**不会自动重试**，等 spec 变更 |
+| `Issued=False` | `SecretNameConflict` | 目标 Secret 已存在，且不是我们这个 `Certificate` 的产物 | 改 `spec.secretName`，或删掉占用者。每个 resync 周期自动重试 |
+| `Issued=False` | `CertificateNotReady` | cert-manager 正在签发 | 看 `describe certificate` 与它下面的 CertificateRequest / Order / Challenge |
+| `Issued=False` | `IssuanceStalled` | `Issuing=True` 超过 `--issuance-stall-threshold` | 多半是 DNS-01 solver 坏了或撞了 Let's Encrypt 速率限制。**这期间 CAS 探测、保留策略回收、Secret 复读照常进行** |
+| `Issued=False` | `SecretNotFound` | Secret 还没出现，或者被删了 | 检查 cert-manager 是否正常、Secret 是否被误删 |
+| `Issued=False` | `SecretInvalid` | 链断、公私钥不匹配、私钥被加密或编码不认 | 检查 Secret 内容。operator 拒绝上传坏证书是有意为之 |
+| `Issued=False` | `SelfSignedDuringIssuance` | Secret 里当前是自签临时证书 | 等签发完成；同时会发一条 `Warning SelfSignedDuringIssuance` |
+| `Issued=False` | `SANsMismatch` | leaf 的 SAN 没覆盖 `dnsNames` / `commonName` | 改 spec，或等 cert-manager 重签 |
+| `Uploaded=False` | `CredentialsSecretNotFound` | `aliyun.credentialsRef` 指的 Secret 不存在 | 建 Secret，会自动重试 |
+| `Uploaded=False` | `CredentialsInvalid` | AK 无效或被拒 | 换凭证。凭证错误不做热重试，长 requeue |
+| `Uploaded=False` | `UploadFailed` | 上传失败且不可重试 | 看 `Warning UploadFailed` 事件与 operator 日志 |
+| `Uploaded=False` | `Throttled` | 撞了 CAS 限流 | 会自动退避重试，通常不用管 |
+| `Uploaded=False` | `UploadDisabled` | `spec.aliyun.uploadToCAS: false` | 预期状态，不参与 `Ready` 聚合 |
+| `IssuerDefaultDiverged=True` | `IssuerDefaultDiverged` | 固化的 issuer 与当前 `--default-issuer-*` 不一致 | 证书本身是健康的，这个 condition **不参与 `Ready`**。要切 issuer 请显式写 `spec.certificateTemplate.issuerRef` |
+| （删除中） | `DeletionBlockedByBindings` | 还有存活的 Binding 引用这张证书 | 先删 Binding。已经在删除中的 Binding 不计入 |
+| （删除中） | `CleanupFailed` / `CleanupAbandoned` | 云侧清理失败 / 超时后放弃 | `CleanupAbandoned` 意味着 CAS 上留了孤儿证书，去控制台按 `casName` 手工删除 |
+
+`AliyunCertificateBinding` 的 condition 有 `Ready` / `Applied` / `Conflict`：
+
+| condition | reason | 含义 | 处置 |
+|---|---|---|---|
+| `Ready=False` | `CertificateNotFound` | `spec.certificateRef` 指的 `AliyunCertificate` 不存在 | 建证书 CR，或改 `certificateRef` |
+| `Ready=False` | `CertificateNotReady` | 证书还没通过校验，或者证书 CR 还没认下 Secret 里的这一代 | 先按上面的证书表把证书修好 |
+| `Ready=False` | `SecretNotFound` / `SecretInvalid` | 证书的 Secret 不存在 / 内容不合法 | 同证书侧 |
+| `Ready=False` | `CredentialsSecretNotFound` / `CredentialsInvalid` | 凭证 Secret 不存在 / AK 被拒 | 建 Secret 或换凭证。Binding 没写 `credentialsRef` 时继承证书的那一份 |
+| `Ready=False` | `DomainNotCovered` | 证书的 SAN 覆盖不了 `target.fc3CustomDomain.domainName` | 改证书的 `dnsNames`，或改 Binding 的目标域名（**`target` 不可变，只能新建 Binding**） |
+| `Applied=False` | `TargetNotFound` | FC3 上没有这个自定义域名 | 先在 FC3 建好域名。也可能是 region 写错了 |
+| `Applied=False` | `ApplyFailed` | 写目标失败 | 看 `Warning ApplyFailed` 事件与日志。连接超时的话看「已知限制」第 9 条 |
+| `Applied=False` | `ObserveFailed` | 回读目标失败 | 多半是 `fc:GetCustomDomain` 权限没给，或域名 ARN 写错了 |
+| `Applied=False` | `Throttled` | 撞了 FC 限流 | 自动退避重试 |
+| `Conflict=True` | `ConflictingBinding` | 同一个 FC3 域名被多个 Binding 引用，本对象不是仲裁胜者 | 删掉多余的 Binding。一个目标只该有一个 Binding |
+| `Conflict=True` | `AccountMismatch` | 目标当前所在账号与 `status.boundAccountId` 固化的不一致 | 账号 fencing 生效了。确认凭证没被换错人，必要时删 Binding 重建 |
+| `Conflict=False` | `NoConflict` | 正常态 | 无需处置，也不发事件 |
+
+### 事件
+
+只在**状态跃迁**时发，Message 是固定文案、不含变量——Kubernetes 只聚合 Reason+Message 完全相同的事件，带变量就是事件洪水。
+
+证书 controller：
+
+| 类型 | Reason | 触发条件 |
+|---|---|---|
+| Warning | `CertificateRecreated` | 已建过的 cert-manager `Certificate` 又被创建了一次（ACME 配额护栏，应恒为 0） |
+| Warning | `IssuanceStalled` | `Issuing=True` 超过 `--issuance-stall-threshold` |
+| Warning | `SelfSignedDuringIssuance` | Secret 里是自签临时证书且 `Issuing=True` |
+| Warning | `IssuerDefaultDiverged` | 固化的 issuer 与当前 `--default-issuer-*` 不一致 |
+| Warning | `UploadFailed` | 不可重试的云错误；Retryable 与 Auth 只置 condition，不发事件 |
+| Warning | `ReclaimFailed` | 保留策略回收失败；不改 `Uploaded` / `Ready` |
+| Warning | `ProbeFailed` | CAS 存在性探测失败；不改 condition、不中断本轮 |
+| Warning | `CASCertificateMissing` | 探测发现 `current.certId` 已不在 CAS，将重新上传 |
+| Warning | `DeletionBlockedByBindings` | 删除被存活的 Binding 阻塞 |
+| Warning | `CleanupAbandoned` | 有界清理超时且策略为 `Abandon`，CAS 侧留下孤儿证书 |
+| Normal | `Reclaimed` | 一代旧证书被回收 |
+| Normal | `Uploaded` | 新代次上传成功 |
+
+绑定 controller：
+
+| 类型 | Reason | 触发条件 |
+|---|---|---|
+| Normal | `Applied` | `Applied` condition 由「不存在 / False」跃迁到 True |
+| Warning | `ApplyFailed` | Apply 失败，且失败 reason 相对上一轮发生了变化 |
+| Warning | `ObserveFailed` | Observe 失败，且失败 reason 相对上一轮发生了变化 |
+| Warning | `DriftCorrected` | 观测到的指纹既不是 `appliedFingerprint` 也不是 current，将纠正 |
+| Warning | `CleanupAbandoned` | `Unbind` 解绑超出 `--cleanup-grace-period` 且策略为 `Abandon` |
+
+「reason 变化时才发」与「只在状态跃迁时发」是同一条规则：一个持续失败的目标不该每个 `--drift-check-interval` 就刷一条事件。
+
+### 排查命令
+
+```bash
+# oc
+oc get aliyuncertificate <name> -o jsonpath='{.status.conditions}' | jq
+oc describe aliyuncertificate <name>
+oc get aliyuncertificatebinding <name> -o jsonpath='{.status}' | jq
+oc -n le-to-alicloud-system logs deploy/le-to-alicloud-controller-manager | grep <name>
+oc get events --field-selector involvedObject.name=<name>
+```
+
+```bash
+# kubectl
+kubectl get aliyuncertificate <name> -o jsonpath='{.status.conditions}' | jq
+kubectl describe aliyuncertificate <name>
+kubectl get aliyuncertificatebinding <name> -o jsonpath='{.status}' | jq
+kubectl -n le-to-alicloud-system logs deploy/le-to-alicloud-controller-manager | grep <name>
+kubectl get events --field-selector involvedObject.name=<name>
+```
+
 ## 开发
+
+### make 目标
+
+| 目标 | 作用 |
+|---|---|
+| `make build` | `manifests generate fmt vet` 之后 `go build -o bin/manager cmd/main.go` |
+| `make test` | `setup-envtest` + 全量单测，写 `cover.out`（不含 `test/e2e`） |
+| `make test-race` | 同上，开竞态检测，不写覆盖率 |
+| `make lint` | golangci-lint v2.13.2；`.golangci.yml` 里配了 `integration` build tag，所以集成测试文件也在 lint 范围内 |
+| `make test-integration` | 真实云集成测试（见下）；**缺凭证时全部 skip，不 fail** |
+| `make test-e2e` | Kind 集群上的 e2e，需要预装 kind |
+| `make install` / `make uninstall` | 装 / 卸 CRD（`config/crd`） |
+| `make deploy` / `make undeploy` | 部署 / 卸载 operator（`config/default`） |
+| `make docker-buildx` | 多架构镜像，`PLATFORMS` 默认 `linux/amd64,linux/arm64` |
+| `make build-installer` | 把 `config/default` 打成单文件 `dist/install.yaml` |
+
+`make help` 会列出全部目标。
+
+### 清单布局
+
+`config/` 的结构与 operator-sdk 脚手架**有一处有意的偏离**：
+
+```
+config/
+├── crd/                  # 只有 CRD。Argo CD 的 crds Application 指向这里
+├── manager/              # Deployment 本体
+├── rbac/                 # ServiceAccount + Role / ClusterRole 及其 binding
+├── operator/             # ../rbac + ../manager + metrics Service，刻意不含 CRD
+├── default/              # ../crd + ../operator，供 make deploy 与 make build-installer
+├── prometheus/           # ServiceMonitor + PrometheusRule
+└── overlays/openshift/   # ../operator + ../prometheus，Argo CD 的 operator Application 指向这里
+```
+
+`config/operator` 是从 `config/default` 里拆出来的，`metrics_service.yaml` 与 `manager_metrics_patch.yaml`（以及注释掉的 `cert_metrics_manager_patch.yaml`）一并移了过去。理由是 **Argo CD 的两个 Application 必须拥有互不相交的资源集合**：CRD 只能有一个所有者，否则 Argo 会把它报成 shared resource 并在两边反复 sync。所以 `config/operator` 不含 CRD，`config/overlays/openshift` 也就不含 CRD；CRD 由指向 `config/crd` 的那个 Application 独占。`make deploy` 走的仍是 `config/default`，它把两边聚合回来——拆分前后 `kustomize build config/default` 的输出逐字节相同。
+
+`cert_metrics_manager_patch.yaml` 必须放在 `config/operator` 目录下，不能留在 `config/default`：kustomize 的 load restrictor 不允许 patch 路径越出 kustomization root，留在原处的话那条 `[METRICS-WITH-CERTS]` 指引一 uncomment 就会 build 失败。
+
+**重新生成脚手架时（升级 operator-sdk、重跑 `operator-sdk init` 之类）不要用生成结果覆盖 `config/operator`，也不要把那几个文件挪回 `config/default`。** 校验方式：
+
+```bash
+./bin/kustomize build config/overlays/openshift | grep -c "kind: CustomResourceDefinition"
+```
+
+必须输出 `0`。反过来，`config/default` 必须含有两个 CRD：
+
+```bash
+./bin/kustomize build config/default | grep -c "^kind: CustomResourceDefinition"
+```
+
+必须输出 `2`。
+
+### 集成测试 runbook
+
+`test/integration/` 下的探针会在**真实阿里云账号**上创建并删除证书，配了 `FC3_TEST_DOMAIN` 时还会真的改写那个域名的 `certConfig`。**不要用生产账号，不要用生产域名。**
+
+1. 建一个独立 RAM 子账号，只给「RAM 权限」一节的那两份策略，生成独立 AK。
+2. 准备环境变量：
+
+   ```bash
+   cp test/integration/env.example.sh local.env   # *.env 已被 .gitignore 挡住
+   $EDITOR local.env
+   set -a && source local.env && set +a
+   ```
+
+3. 跑：
+
+   ```bash
+   make test-integration
+   ```
+
+4. 结论落在 **`test/integration/RESULTS.md`**——它是真实云实测结论的唯一载体，spec 与本 README 里凡是写「实测结论见 `RESULTS.md` 的 `#N`」的地方指的都是它。**文件由测试生成，不要手改**，跑完把它一起提交。
+
+5. `RESULTS.md` 是**整文件覆盖**的，用 `-run` 只跑一个用例会把其它结论抹掉；要产出完整的一份必须整包跑一次 `make test-integration`。唯一的例外是全部用例都被 skip 的那次运行——那时会保留已有的 `RESULTS.md`（stderr 上打印「全部用例被 skip，保留已有的 `RESULTS.md`」），一次没凭证的运行不该把真实结论抹成一片「未实测」。
+
+6. **缺凭证时 `make test-integration` 是 skip，不是 fail。** 所以它进 CI 是安全的，但绿灯不等于跑过——判断依据是 `RESULTS.md` 有没有被更新，以及测试输出里有多少 `--- SKIP`。
+
+7. 集群侧那三项（spec §12.3 `#6` / `#7` / `#11`）需要 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 的集群，并且本项目的 CRD 已经装上（`make install`，或 `oc apply -k config/crd` / `kubectl apply -k config/crd`）。它们用 `SelfSigned` Issuer，不消耗任何 ACME 配额。留空时这三项被跳过，正常会在 `RESULTS.md` 里各留一行「未实测」。**当前提交的那一份连这三行都没有**——它是在集群侧探针没被执行到的情况下生成的，所以 `#6` / `#7` / `#11` 至今没有任何真实集群的结论。补齐它们需要配好 `INTEGRATION_KUBECONFIG` 再整包跑一次。
+
+8. **跑完集群探针要复查残留 namespace。** 探针会建一批 `it-certmgr-<随机后缀>` 的临时 namespace 并在结束时删掉：
+
+   ```bash
+   # oc
+   oc get ns | grep it-certmgr
+   ```
+
+   ```bash
+   # kubectl
+   kubectl get ns | grep it-certmgr
+   ```
+
+   如果这个集群**同时装了本 operator**，删除会卡一阵：探针在 namespace 里建的 `probe-owner` 这个 `AliyunCertificate` 带 finalizer，而它的 `credentialsRef` 指向一个并不存在的 Secret，operator 拿不到凭证就没法完成云侧清理，于是不断重试，namespace 会在 `Terminating` 停留一个宽限期（`--cleanup-grace-period`，默认 15 分钟）后才随 `Abandon` 策略放行。这是预期行为，等一等即可——**不要手工摘 finalizer**，那会跳过清理逻辑。策略配成 `Block` 的集群上它会一直卡住，需要人工介入。
+

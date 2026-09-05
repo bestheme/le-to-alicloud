@@ -88,7 +88,7 @@ func registerOperatorFlags(fs *flag.FlagSet) *operatorOptions {
 	fs.DurationVar(&o.ResyncInterval, "certificate-resync-interval", time.Hour,
 		"Periodic resync of AliyunCertificate (Secret drift detection channel)")
 	fs.DurationVar(&o.DriftCheckInterval, "drift-check-interval", time.Hour,
-		"Periodic Observe of binding targets (used by Plan 2)")
+		"How often each AliyunCertificateBinding re-reads the certificate on its target to detect and correct drift")
 	fs.DurationVar(&o.CASProbeInterval, "cas-probe-interval", 12*time.Hour,
 		"How often to verify the current certificate still exists in CAS")
 	fs.DurationVar(&o.IssuanceStallThreshold, "issuance-stall-threshold", 6*time.Hour,
