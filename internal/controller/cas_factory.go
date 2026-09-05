@@ -73,7 +73,7 @@ func NewCASFactory(reader client.Reader, cache *aliyun.ClientCache[aliyun.CASCli
 			return aliyun.NewCASClient(cred, aliyun.CASClientConfig{
 				Region: key.Region, Endpoint: key.Endpoint, ResourceGroupID: key.ResourceGroupID,
 				Timeout: timeout, Limiters: limiters, LimiterKey: creds.LimiterKey(),
-				OnCall: recordAliyunAPICall,
+				OnCall: aliyunAPICallRecorder(serviceCAS),
 			})
 		})
 	}

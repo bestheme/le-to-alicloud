@@ -1,0 +1,122 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
+)
+
+// bindingRound 是一轮 reconcile 的局部状态。
+//
+// 把「要落盘的对象」「patch 基准」「本轮算出的落后时长」收在一起，省得每个 helper 都
+// 拖着四个参数走；也保证指标刷新与落盘的 status 永远是同一份判定（与证书侧
+// patchStatus 里刷 gauge 的理由相同）。
+type bindingRound struct {
+	b    *certsv1alpha1.AliyunCertificateBinding
+	orig *certsv1alpha1.AliyunCertificateBinding
+	// provider 是指标 label，取 spec.target.type（有界枚举）。
+	provider string
+	// lag 是目标落后于证书当前代次的时长；已跟上时为 0。
+	lag time.Duration
+}
+
+func newBindingRound(b *certsv1alpha1.AliyunCertificateBinding) *bindingRound {
+	return &bindingRound{b: b, orig: b.DeepCopy(), provider: b.Spec.Target.Type}
+}
+
+// setBindingCondition 写入 condition，observedGeneration 取 CR 当前 generation。
+func setBindingCondition(b *certsv1alpha1.AliyunCertificateBinding, condType string,
+	status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: b.Generation,
+	})
+}
+
+func bindingCondTrue(b *certsv1alpha1.AliyunCertificateBinding, condType string) bool {
+	return meta.IsStatusConditionTrue(b.Status.Conditions, condType)
+}
+
+func bindingCondReason(b *certsv1alpha1.AliyunCertificateBinding, condType string) string {
+	if c := meta.FindStatusCondition(b.Status.Conditions, condType); c != nil {
+		return c.Reason
+	}
+	return ""
+}
+
+// setBindingReadyFalse 用于「还没走到 Applied / Conflict 就已经确定不 Ready」的早退分支
+// （证书不存在、材料无效、域名不覆盖……）。这些原因在 Applied / Conflict 里无处安放，
+// 只能直接写进 Ready。
+func setBindingReadyFalse(b *certsv1alpha1.AliyunCertificateBinding, reason, message string) {
+	setBindingCondition(b, certsv1alpha1.ConditionReady, metav1.ConditionFalse, reason, message)
+}
+
+// targetIdentifier 返回目标标识，供日志使用。**必须 nil-safe**：错误处置路径也会被
+// 「target.type 不认识 / 内嵌块缺失」这类失败触发，而那正是 FC3CustomDomain 为 nil 的
+// 时候，直接解引用会把一次配置错误变成 panic。
+//
+//nolint:unused // Task 8 起的 apply / observe 日志与事件使用；本任务先把 nil-safe 语义立住。
+func targetIdentifier(b *certsv1alpha1.AliyunCertificateBinding) string {
+	if b.Spec.Target.FC3CustomDomain != nil {
+		return b.Spec.Target.FC3CustomDomain.DomainName
+	}
+	return b.TargetKey()
+}
+
+// targetRegion 同上，供 region label 使用；取不到时返回空串（label 允许空值）。
+//
+//nolint:unused // 同 targetIdentifier。
+func targetRegion(b *certsv1alpha1.AliyunCertificateBinding) string {
+	if b.Spec.Target.FC3CustomDomain != nil {
+		return b.Spec.Target.FC3CustomDomain.Region
+	}
+	return ""
+}
+
+// aggregateBindingReady 实现 spec §6.2 步骤 8：Ready = Applied && !Conflict。
+func aggregateBindingReady(b *certsv1alpha1.AliyunCertificateBinding) {
+	applied := bindingCondTrue(b, certsv1alpha1.ConditionApplied)
+	conflict := bindingCondTrue(b, certsv1alpha1.ConditionConflict)
+	if applied && !conflict {
+		setBindingCondition(b, certsv1alpha1.ConditionReady, metav1.ConditionTrue, certsv1alpha1.ReasonApplied, "")
+		return
+	}
+	// 冲突比「没写成」更能说明问题：写不进去正是因为不该由我们写。
+	reason := certsv1alpha1.ReasonApplyFailed
+	if conflict {
+		reason = bindingCondReason(b, certsv1alpha1.ConditionConflict)
+	} else if r := bindingCondReason(b, certsv1alpha1.ConditionApplied); r != "" {
+		reason = r
+	}
+	setBindingCondition(b, certsv1alpha1.ConditionReady, metav1.ConditionFalse, reason, "")
+}
+
+// patchBinding 用 MergeFrom 提交 status，并在同一处刷新 gauge。
+func (r *AliyunCertificateBindingReconciler) patchBinding(ctx context.Context, rd *bindingRound) error {
+	recordBindingMetrics(rd)
+	return r.Status().Patch(ctx, rd.b, client.MergeFrom(rd.orig))
+}

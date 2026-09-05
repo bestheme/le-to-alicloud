@@ -41,6 +41,9 @@ const TargetTypeFC3CustomDomain = "FC3CustomDomain"
 // IndexBindingByCertificate 是 controller-runtime field index 的键名。
 const IndexBindingByCertificate = "spec.certificateRef.name"
 
+// IndexBindingByTarget 是同目标冲突仲裁用的 field index 键名，值为 TargetKey()。
+const IndexBindingByTarget = "spec.target"
+
 // FC3CustomDomainTarget 指向一个 FC3 自定义域名。证书归属于域名，与函数无关。
 type FC3CustomDomainTarget struct {
 	// +kubebuilder:validation:MinLength=1

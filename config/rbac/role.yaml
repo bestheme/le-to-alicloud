@@ -34,13 +34,6 @@ rules:
   - certs.bestheme.ac.cn
   resources:
   - aliyuncertificatebindings
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - certs.bestheme.ac.cn
-  resources:
   - aliyuncertificates
   verbs:
   - create
@@ -53,12 +46,14 @@ rules:
 - apiGroups:
   - certs.bestheme.ac.cn
   resources:
+  - aliyuncertificatebindings/finalizers
   - aliyuncertificates/finalizers
   verbs:
   - update
 - apiGroups:
   - certs.bestheme.ac.cn
   resources:
+  - aliyuncertificatebindings/status
   - aliyuncertificates/status
   verbs:
   - get
