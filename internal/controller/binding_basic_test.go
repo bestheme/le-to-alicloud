@@ -42,13 +42,14 @@ var _ = Describe("绑定 controller：骨架", func() {
 
 	It("证书不存在时 Ready=False/CertificateNotFound，且不碰云", func() {
 		ns := newNamespace(ctx)
-		createBinding(ctx, ns, "b1", "no-such-cert", fmt.Sprintf("b1.%s.example.com", ns), nil)
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		createBinding(ctx, ns, "b1", "no-such-cert", domain, nil)
 
 		eventually(func() bool {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady)
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonCertificateNotFound
 		})
-		Expect(currentFC3().GetCalls()).To(BeZero())
+		Expect(currentFC3().GetCallsFor(domain)).To(BeZero())
 	})
 
 	It("加 finalizer 并写 observedGeneration", func() {
@@ -78,7 +79,7 @@ var _ = Describe("绑定 controller：骨架", func() {
 			c := bindingCond(ctx, ns, "b3", certsv1alpha1.ConditionReady)
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonCertificateNotReady
 		})
-		Expect(currentFC3().GetCalls()).To(BeZero())
+		Expect(currentFC3().GetCallsFor(domain)).To(BeZero())
 	})
 
 	It("删除 Binding 时摘掉 finalizer，对象真的消失", func() {

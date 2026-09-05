@@ -57,11 +57,27 @@ func setFC3FactoryErr(err error) { fakeMu.Lock(); fc3FactoryErr = err; fakeMu.Un
 
 func currentFC3FactoryErr() error { fakeMu.Lock(); defer fakeMu.Unlock(); return fc3FactoryErr }
 
-// createCertificate 建一个最小可用的 AliyunCertificate。
+// createCertificate 建一个最小可用的 AliyunCertificate，**关掉 CAS 上传**。
 //
 // 无返回值：没有任何调用点用得上它（与 resetFC3 同理），留着会被 unparam 报出来。
 // 需要读回对象的地方用 getAC()。
+//
+// uploadToCAS=false 有两个理由，一个是语义的、一个是套件卫生的：
+//
+// 语义上这才是绑定侧该有的形态。FC3 内联 PEM（Capabilities.RequiresCASUpload=false），
+// 一个只用 FC3 的用户完全可以不授 yundun-cert:*（spec §8.3）。绑定用例关心的是 Issued
+// 与 status.current，从来不关心 CAS——status.current 在关掉上传时照样会写，只是没有
+// certId，而 certificateGate 只比指纹。
+//
+// 套件卫生上，这是在拆掉一颗跨用例的地雷。envtest 从不回收 namespace，先前每个用例建的
+// AliyunCertificate 都还活着；而 resetCAS() 每个用例换上一个**空的** CAS fake，于是任何
+// 一个老证书被唤醒（绑定 status 每次 patch 都会经证书 controller 的 Binding watch 唤醒
+// 它自己那张证书）都会发现「云上没有我的证书」而重传一次，撞进当前用例的
+// currentCAS().UploadCalls() 里。Task 11 把十几张常驻证书加进套件之后，
+// stall_test 的 UploadCalls()==1/==2 断言开始偶发翻车（实测约 1/20）。
+// 关掉上传，这些证书就再也不是重传源——probe 与 retention 也都对它们直接早退。
 func createCertificate(ctx context.Context, ns, name string, dnsNames ...string) {
+	noUpload := false
 	ac := &certsv1alpha1.AliyunCertificate{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: certsv1alpha1.AliyunCertificateSpec{
@@ -69,6 +85,7 @@ func createCertificate(ctx context.Context, ns, name string, dnsNames ...string)
 			Aliyun: certsv1alpha1.AliyunSpec{
 				CredentialsRef: certsv1alpha1.LocalSecretReference{Name: "aliyun-credentials"},
 				Region:         "cn-hangzhou",
+				UploadToCAS:    &noUpload,
 			},
 		},
 	}

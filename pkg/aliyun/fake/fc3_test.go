@@ -264,3 +264,53 @@ func TestFakeFC3_ConcurrentAccess(t *testing.T) {
 		t.Fatalf("计数丢失: get=%d update=%d", f.GetCalls(), f.UpdateCalls())
 	}
 }
+
+// TestFakeFC3_PerDomainCalls 确认按域名分账真的互不串扰。
+//
+// 这正是 envtest 里那条断言需要的隔离边界：envtest 从不回收 namespace，先前每个用例
+// 建的 Binding 都还活着、还在被同一个常驻 reconciler 处理，任何一个被 watch 唤醒都会
+// 撞进全局计数里。用例想说的从来是「**我这个目标**上没发生云调用」，而域名按
+// <name>.<namespace>.example.com 命名、每个用例独占——按域名分账正好就是那条边界。
+func TestFakeFC3_PerDomainCalls(t *testing.T) {
+	f := fake.NewFC3()
+	f.AddDomain(fake.Domain{DomainName: "a.example.com", Protocol: "HTTP"})
+	f.AddDomain(fake.Domain{DomainName: "b.example.com", Protocol: "HTTP"})
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if _, err := f.GetCustomDomain(ctx, "a.example.com"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.UpdateCustomDomain(ctx, "a.example.com",
+		&aliyun.UpdateCustomDomainInput{Protocol: "HTTP"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// b 上一次调用都没发生过，哪怕 a 上很热闹。
+	if got := f.GetCallsFor("b.example.com"); got != 0 {
+		t.Errorf("GetCallsFor(b)=%d，另一个域名上的调用不该串进来", got)
+	}
+	if got := f.UpdateCallsFor("b.example.com"); got != 0 {
+		t.Errorf("UpdateCallsFor(b)=%d，另一个域名上的调用不该串进来", got)
+	}
+	if got := f.GetCallsFor("a.example.com"); got != 3 {
+		t.Errorf("GetCallsFor(a)=%d, want 3", got)
+	}
+	if got := f.UpdateCallsFor("a.example.com"); got != 1 {
+		t.Errorf("UpdateCallsFor(a)=%d, want 1", got)
+	}
+	// 全局计数仍是所有域名之和——它没有变，只是不再适合做单个用例的断言。
+	if f.GetCalls() != 3 || f.UpdateCalls() != 1 {
+		t.Errorf("全局计数=get %d/update %d, want 3/1", f.GetCalls(), f.UpdateCalls())
+	}
+
+	// 不存在的域名同样计数：「对着一个不存在的域名发过请求」也是这个用例的云调用，
+	// 「域名还没建」那个用例正是靠这一条断言自己没写过云。
+	if _, err := f.GetCustomDomain(ctx, "gone.example.com"); err == nil {
+		t.Fatal("不存在的域名应报错")
+	}
+	if got := f.GetCallsFor("gone.example.com"); got != 1 {
+		t.Errorf("GetCallsFor(gone)=%d, want 1", got)
+	}
+}

@@ -52,9 +52,22 @@ type FC3 struct {
 
 	getCalls    int
 	updateCalls int
+	// 按域名分账的计数。envtest 里 reconciler 是常驻的，而 envtest 从不回收 namespace，
+	// 所以**先前每个用例建的 Binding 都还活着、还在被 reconcile**；任何一个被 watch
+	// 唤醒都会撞进全局计数里。用例真正想断言的从来都是「**我这个目标**上没发生云调用」，
+	// 而域名按 <name>.<namespace>.example.com 命名，天然是每个用例独占的——
+	// 于是按域名分账正好就是断言本来的那条隔离边界。
+	getCallsFor    map[string]int
+	updateCallsFor map[string]int
 }
 
-func NewFC3() *FC3 { return &FC3{domains: map[string]Domain{}} }
+func NewFC3() *FC3 {
+	return &FC3{
+		domains:        map[string]Domain{},
+		getCallsFor:    map[string]int{},
+		updateCallsFor: map[string]int{},
+	}
+}
 
 // SetAccountID 设置 GetCustomDomain 回报的账号（账号 fencing 用例要靠它切换账号）。
 func (f *FC3) SetAccountID(id string) { f.mu.Lock(); f.accountID = id; f.mu.Unlock() }
@@ -94,16 +107,34 @@ func (f *FC3) FailNextUpdateAfterCommit(err error) {
 	f.mu.Unlock()
 }
 
-// GetCalls 返回 GetCustomDomain 的调用次数。持锁，可与 reconciler goroutine 并发调用。
+// GetCalls 返回 GetCustomDomain 的**全局**调用次数。持锁，可与 reconciler goroutine 并发调用。
+//
+// 多个 reconciler 并发跑时这个数字不属于任何一个用例，见 getCallsFor 的说明。
+// envtest 里请一律用 GetCallsFor。
 func (f *FC3) GetCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.getCalls }
 
-// UpdateCalls 返回 UpdateCustomDomain 的调用次数。持锁，可与 reconciler goroutine 并发调用。
+// UpdateCalls 返回 UpdateCustomDomain 的**全局**调用次数。同 GetCalls。
 func (f *FC3) UpdateCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.updateCalls }
+
+// GetCallsFor 返回某个域名上 GetCustomDomain 的调用次数。
+func (f *FC3) GetCallsFor(domain string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCallsFor[domain]
+}
+
+// UpdateCallsFor 返回某个域名上 UpdateCustomDomain 的调用次数。
+func (f *FC3) UpdateCallsFor(domain string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.updateCallsFor[domain]
+}
 
 func (f *FC3) GetCustomDomain(_ context.Context, domain string) (*aliyun.CustomDomain, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getCalls++
+	f.getCallsFor[domain]++
 	if err := pop(&f.getErrs); err != nil {
 		return nil, err
 	}
@@ -126,6 +157,7 @@ func (f *FC3) UpdateCustomDomain(_ context.Context, domain string, in *aliyun.Up
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updateCalls++
+	f.updateCallsFor[domain]++
 	if err := pop(&f.updateErrs); err != nil {
 		return err
 	}

@@ -55,7 +55,7 @@ var _ = Describe("绑定 controller：证书材料", func() {
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonDomainNotCovered
 		})
 		// 推错证书 = 全站 TLS 报错（spec D17）。宁可停下也绝不写。
-		Expect(currentFC3().UpdateCalls()).To(BeZero())
+		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 		// 不碰 Applied：目标上原来那张证书（如果有）还在服役，域名不覆盖说明不了它有毛病。
 		// 断言 condition **根本不存在**（零值状态）而不是「不为 True」：后者在有人开始往
 		// 这条路径写 Applied=False 时照样通过，而那正是这里要拦的事。
@@ -100,7 +100,7 @@ var _ = Describe("绑定 controller：证书材料", func() {
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonCertificateNotReady
 		})
 		// 材料读不出来就一个字节都不写：这才是这条路径真正要守住的东西。
-		Expect(currentFC3().UpdateCalls()).To(BeZero())
+		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 		// 证书 controller 的判定与绑定侧的 reason 同源，钉住上面那段推理。
 		Expect(condReason(getAC(ctx, ns, "c1"), certsv1alpha1.ConditionIssued)).
 			To(Equal(certsv1alpha1.ReasonSecretNotFound))

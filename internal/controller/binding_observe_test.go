@@ -109,7 +109,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady)
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonTargetNotFound
 		})
-		Expect(currentFC3().UpdateCalls()).To(BeZero())
+		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 	})
 
 	// PIt：本用例要先有一次成功的 Apply（issueAndBind 等的是 Applied=True），而 Apply
@@ -117,10 +117,11 @@ var _ = Describe("绑定 controller：Observe", func() {
 	// `grep -n "PIt" internal/controller/binding_observe_test.go` 为空。
 	PIt("指纹一致时短路：不写云，但仍然 Observe", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c2", "b2", fmt.Sprintf("b2.%s.example.com", ns), "HTTP")
+		domain := fmt.Sprintf("b2.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c2", "b2", domain, "HTTP")
 
-		writes := currentFC3().UpdateCalls()
-		getsBefore := currentFC3().GetCalls()
+		writes := currentFC3().UpdateCallsFor(domain)
+		getsBefore := currentFC3().GetCallsFor(domain)
 
 		// 推一次 reconcile（spec.target 不可变，改 deletionPolicy 推进 generation）。
 		b := getBinding(ctx, ns, "b2")
@@ -128,9 +129,9 @@ var _ = Describe("绑定 controller：Observe", func() {
 		b.Annotations = map[string]string{"poke": "1"}
 		Expect(k8sClient.Update(ctx, b)).To(Succeed())
 
-		eventually(func() bool { return currentFC3().GetCalls() > getsBefore })
+		eventually(func() bool { return currentFC3().GetCallsFor(domain) > getsBefore })
 		// 短路只跳过写，不跳过读（spec §3「level-triggered」）。
-		Expect(currentFC3().UpdateCalls()).To(Equal(writes))
+		Expect(currentFC3().UpdateCallsFor(domain)).To(Equal(writes))
 		Expect(getBinding(ctx, ns, "b2").Status.LastObservedTime).NotTo(BeNil())
 	})
 
@@ -141,7 +142,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 		issueAndBind(ctx, ns, "c3", "b3", domain, "HTTPS")
 		Expect(getBinding(ctx, ns, "b3").Status.BoundAccountID).To(Equal(testAccountID))
 
-		writes := currentFC3().UpdateCalls()
+		writes := currentFC3().UpdateCallsFor(domain)
 		// 同一个域名在另一个账号下：AK 被换成了别人的，再写就是在写别人的资源。
 		currentFC3().SetAccountID("9999999999")
 		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTPS"})
@@ -155,7 +156,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonAccountMismatch
 		})
 		Expect(bindingCond(ctx, ns, "b3", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionFalse))
-		Expect(currentFC3().UpdateCalls()).To(Equal(writes))
+		Expect(currentFC3().UpdateCallsFor(domain)).To(Equal(writes))
 	})
 
 	// PIt：同上，Task 12 解除。
@@ -166,7 +167,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 		// 必须把 protocol 原样带回（fake 的 validateUpdate 只挡空值，挡不住「悄悄改成
 		// HTTP」）。
 		issueAndBind(ctx, ns, "c4", "b4", domain, "HTTP,HTTPS")
-		writes := currentFC3().UpdateCalls()
+		writes := currentFC3().UpdateCallsFor(domain)
 
 		// 有人手工把证书换成了另一张。指纹既不是 appliedFingerprint 也不是 current。
 		otherCA := testutil.NewCA(GinkgoT())
@@ -180,7 +181,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 		b.Annotations = map[string]string{"poke": "1"}
 		Expect(k8sClient.Update(ctx, b)).To(Succeed())
 
-		eventually(func() bool { return currentFC3().UpdateCalls() > writes })
+		eventually(func() bool { return currentFC3().UpdateCallsFor(domain) > writes })
 		eventually(func() bool {
 			return bindingCond(ctx, ns, "b4", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
 		})
@@ -244,8 +245,8 @@ var _ = Describe("绑定 controller：Observe", func() {
 		Expect(b.Status.BoundAccountID).To(Equal(testAccountID))
 		Expect(b.Status.LastObservedTime).NotTo(BeNil())
 		// 短路只跳过写，不跳过读（spec §3「level-triggered」）。
-		Expect(currentFC3().GetCalls()).NotTo(BeZero())
-		Expect(currentFC3().UpdateCalls()).To(BeZero())
+		Expect(currentFC3().GetCallsFor(domain)).NotTo(BeZero())
+		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 		// 云上那张证书连名字都不该被换掉。
 		d, _ := currentFC3().Domain(domain)
 		Expect(d.CertName).To(Equal("pre-existing"))
@@ -279,7 +280,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonAccountMismatch
 		})
 		Expect(bindingCond(ctx, ns, "b7", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionFalse))
-		Expect(currentFC3().UpdateCalls()).To(BeZero())
+		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 
 		// fencing 每一轮都要把 Conflict 从仲裁刚写下的 False 再翻回 True（步骤 2 排在
 		// Observe 之前，顺序由 spec §6.2 定死）。这一翻若每轮都盖一个新的
@@ -294,18 +295,18 @@ var _ = Describe("绑定 controller：Observe", func() {
 		// lastTransitionTime 和原值比起来是相等的，churn 就此隐形——这条断言会变成
 		// 一个看着通过、其实什么都没测的空断言（已实测：不睡这一秒，去掉修复它照样绿）。
 		time.Sleep(1100 * time.Millisecond)
-		gets := currentFC3().GetCalls()
+		gets := currentFC3().GetCallsFor(domain)
 		b = getBinding(ctx, ns, "b7")
 		b.Annotations = map[string]string{"poke": "2"}
 		Expect(k8sClient.Update(ctx, b)).To(Succeed())
-		eventually(func() bool { return currentFC3().GetCalls() > gets }) // 确实又跑了一轮
+		eventually(func() bool { return currentFC3().GetCallsFor(domain) > gets }) // 确实又跑了一轮
 
 		c := bindingCond(ctx, ns, "b7", certsv1alpha1.ConditionConflict)
 		Expect(c.Status).To(Equal(metav1.ConditionTrue))
 		Expect(c.Reason).To(Equal(certsv1alpha1.ReasonAccountMismatch))
 		Expect(c.LastTransitionTime).To(Equal(fencedAt),
 			"fencing 是幂等的：同一个判定重复写不该盖新的 lastTransitionTime")
-		Expect(currentFC3().UpdateCalls()).To(BeZero())
+		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 	})
 
 	It("观测到空账号时 fencing 也必须拦下（fail closed）", func() {
@@ -337,7 +338,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonAccountMismatch
 		})
 		Expect(bindingCond(ctx, ns, "b10", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionFalse))
-		Expect(currentFC3().UpdateCalls()).To(BeZero())
+		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 	})
 
 	It("接管之后 Observe 未知失败：旁路，不降级 Applied，只把 reason 换成 ObserveFailed", func() {
@@ -411,7 +412,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonObserveFailed
 		})
 		// 事件只在跃迁那一轮发。等到失败轮次远多于事件数，「每轮一条」就无处躲藏。
-		eventually(func() bool { return currentFC3().GetCalls() >= 8 })
+		eventually(func() bool { return currentFC3().GetCallsFor(domain) >= 8 })
 		n := bindingEventCount(ctx, ns, "b11", certsv1alpha1.ReasonObserveFailed)
 		Expect(n).To(BeNumerically(">=", 1), "跃迁那一轮必须发一条")
 		// 不断言恰好等于 1：跃迁判据取自 informer cache 里的那一份（rd.orig），缓存
@@ -419,7 +420,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 		// 要钉死的是「有界」：坏掉的实现是每一轮都发，事件数跟着轮次一起涨。
 		Expect(n).To(BeNumerically("<=", 3),
 			fmt.Sprintf("已失败 %d 轮却发了 %d 条事件——事件数不该跟轮次一起涨",
-				currentFC3().GetCalls(), n))
+				currentFC3().GetCallsFor(domain), n))
 	})
 
 	It("从没 Applied 过的对象观测反复失败：不留痕迹，也一条事件都不发", func() {
@@ -442,7 +443,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 		createBinding(ctx, ns, "b12", "c12", domain, nil)
 
 		// 先确认重试风暴真的发生了，否则下面的「零事件」是空断言。
-		eventually(func() bool { return currentFC3().GetCalls() >= 5 })
+		eventually(func() bool { return currentFC3().GetCallsFor(domain) >= 5 })
 		// 绝不凭空造 Applied=False。
 		Expect(bindingCond(ctx, ns, "b12", certsv1alpha1.ConditionApplied).Status).To(BeEmpty())
 		// 「还没绑成功」由 Ready 说就够了，不需要每一轮再发一条 Warning 重复一遍。
