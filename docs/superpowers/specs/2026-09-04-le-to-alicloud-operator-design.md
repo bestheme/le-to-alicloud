@@ -98,7 +98,7 @@
 ┌──────────────────────────── operator (单二进制, replicas=1) ────────────────────────────┐
 │                                                                                          │
 │  AliyunCertificate ──▶ 证书 controller ──┬─▶ cert-manager Certificate (owned)             │
-│         ▲                                ├─▶ 读 Secret (APIReader, 不缓存)                 │
+│         ▲                                ├─▶ 读 Secret (Client, 已 DisableFor)                 │
 │         │ status.current 变化             ├─▶ CAS UploadUserCertificate / Delete           │
 │         │ (field index 反查)              └─▶ status: current / history / conditions      │
 │         │                                                                                │
@@ -307,10 +307,11 @@ const (
     ReasonReady                    = "Ready"
 )
 
-// AliyunCertificateBinding（凭证类 reason CredentialsNotFound / CredentialsInvalid 与证书侧共用）
+// AliyunCertificateBinding（CredentialsNotFound / CredentialsInvalid / CertificateNotReady 与证书侧共用，不重复声明）
+// 注意 ReasonCertificateNotReady 两边共用：它只在上面的证书块里声明一次
+// （api/v1alpha1/conditions.go），绑定侧直接引用，这里不再重复声明。
 const (
     ReasonCertificateNotFound = "CertificateNotFound"
-    ReasonCertificateNotReady = "CertificateNotReady"
     ReasonTargetNotFound      = "TargetNotFound"
     ReasonDomainNotCovered    = "DomainNotCovered"
     ReasonConflictingBinding  = "ConflictingBinding"
@@ -332,7 +333,7 @@ const (
 - 主资源：`AliyunCertificate`
 - Owns：`cmapi.Certificate`（cert-manager 每次签发 / 续期都会推进 `status.revision` 与 `notAfter`，这是我们读 Secret 的触发信号）
 - Watches：`AliyunCertificateBinding` → 映射到其 `spec.certificateRef`（用于回收守卫及时生效、以及删除阻塞及时解除）
-- **不 watch、不缓存任何 Secret**。TLS Secret 与凭证 Secret 一律通过 `mgr.GetAPIReader()` 直读。收益：内存中无 Secret 副本、RBAC 上 secrets 不需要 `list`/`watch`。代价：周期 resync 成为 Secret 漂移检测的承重通道，定为 1h（`--certificate-resync-interval`）。
+- **不 watch、不缓存任何 Secret**。TLS Secret 与凭证 Secret 都走普通的 `mgr.GetClient()`（`material.go` / `cas_factory.go` / `provider_factory.go`），之所以不缓存是因为 manager 的 `client.CacheOptions.DisableFor` 里列了 `&corev1.Secret{}`（`cmd/main.go`）——被 DisableFor 的类型上，`Client.Get` 等同直读 API server。**不是**通过 `mgr.GetAPIReader()`（那个只用在 live list Binding 与 refreshUploadState 上）。收益：内存中无 Secret 副本、RBAC 上 secrets 不需要 `list`/`watch`。代价：周期 resync 成为 Secret 漂移检测的承重通道，定为 1h（`--certificate-resync-interval`）。
 - 每次成功 reconcile 返回 `RequeueAfter: certificate-resync-interval`。
 
 ### 5.2 Reconcile 步骤
@@ -354,7 +355,7 @@ const (
         都必须照常进行（与 §5.2 步骤 9 旁路化、§5.7 回收失败不降级同一条原则）
     - Certificate 未 Ready → Issued=False/CertificateNotReady，return（靠 watch）；
       停滞时不覆写这个 reason，否则「已经卡了几小时」这条信息会被抹平
- 5. APIReader 读 Secret，校验（§5.4）；任一不通过 → Issued=False/<reason>，不上传，
+ 5. 读 Secret（`Client`，已 DisableFor，等同直读），校验（§5.4）；任一不通过 → Issued=False/<reason>，不上传，
     **不清空 status.current**（Secret 短暂消失再回来时不能被当作新代次）
  6. 指纹 == status.current.fingerprint → 跳到 8
  7. uploadToCAS=true 时上传（§5.5）；旧 current 推进 history，写新 current
@@ -608,7 +609,7 @@ rules:
 
 ### 8.2 凭证处理
 
-- 通过 `APIReader` 直读凭证 Secret，不缓存 Secret 本身。
+- 凭证 Secret 走 `Client`（已 `DisableFor`，等同直读），不缓存 Secret 本身。
 - SDK client 缓存 key = `(namespace, name, resourceVersion)`——否则轮换后的 AK 直到 Pod 重启才生效。
 - 凭证错误（`InvalidAccessKeyId*`、`Forbidden`）不可重试，置 `CredentialsInvalid`，长 requeue。
 
@@ -814,21 +815,21 @@ type FC3Client interface {
 }
 ```
 
-### 12.3 真实环境集成测试（必测清单——实现前先做，结论写入代码注释）
+### 12.3 真实环境集成测试（必测清单；结论回填本表与代码注释）
 
 编号是契约：`test/integration/` 的探针按这里的编号 `Record`，`test/integration/RESULTS.md`
-按同一套编号回填，因此**已定的编号不再改动**，新问题只在表末追加。**已核实的行以 `RESULTS.md` 为唯一依据**，不在此处推断超出实测的结论。
+按同一套编号回填，因此**已定的编号不再改动**，新问题只在表末追加。已核实的行**以 `RESULTS.md`、或本行明确标注的其它一手依据为准**（例如 #9 的前半来自 Go SDK v4 内置的 `EndpointMap`，#8 的两条范围限定来自 SDK 的 `Status` 枚举语义——这类依据必须在行内写明「推导」二字），不在此处推断超出依据的结论。
 
 | # | 待核实 | 影响 |
 |---|---|---|
-| 1 | ~~CAS 对 PKCS#1 / PKCS#8 / `EC PRIVATE KEY` 私钥的接受情况~~ **CAS 侧已核实**：PKCS#1 RSA、SEC1 EC、PKCS#8 三种未加密编码**一律接受**（各自上传成功）；带 `Proc-Type: 4,ENCRYPTED` 头的私钥块被拒，错误码 `PrivateKeyFormatException`（Permanent）——CAS 报的是格式错误而非配对错误。**FC3 侧未测**（`CertConfig.privateKey` 的接受情况由 FC3 探针补测，仍记在本行下） | 决定 6 的默认编码；`privateKey.encoding: PKCS8` 是否要在 CRD 层直接拒绝。CAS 侧已确定三种编码都不需要转换 |
+| 1 | CAS 与 FC3 对 PKCS#1 / PKCS#8 / `EC PRIVATE KEY` 私钥的接受情况（**未画删除线：只关闭了 CAS 一半**）。**CAS 侧已核实**：PKCS#1 RSA、SEC1 EC、PKCS#8 三种未加密编码**一律接受**（各自上传成功）；带 `Proc-Type: 4,ENCRYPTED` 头的私钥块被拒，错误码 `PrivateKeyFormatException`（Permanent）——CAS 报的是格式错误而非配对错误。**FC3 侧未测**（`CertConfig.privateKey` 的接受情况由 FC3 探针补测，仍记在本行下） | 决定 6 的默认编码；`privateKey.encoding: PKCS8` 是否要在 CRD 层直接拒绝。CAS 侧已确定三种编码都不需要转换 |
 | 2 | `UpdateCustomDomain` 全量替换 vs 部分合并（构造含 routeConfig+wafConfig+tlsConfig 的域名，只提交 certConfig）。**仍未核实**：探针已写好（`test/integration/fc3_test.go`），但它需要一个可被改写 `certConfig` 的 `FC3_TEST_DOMAIN`，实测那一轮没有配（`RESULTS.md` #2） | read-modify-write 两种语义下都安全（§6.3 走的就是 read-modify-write），所以这一行不阻塞实现，只决定 last-write-wins 的风险大小 |
 | 3 | ~~CAS `ClientToken` 语义（同 token 重复上传返回同 certId？报错？有效期？）~~ **已核实**：`ClientToken` **不做上传幂等**——同 token、同 Name 重传直接报 `NameRepeat`（Permanent），而不是回放首次的 certId | write-ahead 幂等能否落地；结论见 `test/integration/RESULTS.md`。既然不幂等，write-ahead 的崩溃恢复 100% 依赖 `isDuplicateName` → `findByName` 认领既有 certId 这条路径 |
 | 4 | ~~CAS `Name` 是否接受 `-` / `.`~~ **已核实**：两者都**接受**，且**原样保存、不做归一化**（回查云上存的名字与提交值逐字相同） | 命名 sanitize 规则；`findByName` 可以按提交的名字精确比对，无需考虑云侧改名 |
-| 5 | ~~LE 链（leaf + intermediate，无 root）FC3 与 CAS 是否都接受、是否要求带根证书、顺序是否敏感~~ **CAS 侧已核实**：leaf + 其签发 CA（两块）**接受**，**仅 leaf 也接受**（故不要求带根）；把 CA 放在 leaf 前面**被拒**（`NotMatch.CertificateAndPrivateKey`，Permanent）——**顺序敏感，leaf 必须在首位**。这两条合起来说明 LE 的「leaf + intermediate、无 root」形状在 CAS 可用。**FC3 侧未测**（由 FC3 探针补测，仍记在本行下） | §5.4 第 7 条 PEM 规范化的输出形状：只需保证 leaf 在首位，不需要补根 |
+| 5 | LE 链（leaf + intermediate，无 root）FC3 与 CAS 是否都接受、是否要求带根证书、顺序是否敏感（**未画删除线：只关闭了 CAS 一半**）。**CAS 侧已核实**：leaf + 其签发 CA（两块）**接受**，**仅 leaf 也接受**（故不要求带根）；把 CA 放在 leaf 前面**被拒**（`NotMatch.CertificateAndPrivateKey`，Permanent）——**顺序敏感，leaf 必须在首位**。这两条合起来说明 LE 的「leaf + intermediate、无 root」形状在 CAS 可用。**FC3 侧未测**（由 FC3 探针补测，仍记在本行下） | §5.4 第 7 条 PEM 规范化的输出形状：只需保证 leaf 在首位，不需要补根 |
 | 6 | 给 TLS Secret 追加指向 AliyunCertificate 的 ownerRef，cert-manager 的 SSA 是否保留 | 若保留，可消掉 `secrets: delete` 和 finalizer 顺序难题。**仍未核实**：探针已写好，但集成环境的集群上 cert-manager 已不存在，本轮跳过 |
 | 7 | Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision` | 不缓存 Secret 决定的盲区大小。**仍未核实**：同 #6，集群上无 cert-manager |
-| 8 | ~~CAS 单账号上传证书数量配额~~ **部分核实**：空 `Keyword` 列举当前返回 **0 张**已上传证书（附带的两条限定——`Status` 留空的列举不含已过期证书、配了 `ALIYUN_RESOURCE_GROUP_ID` 时仅限该资源组——是**据 SDK 枚举语义推导的，未经实测**：0 张证书的账号里这个排除在构造上就不可观测，见 §2.2）。**配额上限本身未实测**——撞上限会污染账号，需在控制台「数字证书管理服务 → 证书管理 → 上传证书」页核对账号总量与上限 | `cleanup_abandoned_total` 是否必须配告警。列举语义已定：存在性探测按 Name 客户端过滤时要意识到过期证书不在默认结果里 |
+| 8 | CAS 单账号上传证书数量配额（**未画删除线：配额上限这一半没关**）。**部分核实**：空 `Keyword` 列举当前返回 **0 张**已上传证书（附带的两条限定——`Status` 留空的列举不含已过期证书、配了 `ALIYUN_RESOURCE_GROUP_ID` 时仅限该资源组——是**据 SDK 枚举语义推导的，未经实测**：0 张证书的账号里这个排除在构造上就不可观测，见 §2.2）。**配额上限本身未实测**——撞上限会污染账号，需在控制台「数字证书管理服务 → 证书管理 → 上传证书」页核对账号总量与上限 | `cleanup_abandoned_total` 是否必须配告警。列举语义**据 SDK 枚举推导、未经实测**：若推导成立，存在性探测按 Name 客户端过滤时要意识到过期证书不在默认结果里 |
 | 9 | ~~CAS endpoint 是否 region 化~~ **已核实**（Go SDK v4 内置 `EndpointMap`）：全部中国区域及 `eu-west-1` / `us-east-1` / `us-west-1` 映射到同一个 `cas.aliyuncs.com`；`ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `me-central-1` / `ap-south-1` / `me-east-1` 各有独立 endpoint（`cas.<region>.aliyuncs.com`）。结论：CAS **部分 region 化**，`casRegion` 字段保留；实现上把 `casRegion` 作为 SDK `RegionId` 传入，由 SDK 的 `EndpointRule=regional` 自动选 endpoint，`endpointOverride` 非空时直接覆盖。**跨 endpoint 可见性也已核实**：两个 endpoint 的证书集合**互相隔离（双向验证）**——同一份 PEM 在 `cn-hangzhou` 与 `ap-southeast-1` 分别上传得到两个不在同一量级的 certId，各自在对方的列举里都看不见，是**两套独立的 ID 空间**而非复制延迟 | `casRegion` 语义已定。隔离意味着 `casRegion` 一旦改变，`status.current.certId` 在新 endpoint 上必然查不到，存在性探测会重新上传一次——这是预期行为，不是 bug |
 | 10 | FC3 API 账号级频控阈值与 Throttling 错误码，**特别是错误码是否以 `Throttling` 开头**。**仍未核实**：阈值**刻意不测**——触发账号级频控只能对真实云连续打满请求，会波及同账号的其它调用，违反探针「不污染账号」的纪律；且 `pkg/aliyun` 的 `LimitFC3` 是 5 QPS / burst 1 的客户端限流，探针先被自己限住，摸不到云侧阈值。错误码这一半留给只读探针偶遇限流时顺带记录，实测那一轮未偶遇（`RESULTS.md` #10） | drift 1h 在数百 Binding 下是否安全；错误分类表。不以 `Throttling` 开头则 `aliyun.Classify` 会把限流判成不可重试，退避逻辑失效 |
 | 11 | cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在 | `SecretNameConflict` 判定依据。**仍未核实**：同 #6，集群上无 cert-manager |
