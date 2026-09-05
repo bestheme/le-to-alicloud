@@ -48,7 +48,7 @@ const (
 	ReasonReady                    = "Ready"
 )
 
-// AliyunCertificateBinding reasons（Plan 2 使用，先定下来）
+// AliyunCertificateBinding reasons
 const (
 	ReasonCertificateNotFound = "CertificateNotFound"
 	ReasonTargetNotFound      = "TargetNotFound"

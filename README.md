@@ -105,14 +105,16 @@ $EDITOR deploy/argocd/application-credentials.yaml   # 填掉 REPLACE_ME
 
 ```bash
 # oc
+ARGOCD_NS=argocd   # OpenShift GitOps 的默认实例请改成 openshift-gitops
 oc apply -f deploy/argocd/root-application.yaml
-oc -n argocd get applications
+oc -n "$ARGOCD_NS" get applications
 ```
 
 ```bash
 # kubectl
+ARGOCD_NS=argocd   # OpenShift GitOps 的默认实例请改成 openshift-gitops
 kubectl apply -f deploy/argocd/root-application.yaml
-kubectl -n argocd get applications
+kubectl -n "$ARGOCD_NS" get applications
 ```
 
 > 根应用的 `source.path` 指向 `deploy/argocd` 目录本身，Argo 只会捡其中的 `.yaml` / `.yml` / `.json`。`application-credentials.yaml.example` 因为后缀是 `.example` 天然被排除在外——所以第 3 步要把它复制成 `application-credentials.yaml` 再提交，否则凭证 Application 不会被下发。
@@ -162,8 +164,10 @@ argocd app delete le-to-alicloud-crds --cascade=false
 第二道防线由 CRD 资源自身承载：`config/crd` 给两个 CRD 打了 `argocd.argoproj.io/sync-options: Delete=false`，Argo 级联删除时会跳过带此注解的资源。部署前可以离线核对它在位（应输出 `2`）：
 
 ```bash
-./bin/kustomize build config/crd | grep -c "argocd.argoproj.io/sync-options"
+make kustomize && ./bin/kustomize build config/crd | grep -c "argocd.argoproj.io/sync-options"
 ```
+
+> `bin/` 是构建产物、被 `.gitignore` 排除，全新 clone 里没有 `./bin/kustomize`。所以本文所有用到它的命令都前置了 `make kustomize`——那个目标会在缺失时把工具下载到 `bin/`，已存在则什么都不做，重复执行是安全的。
 
 代价是将来真要删 CRD 时必须先手工摘掉这个注解——这道摩擦是有意的。
 
@@ -411,23 +415,53 @@ kubectl -n le-to-alicloud-system get deploy le-to-alicloud-controller-manager \
 
 三个 gauge 的 `namespace` / `name` 指的是 **Binding 对象**，不是它引用的 `AliyunCertificate`。`provider` 的取值目前只有 `FC3CustomDomain`（`pkg/provider/fc3` 的 `Name()`）。
 
-抓一份看看：
+抓一份看看。`--metrics-secure` 默认 true，`/metrics` 前面挂着 controller-runtime 的 authn/authz filter：每个请求都会被做一次 nonResourceURL `/metrics` + verb `get` 的 SubjectAccessReview。**授权读它的是 `le-to-alicloud-metrics-reader` 这条 ClusterRole，而 `config/` 里没有任何 ClusterRoleBinding 引用它**——它装上了，但默认不绑任何主体。所以要先给你打算用的那个主体临时授权，否则一律 403。
 
 ```bash
-# oc
+# oc —— 1) 临时授权（用完记得删）
+oc create clusterrolebinding metrics-peek \
+  --clusterrole=le-to-alicloud-metrics-reader \
+  --serviceaccount=le-to-alicloud-system:le-to-alicloud-controller-manager
+```
+
+```bash
+# oc —— 2) 前台开隧道，这个终端会一直占着
 oc -n le-to-alicloud-system port-forward deploy/le-to-alicloud-controller-manager 8443:8443
-# 另开一个终端
+```
+
+```bash
+# oc —— 3) 另开一个终端抓
 TOKEN=$(oc -n le-to-alicloud-system create token le-to-alicloud-controller-manager)
 curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/metrics | grep '^aliyuncert_'
+
+# 4) 收工，把临时授权删掉
+oc delete clusterrolebinding metrics-peek
 ```
 
 ```bash
-# kubectl
+# kubectl —— 1) 临时授权（用完记得删）
+kubectl create clusterrolebinding metrics-peek \
+  --clusterrole=le-to-alicloud-metrics-reader \
+  --serviceaccount=le-to-alicloud-system:le-to-alicloud-controller-manager
+```
+
+```bash
+# kubectl —— 2) 前台开隧道，这个终端会一直占着
 kubectl -n le-to-alicloud-system port-forward deploy/le-to-alicloud-controller-manager 8443:8443
-# 另开一个终端
+```
+
+```bash
+# kubectl —— 3) 另开一个终端抓
 TOKEN=$(kubectl -n le-to-alicloud-system create token le-to-alicloud-controller-manager)
 curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/metrics | grep '^aliyuncert_'
+
+# 4) 收工，把临时授权删掉
+kubectl delete clusterrolebinding metrics-peek
 ```
+
+这里借用 operator 自己的 SA 只是图省事——它本来就存在，且**不**自带读 `/metrics` 的权限（它绑的 `le-to-alicloud-metrics-auth-role` 授的是 `tokenreviews` / `subjectaccessreviews` 的 **create**，那是给 operator 自己去**发起**委派鉴权用的，不是让它自己通过 SAR）。换成任何别的 SA 或用户同理，只要把上面第 1 步的主体换掉即可。
+
+**同一个坑会在接 Prometheus 时再撞一次**：`config/prometheus/monitor.yaml` 的 `ServiceMonitor` 用的是 Prometheus 自己那个 SA 的 token（`bearerTokenFile` 指向 pod 里挂的 SA token），所以那个 SA 也必须被授到 `le-to-alicloud-metrics-reader` 上，否则 target 会一直是 `403 Forbidden`。这一条不在本仓库的清单里，得在你的监控栈那边配。
 
 ### 告警
 
@@ -447,7 +481,7 @@ curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/metrics | grep
 离线核对四条规则在位：
 
 ```bash
-./bin/kustomize build config/overlays/openshift | grep -c "alert:"
+make kustomize && ./bin/kustomize build config/overlays/openshift | grep -c "alert:"
 ```
 
 应输出 `4`。
@@ -532,7 +566,7 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 
 2. **`yundun-cert:*` 无法资源级收窄**，见「RAM 权限」。必须用独立子账号。
 
-3. **不缓存 Secret 的盲区。** Secret 被换成一张合法但不同的证书、且 cert-manager 没有 bump `revision` 时，operator 要到下一次周期 resync 才发现，最多延迟一个 `--certificate-resync-interval`（默认 1h）。这一条对应 spec §12.3 的 `#7`，属于集群侧探针，跑它需要 `INTEGRATION_KUBECONFIG`；**当前提交的 `test/integration/RESULTS.md` 里没有 `#7` 这一行**，也就是说这一条尚无真实集群的实测结论。怎么发现：`status.current.fingerprint` 与 Secret 里那张的实际指纹对不上。
+3. **不缓存 Secret 的盲区。** Secret 被换成一张合法但不同的证书、且 cert-manager 没有 bump `revision` 时，operator 要到下一次周期 resync 才发现，最多延迟一个 `--certificate-resync-interval`（默认 1h）。这一条对应 spec §12.3 的 `#7`，属于集群侧探针。`test/integration/RESULTS.md` 里 `#7` 目前记的是**未实测**（原因：集成环境的那个集群上没有 cert-manager 的 API 类型），所以这个延迟上界还没有真实集群的实测确认。怎么发现：`status.current.fingerprint` 与 Secret 里那张的实际指纹对不上。
 
 4. **CAS 的 `ClientToken` 不提供上传幂等。** 实测（`RESULTS.md` `#3` / `#13`）：同 token 重复上传返回 `NameRepeat` 而不是原 certId。write-ahead 的崩溃恢复因此走的是预案里的退化路径——`DuplicateName → findByName`，用 `ListUserCertificateOrder` 分页查询认领既有 certId，而这个接口 QPS 只有 10。名字字符集（`-` 与 `.` 均接受）与跨 region 可见性（**不可见**，两个 endpoint 的证书集合互相隔离）同样在 `RESULTS.md` 里，`#4` 与 `#9`。跨 region 那条的直接后果：`spec.aliyun.casRegion` 改了之后，旧 region 上的证书在新 region 一条都查不到。
 
@@ -548,7 +582,11 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 
 10. **CAS 的 `Keyword` 是任意子串匹配，且不做 DNS 通配符展开。** 实测（`RESULTS.md` `#12`）：对一张 SAN 为 `*.example.com` 的证书，`Keyword` 传 `*.example.com`、`example.com`、甚至 `xampl` 这样的片段都能查到，因为它按字符串子串匹配；但传 `probe.example.com` 查不到，因为它不把通配符展开成具体子域。
 
-    现有实现（`casDomainHint` 取 `dnsNames[0]`）传的就是 `*.example.com`，**正常路径没有问题**，不存在「探测持续误判、每 12 小时重传一次」这种情况。要咬人的是反方向：把 `spec.dnsNames` 从 `*.example.com` 改成 `probe.example.com`（或任何不是它子串的域名），并且此时 `status.pendingUpload.domainHint` 这个快照已经因为上传成功而被清空——那么之后所有按 Keyword 去找旧证书的路径（存在性探测、保留策略回收、finalizer 清理）都会一无所获，CAS 上那张旧证书就被**无痕地孤儿化**，同时新域名的证书会被当成一张新证书重新上传。怎么发现：改过 `dnsNames` 之后去 CAS 控制台看，旧域名的证书还在，但没有任何 CR 的 `status` 指向它。处置：手工删除。
+    现有实现传的就是 `*.example.com`（`casDomainHint` 取 `dnsNames[0]`），**正常路径没有问题**，不存在「探测持续误判、每 12 小时重传一次」这种情况。要咬人的是反方向，而且只有**一条**路径会咬：**CAS 存在性探测**。
+
+    机制是这样的。走 Keyword 的地方一共三处，另外两处都不受影响——保留策略回收（`retention.go`）与 finalizer 主清理路径（`deletion.go`）都是拿 `status` 里记着的 `certId` **直删**，压根不查 Keyword；唯一另一处用 Keyword 的 `cleanupPendingUpload` 只在 `status.pendingUpload != nil` 时才跑，而那时 `casFindHint` 第一优先返回的正是 `pendingUpload.domainHint` 这个快照。剩下的探测则不同：它传给 `FindUploaded` 的域名取自**当前叶子证书的 SAN**。所以把 `spec.dnsNames` 从 `*.example.com` 改成 `probe.example.com`（或任何不是它子串的域名）、cert-manager 重签出新叶子之后，如果这一轮恰好轮到 12 小时一次的探测（`status.casProbedAt` 已过期），探测就会拿**新叶子**的域名去找**旧代次**的 certId，必然找不到，于是判定「云上那张没了」：清空 `status.current.certId` 与 `fingerprint`，发一条 `Warning CASCertificateMissing`，紧接着把新证书当作全新一张传上去。旧代次的 certId 就此从 `status` 里消失，CAS 上那张证书被**无痕地孤儿化**。（探测不到期的那些轮次里，换代走的是正常路径：旧代次进 `history`、certId 保留、之后由保留策略按 certId 正常回收，不会漏。）
+
+    怎么发现：改过 `dnsNames` 之后盯 `Warning CASCertificateMissing` 事件，以及 `aliyuncert_cas_upload_total{result="success"}` 意外多涨的那一次——这两个信号比事后去 CAS 控制台翻「有证书但没有 CR 指向它」早得多。处置：去控制台手工删掉旧域名那张。
 
 11. **`--watch-namespaces` 生效时，跨 namespace 仲裁退化为跨已 watch namespace 仲裁。** 「同一个目标只能有一个 Binding 生效」这条约束靠 controller 自己看到的全量 Binding 列表来判定（`binding_conflict.go` 走的是带 cache 的 List）。限定 watch 范围之后，范围外的 Binding 看不见也就不参与仲裁，两个不同 namespace 的 Binding 可能同时认为自己是赢家、互相覆盖目标上的证书。怎么发现：`aliyuncert_binding_conflict` 恒为 0，而 FC3 域名上的证书在两代之间来回翻，`aliyuncert_binding_drift_detected_total` 两边都在涨。用 `--watch-namespaces` 时必须自己保证同一个 FC3 域名不被范围外的 Binding 引用。
 
@@ -631,22 +669,26 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 
 ### 排查命令
 
+先把要查的对象名放进一个变量，下面几条就能整块复制执行：
+
 ```bash
 # oc
-oc get aliyuncertificate <name> -o jsonpath='{.status.conditions}' | jq
-oc describe aliyuncertificate <name>
-oc get aliyuncertificatebinding <name> -o jsonpath='{.status}' | jq
-oc -n le-to-alicloud-system logs deploy/le-to-alicloud-controller-manager | grep <name>
-oc get events --field-selector involvedObject.name=<name>
+NAME=timehorse-api   # 换成你自己的 CR 名
+oc get aliyuncertificate "$NAME" -o jsonpath='{.status.conditions}' | jq
+oc describe aliyuncertificate "$NAME"
+oc get aliyuncertificatebinding "$NAME-fc3" -o jsonpath='{.status}' | jq
+oc -n le-to-alicloud-system logs deploy/le-to-alicloud-controller-manager | grep "$NAME"
+oc get events --field-selector "involvedObject.name=$NAME"
 ```
 
 ```bash
 # kubectl
-kubectl get aliyuncertificate <name> -o jsonpath='{.status.conditions}' | jq
-kubectl describe aliyuncertificate <name>
-kubectl get aliyuncertificatebinding <name> -o jsonpath='{.status}' | jq
-kubectl -n le-to-alicloud-system logs deploy/le-to-alicloud-controller-manager | grep <name>
-kubectl get events --field-selector involvedObject.name=<name>
+NAME=timehorse-api   # 换成你自己的 CR 名
+kubectl get aliyuncertificate "$NAME" -o jsonpath='{.status.conditions}' | jq
+kubectl describe aliyuncertificate "$NAME"
+kubectl get aliyuncertificatebinding "$NAME-fc3" -o jsonpath='{.status}' | jq
+kubectl -n le-to-alicloud-system logs deploy/le-to-alicloud-controller-manager | grep "$NAME"
+kubectl get events --field-selector "involvedObject.name=$NAME"
 ```
 
 ## 开发
@@ -680,8 +722,11 @@ config/
 ├── operator/             # ../rbac + ../manager + metrics Service，刻意不含 CRD
 ├── default/              # ../crd + ../operator，供 make deploy 与 make build-installer
 ├── prometheus/           # ServiceMonitor + PrometheusRule
+├── samples/              # 三个样本 CR，见「CRD 参考 → 上手」；手工 apply，不进上面任何一层
 └── overlays/openshift/   # ../operator + ../prometheus，Argo CD 的 operator Application 指向这里
 ```
+
+（`config/` 下还有 `manifests/`、`scorecard/`、`network-policy/` 三个脚手架原样的目录。前两个只服务 `make bundle`（本项目不做 OLM bundle，不进 CI 必过项），`network-policy/` 没有被任何 kustomization 引用。三者都与本节要讲的布局偏离无关。）
 
 `config/operator` 是从 `config/default` 里拆出来的，`metrics_service.yaml` 与 `manager_metrics_patch.yaml`（以及注释掉的 `cert_metrics_manager_patch.yaml`）一并移了过去。理由是 **Argo CD 的两个 Application 必须拥有互不相交的资源集合**：CRD 只能有一个所有者，否则 Argo 会把它报成 shared resource 并在两边反复 sync。所以 `config/operator` 不含 CRD，`config/overlays/openshift` 也就不含 CRD；CRD 由指向 `config/crd` 的那个 Application 独占。`make deploy` 走的仍是 `config/default`，它把两边聚合回来——拆分前后 `kustomize build config/default` 的输出逐字节相同。
 
@@ -690,13 +735,13 @@ config/
 **重新生成脚手架时（升级 operator-sdk、重跑 `operator-sdk init` 之类）不要用生成结果覆盖 `config/operator`，也不要把那几个文件挪回 `config/default`。** 校验方式：
 
 ```bash
-./bin/kustomize build config/overlays/openshift | grep -c "kind: CustomResourceDefinition"
+make kustomize && ./bin/kustomize build config/overlays/openshift | grep -c "kind: CustomResourceDefinition"
 ```
 
 必须输出 `0`。反过来，`config/default` 必须含有两个 CRD：
 
 ```bash
-./bin/kustomize build config/default | grep -c "^kind: CustomResourceDefinition"
+make kustomize && ./bin/kustomize build config/default | grep -c "^kind: CustomResourceDefinition"
 ```
 
 必须输出 `2`。
@@ -726,7 +771,7 @@ config/
 
 6. **缺凭证时 `make test-integration` 是 skip，不是 fail。** 所以它进 CI 是安全的，但绿灯不等于跑过——判断依据是 `RESULTS.md` 有没有被更新，以及测试输出里有多少 `--- SKIP`。
 
-7. 集群侧那三项（spec §12.3 `#6` / `#7` / `#11`）需要 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 的集群，并且本项目的 CRD 已经装上（`make install`，或 `oc apply -k config/crd` / `kubectl apply -k config/crd`）。它们用 `SelfSigned` Issuer，不消耗任何 ACME 配额。留空时这三项被跳过，正常会在 `RESULTS.md` 里各留一行「未实测」。**当前提交的那一份连这三行都没有**——它是在集群侧探针没被执行到的情况下生成的，所以 `#6` / `#7` / `#11` 至今没有任何真实集群的结论。补齐它们需要配好 `INTEGRATION_KUBECONFIG` 再整包跑一次。
+7. 集群侧那三项（spec §12.3 `#6` / `#7` / `#11`）需要 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 的集群，并且本项目的 CRD 已经装上（`make install`，或 `oc apply -k config/crd` / `kubectl apply -k config/crd`）。它们用 `SelfSigned` Issuer，不消耗任何 ACME 配额。留空（或者 kubeconfig 指的集群上没装 cert-manager）时这三项被跳过，`RESULTS.md` 里会各留一行「未实测」并附上原因——**当前提交的那一份正是这个状态**：三行都在，但都还没有真实集群的结论。补齐它们需要把 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 与本项目 CRD 的集群，再整包跑一次。
 
 8. **跑完集群探针要复查残留 namespace。** 探针会建一批 `it-certmgr-<随机后缀>` 的临时 namespace 并在结束时删掉：
 
@@ -742,3 +787,6 @@ config/
 
    如果这个集群**同时装了本 operator**，删除会卡一阵：探针在 namespace 里建的 `probe-owner` 这个 `AliyunCertificate` 带 finalizer，而它的 `credentialsRef` 指向一个并不存在的 Secret，operator 拿不到凭证就没法完成云侧清理，于是不断重试，namespace 会在 `Terminating` 停留一个宽限期（`--cleanup-grace-period`，默认 15 分钟）后才随 `Abandon` 策略放行。这是预期行为，等一等即可——**不要手工摘 finalizer**，那会跳过清理逻辑。策略配成 `Block` 的集群上它会一直卡住，需要人工介入。
 
+## License
+
+Apache License 2.0，与各源文件头部的许可声明一致。完整条款见 <https://www.apache.org/licenses/LICENSE-2.0>。
