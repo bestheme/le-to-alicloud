@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -30,50 +31,45 @@ func TestFC3GetCustomDomainNotFound(t *testing.T) {
 	cred, region := requireCAS(t, "#14", q14fc3)
 	c := newFC3(t, cred, region)
 
-	// .invalid 是 RFC 2606 的保留后缀，谁都注册不了；再拼一段随机前缀，保证这个名字
-	// 既不可能属于本账号，也不可能撞上别人的域名。
-	absent := "it-absent-" + randHex(t, 6) + ".integration.invalid"
+	// 两个探测名一起用，是为了把**域名格式校验**这个混淆变量消掉。
+	//
+	// FC3 自定义域名要求真实注册的域名（中国区还要 ICP 备案），所以服务端完全可能在
+	// 做存在性查找**之前**就以 InvalidArgument / ParameterInvalid / DomainNameInvalid
+	// 一类把探测名按参数非法拒掉。那种码不是「FC3 说这个域名不存在」，把它当成 #14 的
+	// 结论，会连带指示把它补进 classifyCode 的 NotFound 桶——那样**每一次域名参数
+	// 错误都会被 Observe 判成「目标不存在」**。
+	//
+	//   - primary：`.example.com`（RFC 2606 保留给文档用）语法完全正常，能过格式校验，
+	//     但本账号必然没有绑定过它。结论以这个名字的应答为准。
+	//   - control：`.invalid`（RFC 2606 保留后缀）谁都注册不了，必然过不了「真实域名」
+	//     这一关。它只做交叉对照：两个名字返回同一个码，才说明这个码与格式无关。
+	//
+	// 两个名字都带随机前缀，保证既不属于本账号也撞不上别人的域名。
+	primary := "it-absent-" + randHex(t, 6) + ".example.com"
+	control := "it-absent-" + randHex(t, 6) + ".integration.invalid"
 
-	// 重试是必需的，不是保险：实测中到 fcv3 endpoint 的**首次**连接会撞满 5s 的
-	// ConnectTimeout（endpoint 有多条 A 记录，第一条可能连不上），而那是一次传输层
-	// 故障，跟「FC3 怎么回答不存在的域名」毫无关系。不重试就会把一次网络抖动写成
-	// #14 的结论——这正是探针最该避免的错误。
-	const attempts = 3
-	var (
-		err  error
-		code string
-	)
-	for i := 1; i <= attempts; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-		_, err = c.GetCustomDomain(ctx, absent)
-		cancel()
-		if err == nil {
-			break
-		}
-		code = errCode(err)
-		if !isTransportFailure(code) {
-			break
-		}
-		t.Logf("第 %d/%d 次 GetCustomDomain 是传输层故障（code=%s），重试", i, attempts, code)
-	}
-
+	code, err := probeAbsentDomain(t, c, primary)
 	if err == nil {
-		Record(t, "#14", q14fc3, "无错误：不存在的域名也返回了对象", "查询的域名="+absent)
-		t.Fatalf("GetCustomDomain 对不存在的域名 %q 没有报错", absent)
+		Record(t, "#14", q14fc3, "无错误：不存在的域名也返回了对象", "查询的域名="+primary)
+		t.Fatalf("GetCustomDomain 对不存在的域名 %q 没有报错", primary)
 	}
 	class := aliyun.ClassOf(err)
 
-	// 传输层故障说明这次调用压根没拿到 FC3 的回答。它既不是「域名不存在」也不是
-	// 「FC3 拒绝」，只能记成未实测。
-	if isTransportFailure(code) {
+	// 守卫一：传输层故障（含拿不到错误码的兜底）说明这次调用压根没拿到 FC3 的回答。
+	// 它既不是「域名不存在」也不是「FC3 拒绝」，只能记成未实测。
+	//
+	// code == "" 走同一条路：那意味着错误不是 *aliyun.Error。当前 fc3_sdk.go 的每条
+	// 返回路径都经过 Classify，实际不可达，但一旦哪天可达了，"错误码= class=Permanent"
+	// 这种没有诊断价值的结论比不记还糟。
+	if code == "" || isTransportFailure(code) {
 		RecordSkip(t, "#14", q14fc3,
-			"未实测："+itoa(attempts)+" 次调用全是传输层故障（"+sdkSummary(err)+"），"+
-				"没有拿到 FC3 的应答，得不出 #14 的结论。网络通畅时重跑本用例即可")
+			"未实测：调用没有拿回可解析的 FC3 应答（"+sdkSummary(err)+"），"+
+				"得不出 #14 的结论。网络通畅时重跑本用例即可")
 	}
 
-	// 鉴权失败与「域名不存在」是两回事。凭证子账号可能只有 CAS 权限，那样这里拿到的
-	// 是 403 / AccessDenied——它证明的是「没有 FC3 权限」，**不是** FC3 对缺失域名的
-	// 应答形状。把它写成 #14 的结论就是伪造。
+	// 守卫二：鉴权失败与「域名不存在」是两回事。凭证子账号可能只有 CAS 权限，那样
+	// 这里拿到的是 403 / AccessDenied——它证明的是「没有 FC3 权限」，**不是** FC3 对
+	// 缺失域名的应答形状。把它写成 #14 的结论就是伪造。
 	//
 	// 注意 AccessDenied 本身是有歧义的：FC 的 RAM 是逐域名 ARN
 	// （acs:fc:{region}:{accountId}:custom-domains/{domainName}），所以「压根没有
@@ -87,9 +83,10 @@ func TestFC3GetCustomDomainNotFound(t *testing.T) {
 				"据此得不出 #14 的结论。给子账号授予 fc:GetCustomDomain（资源可用 "+
 				"custom-domains/*）后重跑本用例即可")
 	}
-	// 限流同理：它说明的是账号被频控，不是域名不存在。顺带把这个偶遇的证据记进 #10
-	// ——controller 明确要求「别为了触发限流而狂打真实云」，那么偶然撞上的一次就是
-	// #10 唯一诚实的观测来源。
+
+	// 守卫三：限流同理，它说明的是账号被频控，不是域名不存在。顺带把这个偶遇的证据
+	// 记进 #10——controller 明确要求「别为了触发限流而狂打真实云」，那么偶然撞上的
+	// 一次就是 #10 唯一诚实的观测来源。
 	if strings.HasPrefix(code, "Throttling") {
 		Record(t, "#10", q10fc3,
 			"偶遇一次限流：错误码="+code+"，**以 Throttling 开头**，aliyun.classifyCode 判为 "+
@@ -98,12 +95,71 @@ func TestFC3GetCustomDomainNotFound(t *testing.T) {
 			"未实测：本次 GetCustomDomain 被频控（"+sdkSummary(err)+"），不是「域名不存在」的应答")
 	}
 
+	// control 名只在下面两处出现：作为「非 NotFound 码」的旁证，和作为结论的交叉对照。
+	// 它自己被拒掉是预期之内的，所以它的应答**永远不单独构成结论**。
+	cCode, cErr := probeAbsentDomain(t, c, control)
+	controlNote := "对照名（" + control + "）"
+	switch {
+	case cErr == nil:
+		controlNote += "居然读到了对象"
+	case cCode == "" || isTransportFailure(cCode):
+		controlNote += "是传输层故障（code=" + cCode + "），无参考价值"
+	case cCode == code:
+		controlNote += "返回同一个码，说明该码与域名格式无关"
+	default:
+		controlNote += "返回 code=" + cCode + "，与主探测不同——两者之间至少有一个是格式校验的结果"
+	}
+
+	// 守卫四：只有确实拿到「不存在」这个语义的应答才落结论。判定口径与
+	// pkg/aliyun 的 classifyCode 对齐：class 已是 NotFound，或错误码含 NotFound /
+	// NotExist，或 HTTP 状态是 404。三者都不满足就说明这个码有别的解释（最可能是
+	// 域名格式 / 参数校验），据此落结论就是假结论。
+	if !isNotFoundAnswer(err, code, class) {
+		RecordSkip(t, "#14", q14fc3,
+			"未实测：拿到 "+sdkSummary(err)+"，无法排除它是域名格式 / 参数校验的结果而非"+
+				"「域名不存在」的应答（FC3 自定义域名要求真实注册域名，中国区还要 ICP 备案）。"+
+				controlNote+"。请改用一个语法正常、账号确实未绑定、且已备案的域名重跑本用例")
+	}
+
 	Record(t, "#14", q14fc3, "错误码="+code+" class="+class.String(),
-		sdkSummary(err)+"；查询的域名="+absent)
+		sdkSummary(err)+"；查询的域名="+primary+"；"+controlNote)
 	if class != aliyun.ClassNotFound {
 		t.Errorf("不存在的域名被判成 %s 而不是 NotFound，"+
 			"必须把错误码 %q 补进 pkg/aliyun/errors.go 的 classifyCode 再重跑", class, code)
 	}
+}
+
+// probeAbsentDomain 对一个必然不存在的域名做只读 GetCustomDomain，返回最后一次的
+// 错误码与 error（error 为 nil 时错误码为空串）。
+//
+// 重试是必需的，不是保险：实测中到 fcv3 endpoint 的**首次**连接会撞满 5s 的
+// ConnectTimeout（endpoint 有多条 A 记录，第一条可能连不上），而那是一次传输层故障，
+// 跟「FC3 怎么回答不存在的域名」毫无关系。不重试就会把一次网络抖动写成 #14 的结论。
+func probeAbsentDomain(t *testing.T, c aliyun.FC3Client, domain string) (string, error) {
+	t.Helper()
+	const attempts = 3
+	var (
+		err  error
+		code string
+	)
+	for i := 1; i <= attempts; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		_, err = c.GetCustomDomain(ctx, domain)
+		cancel()
+		if err == nil {
+			return "", nil
+		}
+		code = errCode(err)
+		if !isTransportFailure(code) {
+			break
+		}
+		if i < attempts {
+			t.Logf("第 %d/%d 次 GetCustomDomain 是传输层故障（code=%s），重试", i, attempts, code)
+			continue
+		}
+		t.Logf("第 %d/%d 次 GetCustomDomain 仍是传输层故障（code=%s），不再重试", i, attempts, code)
+	}
+	return code, err
 }
 
 // TestFC3CertConfigEncodings（#1、#5 的 FC3 侧）：CAS 与 FC3 是两套独立的校验，
@@ -234,7 +290,10 @@ func TestFC3ThrottlingThreshold(t *testing.T) {
 			"违反探针「不污染账号」的纪律；且 pkg/aliyun 的 LimitFC3 客户端限流是 "+
 			"5 QPS / burst 1，探针先被自己限住，摸不到云侧阈值。"+
 			"阈值需查官方文档或提工单确认；错误码是否以 Throttling 开头，"+
-			"由只读探针偶遇限流时记录（本轮未偶遇）")
+			"由只读探针偶遇限流时记录（本轮未偶遇）。"+
+			"**若 RESULTS.md 里另有一行 #10 记录了真实错误码，以那一行为准**——"+
+			"那是 TestFC3GetCustomDomainNotFound 偶遇限流时写下的真实观测，"+
+			"本行只说明「阈值」这一半没测")
 }
 
 // ---- 以下是本文件专用的辅助 ----
@@ -311,7 +370,10 @@ func restoreCustomDomain(t *testing.T, c aliyun.FC3Client, domain string, before
 		t.Logf("回写 %s 的原配置失败，需人工检查: %s", domain, sdkSummary(err))
 		return
 	}
-	t.Logf("已回写 %s 的 protocol 与回填字段；证书仍是探针签发的那张，需人工替换", domain)
+	// 回写体既没有 CertConfig 也没有 ClearCert，所以域名上的证书变成什么样，取决于
+	// UpdateCustomDomain 到底是全量替换还是部分合并（那正是 #2 要测的东西）：
+	// 合并语义下留着探针签发的那张，替换语义下被清空。两种都不是原来的证书。
+	t.Logf("已回写 %s 的 protocol 与回填字段；证书状态取决于 Update 的合并语义，需人工核对", domain)
 }
 
 // errCode 取阿里云错误码；非本包错误返回空串。
@@ -335,6 +397,49 @@ func isTransportFailure(code string) bool {
 	default:
 		return false
 	}
+}
+
+// isNotFoundAnswer 判断这个应答是不是「FC3 说这个域名不存在」。
+//
+// 口径与 pkg/aliyun 的 classifyCode 对齐：class 已是 NotFound、错误码含 NotFound /
+// NotExist、或 HTTP 状态是 404，三者任一成立即可。三者都不成立时，这个码就有别的
+// 解释——最可能的是域名格式 / 参数校验（FC3 自定义域名要求真实注册域名），而不是
+// 「不存在」。
+//
+// 这道守卫必须有：#14 落结论的那一步会顺带 t.Errorf **指示**把该错误码补进
+// classifyCode 的 NotFound 桶。要是把 InvalidArgument 这类码放进去，每一次域名参数
+// 错误都会被 Observe 判成「目标不存在」——比它要防的无限重试更糟。
+func isNotFoundAnswer(err error, code string, class aliyun.ErrClass) bool {
+	return class == aliyun.ClassNotFound ||
+		strings.Contains(code, "NotFound") ||
+		strings.Contains(code, "NotExist") ||
+		httpStatusOf(err) == 404
+}
+
+// httpStatusOf 取错误里的 HTTP 状态码，取不到返回 0。
+//
+// aliyun.Error 刻意不保留 StatusCode 字段，fromSDKError 构造的内层文本
+// "sdk error code=… status=…" 是它唯一暴露状态码的地方，所以这里只能解析它——
+// 且只解析这一种前缀，本地构造的错误分支一律返回 0。
+func httpStatusOf(err error) int {
+	var ae *aliyun.Error
+	if !asAliyunError(err, &ae) || ae.Err == nil {
+		return 0
+	}
+	s := ae.Err.Error()
+	if !strings.HasPrefix(s, "sdk error code=") {
+		return 0
+	}
+	const marker = " status="
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return 0
+	}
+	n, convErr := strconv.Atoi(strings.TrimSpace(s[i+len(marker):]))
+	if convErr != nil {
+		return 0
+	}
+	return n
 }
 
 // sdkSummary 把一个错误折成可以安全写进报告的一句话。
