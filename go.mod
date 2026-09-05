@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/alibabacloud-go/cas-20200407/v4 v4.7.0
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.2.4
+	github.com/alibabacloud-go/fc-20230330/v4 v4.8.2
 	github.com/alibabacloud-go/tea v1.5.3
 	github.com/aliyun/credentials-go v1.4.13
 	github.com/cert-manager/cert-manager v1.21.1

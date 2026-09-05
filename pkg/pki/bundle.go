@@ -34,6 +34,17 @@ type Bundle struct {
 	Fingerprint string
 }
 
+// fingerprintOf 是全系统的幂等基准：hex(sha256(证书 DER))。
+//
+// 这个表达式只此一处。ParseBundle（从 Secret 连私钥一起解析）与 LeafFingerprint（云侧
+// 只拿得到公开证书）必须给出同一个值，否则「云上这张是不是我写的」永远为假，operator
+// 会一轮一轮地重写同样的内容。抄两遍就是在赌它们永远同步；抽成一个函数，这条不变量才
+// 从「测试保证」变成「结构保证」。
+func fingerprintOf(c *x509.Certificate) string {
+	sum := sha256.Sum256(c.Raw)
+	return hex.EncodeToString(sum[:])
+}
+
 // ParseBundle 解析 tls.crt / tls.key，校验链连续性与公私钥匹配。
 // 不校验有效期、不校验信任锚（那是 cert-manager 的职责）。
 func ParseBundle(certPEM, keyPEM []byte) (*Bundle, error) {
@@ -60,8 +71,7 @@ func ParseBundle(certPEM, keyPEM []byte) (*Bundle, error) {
 		return nil, ErrKeyMismatch
 	}
 
-	sum := sha256.Sum256(b.Leaf.Raw)
-	b.Fingerprint = hex.EncodeToString(sum[:])
+	b.Fingerprint = fingerprintOf(b.Leaf)
 	return b, nil
 }
 
@@ -227,4 +237,17 @@ func (b *Bundle) KeyPEM() ([]byte, error) {
 	default:
 		return nil, ErrUnsupportedKey
 	}
+}
+
+// LeafFingerprint 从 PEM 中解析出第一张证书并返回 hex(sha256(DER))。
+//
+// 与 Bundle.Fingerprint 同源：云侧只能拿到公开证书（FC3 的 certConfig.certificate），
+// 而证书侧是从 Secret 连私钥一起解析出来的。两条路径必须给出同一个值，否则「云上这张
+// 是不是我写的」这个判断永远为假，operator 会每小时重写一次同样的内容。
+func LeafFingerprint(certPEM []byte) (string, error) {
+	certs, err := parseCertificates(certPEM)
+	if err != nil {
+		return "", err
+	}
+	return fingerprintOf(certs[0]), nil
 }

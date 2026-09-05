@@ -23,22 +23,25 @@ func (k ClientKey) identity() string {
 	return k.Namespace + "/" + k.Name + "/" + k.Region + "/" + k.Endpoint + "/" + k.ResourceGroupID
 }
 
+type entry[T any] struct {
+	rv     string
+	client T
+}
+
 // ClientCache 每个 (namespace, name, region, endpoint, resourceGroupId) 只保留最新
 // resourceVersion 的 client。
-type ClientCache struct {
+//
+// 泛型是因为 CAS 与 FC3 的 client 类型不同，而两者的缓存规则完全一样：与其让缓存存
+// any 再到处断言，不如让每个服务各持一份类型确定的缓存。
+type ClientCache[T any] struct {
 	mu sync.Mutex
-	m  map[string]entry
+	m  map[string]entry[T]
 }
 
-type entry struct {
-	rv     string
-	client CASClient
-}
-
-func NewClientCache() *ClientCache { return &ClientCache{m: map[string]entry{}} }
+func NewClientCache[T any]() *ClientCache[T] { return &ClientCache[T]{m: map[string]entry[T]{}} }
 
 // GetOrBuild 返回缓存 client，或用 build 构造并替换旧版本。
-func (c *ClientCache) GetOrBuild(key ClientKey, build func() (CASClient, error)) (CASClient, error) {
+func (c *ClientCache[T]) GetOrBuild(key ClientKey, build func() (T, error)) (T, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	id := key.identity()
@@ -47,11 +50,12 @@ func (c *ClientCache) GetOrBuild(key ClientKey, build func() (CASClient, error))
 	}
 	cl, err := build()
 	if err != nil {
-		return nil, err
+		var zero T
+		return zero, err
 	}
-	c.m[id] = entry{rv: key.ResourceVersion, client: cl}
+	c.m[id] = entry[T]{rv: key.ResourceVersion, client: cl}
 	return cl, nil
 }
 
 // Len 返回缓存条目数（测试用）。
-func (c *ClientCache) Len() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.m) }
+func (c *ClientCache[T]) Len() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.m) }

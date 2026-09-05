@@ -37,20 +37,39 @@ type materialError struct {
 	Message string
 }
 
-// loadMaterial 直读 Secret（不经 cache），解析并校验。任何失败都不上传。
-func loadMaterial(ctx context.Context, reader client.Reader, ac *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate) (*pki.Bundle, *materialError) {
+// loadBundle 直读 Secret（不经 cache）并解析成 Bundle。
+//
+// 证书 controller（loadMaterial）与绑定 controller（loadBindingMaterial）共用这一段：
+// 两边对「读 Secret」这件事的契约必须逐字相同——同一个 Secret 名、同两个 data key、
+// 同一组 reason 与 message。抄成两份的话，将来任何一次改动（加 Secret 类型校验、换
+// data key、改写 message、新增一类 invalid 子情形）都会只落在一份里，而用户看到的是
+// 两个 controller 对同一个故障给出不一样的 condition。
+//
+// 零凭证泄漏的护栏也因此只有这一处：pki 的错误只描述格式问题，不含密钥内容，可安全
+// 写入 message。
+func loadBundle(ctx context.Context, reader client.Reader,
+	ac *certsv1alpha1.AliyunCertificate) (*pki.Bundle, *materialError) {
 	s := &corev1.Secret{}
-	err := reader.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: secretNameFor(ac)}, s)
+	name := secretNameFor(ac)
+	err := reader.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: name}, s)
 	if apierrors.IsNotFound(err) {
-		return nil, &materialError{certsv1alpha1.ReasonSecretNotFound, fmt.Sprintf("Secret %q 不存在", secretNameFor(ac))}
+		return nil, &materialError{certsv1alpha1.ReasonSecretNotFound, fmt.Sprintf("Secret %q 不存在", name)}
 	}
 	if err != nil {
 		return nil, &materialError{certsv1alpha1.ReasonSecretInvalid, "读取 Secret 失败: " + err.Error()}
 	}
 	b, err := pki.ParseBundle(s.Data[corev1.TLSCertKey], s.Data[corev1.TLSPrivateKeyKey])
 	if err != nil {
-		// pki 的错误只描述格式问题，不含密钥内容，可安全写入 message
 		return nil, &materialError{certsv1alpha1.ReasonSecretInvalid, err.Error()}
+	}
+	return b, nil
+}
+
+// loadMaterial 直读 Secret（不经 cache），解析并校验。任何失败都不上传。
+func loadMaterial(ctx context.Context, reader client.Reader, ac *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate) (*pki.Bundle, *materialError) {
+	b, me := loadBundle(ctx, reader, ac)
+	if me != nil {
+		return nil, me
 	}
 	if me := validateMaterial(b, ac, cert); me != nil {
 		return nil, me

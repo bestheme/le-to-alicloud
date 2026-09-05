@@ -41,6 +41,9 @@ const TargetTypeFC3CustomDomain = "FC3CustomDomain"
 // IndexBindingByCertificate 是 controller-runtime field index 的键名。
 const IndexBindingByCertificate = "spec.certificateRef.name"
 
+// IndexBindingByTarget 是同目标冲突仲裁用的 field index 键名，值为 TargetKey()。
+const IndexBindingByTarget = "spec.target"
+
 // FC3CustomDomainTarget 指向一个 FC3 自定义域名。证书归属于域名，与函数无关。
 type FC3CustomDomainTarget struct {
 	// +kubebuilder:validation:MinLength=1
@@ -85,6 +88,15 @@ type AliyunCertificateBindingStatus struct {
 	// 目标上实际生效的证书指纹。
 	// +optional
 	AppliedFingerprint string `json:"appliedFingerprint,omitempty"`
+	// 上一轮观测到的「漂移证书」指纹：既不是我们上次写的、也不是当前该写的那一张。
+	// 未观测到漂移时为空。
+	//
+	// 存在的唯一理由是让 DriftCorrected 事件与 drift 计数器**只在跃迁时**发一次
+	// （spec §10.2）：漂移在 Apply 修好之前每一轮都还在，没有这条痕迹就没有可比较的
+	// 基准，事件会随重试节奏一轮一轮地重发。写入点只有 noteDrift（记下 / 抹掉）与
+	// freezeApplied（两条核实过的成功路径上一并清空）。
+	// +optional
+	DriftedFingerprint string `json:"driftedFingerprint,omitempty"`
 	// +optional
 	LastAppliedTime *metav1.Time `json:"lastAppliedTime,omitempty"`
 	// +optional
@@ -92,6 +104,9 @@ type AliyunCertificateBindingStatus struct {
 	// 首次成功 Apply 时固化，用于账号 fencing。
 	// +optional
 	BoundAccountID string `json:"boundAccountId,omitempty"`
+	// 首次进入删除分支的时间，用于 --cleanup-grace-period 计时。
+	// +optional
+	CleanupStartedAt *metav1.Time `json:"cleanupStartedAt,omitempty"`
 	// +optional
 	// +listType=map
 	// +listMapKey=type

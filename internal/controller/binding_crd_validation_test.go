@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -33,6 +34,8 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 	var ns string
 	BeforeEach(func() { ns = newNamespace(ctx) })
 
+	// 域名一律 <name>.<namespace>.example.com：TargetKey() 不含 namespace，跨 namespace
+	// 撞名的 fixture 会被同目标仲裁判成 Conflict。
 	newBinding := func(name string) *certsv1alpha1.AliyunCertificateBinding {
 		return &certsv1alpha1.AliyunCertificateBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -41,7 +44,7 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 				Target: certsv1alpha1.BindingTarget{
 					Type: certsv1alpha1.TargetTypeFC3CustomDomain,
 					FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{
-						Region: "cn-hangzhou", DomainName: "api.example.com",
+						Region: "cn-hangzhou", DomainName: fmt.Sprintf("%s.%s.example.com", name, ns),
 					},
 				},
 			},
@@ -54,7 +57,7 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 		got := &certsv1alpha1.AliyunCertificateBinding{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "defaults", Namespace: ns}, got)).To(Succeed())
 		Expect(got.Spec.DeletionPolicy).To(Equal(certsv1alpha1.DeletionPolicyOrphan))
-		Expect(got.TargetKey()).To(Equal("FC3CustomDomain/cn-hangzhou/api.example.com"))
+		Expect(got.TargetKey()).To(Equal(fmt.Sprintf("FC3CustomDomain/cn-hangzhou/defaults.%s.example.com", ns)))
 	})
 
 	It("拒绝 type=FC3CustomDomain 但缺少 fc3CustomDomain", func() {
@@ -65,10 +68,21 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 	})
 
 	It("target 不可变", func() {
-		b := newBinding("immutable")
-		Expect(k8sClient.Create(ctx, b)).To(Succeed())
-		b.Spec.Target.FC3CustomDomain.DomainName = "other.example.com"
-		Expect(k8sClient.Update(ctx, b)).To(MatchError(ContainSubstring(
+		Expect(k8sClient.Create(ctx, newBinding("immutable"))).To(Succeed())
+		// 不能拿创建时那一份直接改：Binding reconciler 一唤醒就会给新对象补 finalizer，
+		// 那次 Update 推进 resourceVersion，于是这里的写入撞上 409 Conflict 而不是 CEL 的
+		// 不可变错误，用例随机翻车（实测约 1/9）。重读一份也不够——重读与 Update 之间
+		// 同样能插进 finalizer 那一次写——所以整段放进 Eventually：冲突就重来，咬定
+		// 「最终报出来的是不可变」。放宽的只有时机，断言的内容一个字没动：真让 target
+		// 可改了，Update 会成功、返回 nil，匹配照样失败。
+		Eventually(func() error {
+			got := &certsv1alpha1.AliyunCertificateBinding{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "immutable", Namespace: ns}, got); err != nil {
+				return err
+			}
+			got.Spec.Target.FC3CustomDomain.DomainName = fmt.Sprintf("other.%s.example.com", ns)
+			return k8sClient.Update(ctx, got)
+		}, "10s", "100ms").Should(MatchError(ContainSubstring(
 			"spec.target: Invalid value: target 不可变，请新建 Binding")))
 	})
 

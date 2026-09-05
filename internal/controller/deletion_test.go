@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -30,8 +31,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake" // fake 已归 pkg/aliyun/fake
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
@@ -115,6 +120,46 @@ func TestCleanupPendingUploadNotOnServer(t *testing.T) {
 	}
 	if !f.Has(other) {
 		t.Error("别人的证书不该被删掉")
+	}
+}
+
+// 摘 finalizer 时的 NotFound 必须被吸收掉，与 finishBindingDeletion 同一条规矩。
+//
+// 删除分支读的是 informer cache：对象被 API server 真正删除之后，缓存里那份带 finalizer
+// 的旧版本还会再唤起一轮，而那一轮的 Update 打在一个已经不存在的对象上。抛上去等于
+// **每一次证书删除**都推高一次 controller_runtime_reconcile_errors_total 并打一条
+// reconciler error 日志——那个指标正是运维配告警的地方。
+func TestReconcileDelete_IgnoresNotFoundOnFinalizerRemoval(t *testing.T) {
+	s := factoryScheme(t)
+	if err := cmapi.AddToScheme(s); err != nil {
+		t.Fatalf("cmapi.AddToScheme: %v", err)
+	}
+	ac := &certsv1alpha1.AliyunCertificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns1", Name: "c1",
+			Finalizers: []string{certsv1alpha1.FinalizerName},
+		},
+	}
+	c := crfake.NewClientBuilder().WithScheme(s).WithObjects(ac.DeepCopy()).
+		WithStatusSubresource(&certsv1alpha1.AliyunCertificate{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(_ context.Context, _ client.WithWatch, obj client.Object,
+				_ ...client.UpdateOption) error {
+				return apierrors.NewNotFound(
+					schema.GroupResource{Group: certsv1alpha1.GroupVersion.Group, Resource: "aliyuncertificates"},
+					obj.GetName())
+			},
+		}).Build()
+
+	// status 里没有任何 certId、也没有 pendingUpload：cleanupCAS 直接早退，用例因此
+	// 不需要 CASFactory，走到的正是「一切都清干净了，只剩摘 finalizer」那一步。
+	r := &AliyunCertificateReconciler{Client: c, APIReader: c}
+	res, err := r.reconcileDelete(context.Background(), ac, ac.DeepCopy())
+	if err != nil {
+		t.Fatalf("对象已经不在了，摘 finalizer 的目的已经达到，不该报错: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("删除收尾不该要求重排: %+v", res)
 	}
 }
 
@@ -245,7 +290,9 @@ var _ = Describe("证书 controller：删除", func() {
 			Spec: certsv1alpha1.AliyunCertificateBindingSpec{
 				CertificateRef: certsv1alpha1.LocalObjectReference{Name: "blocked"},
 				Target: certsv1alpha1.BindingTarget{Type: certsv1alpha1.TargetTypeFC3CustomDomain,
-					FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{Region: "cn-hangzhou", DomainName: "x.example.com"}},
+					// 域名带 namespace：TargetKey() 不含 namespace，撞名会被同目标仲裁判成 Conflict。
+					FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{
+						Region: "cn-hangzhou", DomainName: fmt.Sprintf("b.%s.example.com", ns)}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, b)).To(Succeed())

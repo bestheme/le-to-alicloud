@@ -41,7 +41,7 @@ func (e *credentialsError) Error() string { return e.Err.Error() }
 func (e *credentialsError) Unwrap() error { return e.Err }
 
 // NewCASFactory 构造生产用 CASFactory：读同 namespace 的凭证 Secret，按 resourceVersion 缓存 client。
-func NewCASFactory(reader client.Reader, cache *aliyun.ClientCache, limiters *aliyun.Limiters, timeout time.Duration) CASFactory {
+func NewCASFactory(reader client.Reader, cache *aliyun.ClientCache[aliyun.CASClient], limiters *aliyun.Limiters, timeout time.Duration) CASFactory {
 	return func(ctx context.Context, ac *certsv1alpha1.AliyunCertificate) (aliyun.CASClient, error) {
 		s := &corev1.Secret{}
 		err := reader.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: ac.Spec.Aliyun.CredentialsRef.Name}, s)
@@ -73,7 +73,7 @@ func NewCASFactory(reader client.Reader, cache *aliyun.ClientCache, limiters *al
 			return aliyun.NewCASClient(cred, aliyun.CASClientConfig{
 				Region: key.Region, Endpoint: key.Endpoint, ResourceGroupID: key.ResourceGroupID,
 				Timeout: timeout, Limiters: limiters, LimiterKey: creds.LimiterKey(),
-				OnCall: recordAliyunAPICall,
+				OnCall: aliyunAPICallRecorder(serviceCAS),
 			})
 		})
 	}

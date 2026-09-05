@@ -40,6 +40,13 @@ const (
 // 指标的 label 顺序永远一致，recordCertMetrics 里 WithLabelValues(ns, n) 才是对的。
 var crLabels = []string{"namespace", "name"}
 
+// 跨多个指标复用的 label 名。抽成常量与 crLabels 同理：写错一个字面量，只有到
+// WithLabelValues panic 时才会发现。
+const (
+	labelResult   = "result"
+	labelProvider = "provider"
+)
+
 // label 集合刻意很小：绝不把 fingerprint / certId 放进 label（每次轮换都会新增永不消失的 series）。
 var (
 	certNotAfter = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -57,17 +64,24 @@ var (
 	}, crLabels)
 	casUploadTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_cas_upload_total", Help: "CAS upload attempts by result",
-	}, []string{"result"})
+	}, []string{labelResult})
 	casDeleteTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_cas_delete_total", Help: "CAS delete attempts by result",
-	}, []string{"result"})
+	}, []string{labelResult})
 	certManagerCertRecreatedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_certmanager_certificate_recreated_total",
 		Help: "Times the cert-manager Certificate was (re)created after first creation; should stay 0",
 	}, crLabels)
+	// 两个 controller 共用这一个计数器，reason label 上因此跑着**两套词表**
+	// （见 providerErrClass 的注释）。help 文本必须自己说清楚这件事：代码注释给不到
+	// 看板与告警的作者，他们读到的只有这一行。
 	cleanupAbandonedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_cleanup_abandoned_total",
-		Help: "Number of AliyunCertificate deletions that abandoned CAS cleanup",
+		Help: "Deletions that abandoned cloud cleanup after the grace period: " +
+			"AliyunCertificate giving up on CAS certificate deletion, or " +
+			"AliyunCertificateBinding giving up on unbinding the certificate from its target. " +
+			"The reason label carries two vocabularies, one per controller " +
+			"(aliyun error class vs provider error code)",
 	}, []string{"region", "reason"})
 	// spec §10.1 的两个 API 级指标。casUploadTotal / casDeleteTotal 只覆盖写通道，
 	// 而 ListUserCertificateOrder 才是限流最紧（QPS 8、burst 1）也最容易被 RAM 权限
@@ -81,37 +95,96 @@ var (
 		Help:    "Aliyun OpenAPI call latency in seconds",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"service", "action"})
+	bindingReadyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "aliyuncert_binding_ready", Help: "1 if the binding Ready condition is True",
+	}, crLabels)
+	bindingConflictGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "aliyuncert_binding_conflict", Help: "1 if the binding Conflict condition is True",
+	}, crLabels)
+	// aliyuncert_binding_applied_age_seconds 是 spec §10.1 点名「必须告警」的那一个：
+	// 独有的失败模式是「证书续期成功了，但没推到线上」。
+	//
+	// 语义是**滞后时长**（证书 CR 的 status.current 推进之后、本 Binding 尚未把该代
+	// 应用到目标的持续时间；同步时为 0），而不是字面的「生效证书年龄」：后者在一切
+	// 正常时也会随着证书服役时间一路涨到 90 天，而 spec §10.3 的告警式子是
+	// `applied_age > 86400 and certificate_ready == 1`——用字面语义，每一张健康证书在
+	// 第二天就会误报。指标名不变；spec §10.1 与 §10.3 的文字由 Plan 3 的 spec 对齐
+	// 任务更新（team lead 裁决，2026-09-05）。
+	bindingAppliedAge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "aliyuncert_binding_applied_age_seconds",
+		Help: "Seconds the target has been behind the certificate's current generation; 0 when up to date",
+	}, []string{"namespace", "name", labelProvider})
+	bindingApplyTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aliyuncert_binding_apply_total", Help: "Binding apply attempts by provider and result",
+	}, []string{labelProvider, labelResult})
+	bindingDriftTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aliyuncert_binding_drift_detected_total",
+		Help: "Times the target certificate was found changed outside the operator",
+	}, []string{labelProvider})
 )
 
-// serviceCAS 是 service label 目前唯一的取值：Plan 1 只调 CAS。
-const serviceCAS = "cas"
+// service label 的取值。与阿里云的 RAM code 无关，取的是可读的服务简称。
+const (
+	serviceCAS = "cas"
+	serviceFC3 = "fc"
+)
 
 func init() {
 	metrics.Registry.MustRegister(certNotAfter, certReadyGauge, certIssuanceStalled, issuerDefaultDiverged,
 		casUploadTotal, casDeleteTotal, certManagerCertRecreatedTotal, cleanupAbandonedTotal,
-		aliyunAPIRequestsTotal, aliyunAPIDuration)
+		aliyunAPIRequestsTotal, aliyunAPIDuration,
+		bindingReadyGauge, bindingConflictGauge, bindingAppliedAge, bindingApplyTotal, bindingDriftTotal)
 }
 
-// recordAliyunAPICall 是接给 aliyun.CASClientConfig.OnCall 的钩子。
+// aliyunAPICallRecorder 返回绑定到某个 service label 的 OnCall 钩子。
 //
 // 走回调而不是让 pkg/aliyun 直接注册指标：那是一个纯 SDK 封装包，不该依赖
-// controller-runtime 的 metrics registry。label 基数由调用方保证有界——action 是包里
-// 的常量，code 来自 aliyun.callCode（服务端错误码或固定字符串），两者都不含 Message、
+// controller-runtime 的 metrics registry。label 基数由调用方保证有界——action 是包里的
+// 常量，code 来自 aliyun.callCode（服务端错误码或固定字符串），两者都不含 Message、
 // certId、指纹这类每次都不同的值。
-func recordAliyunAPICall(action, code string, d time.Duration) {
-	aliyunAPIRequestsTotal.WithLabelValues(serviceCAS, action, code).Inc()
-	aliyunAPIDuration.WithLabelValues(serviceCAS, action).Observe(d.Seconds())
+func aliyunAPICallRecorder(service string) func(action, code string, d time.Duration) {
+	return func(action, code string, d time.Duration) {
+		aliyunAPIRequestsTotal.WithLabelValues(service, action, code).Inc()
+		aliyunAPIDuration.WithLabelValues(service, action).Observe(d.Seconds())
+	}
+}
+
+// b2f 把布尔折成 gauge 的 0/1。证书侧与绑定侧共用一份。
+func b2f(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// recordBindingMetrics 在每次 status patch 前刷新 binding 侧 gauge。
+func recordBindingMetrics(rd *bindingRound) {
+	recordBindingReadiness(rd)
+	bindingAppliedAge.WithLabelValues(rd.b.Namespace, rd.b.Name, rd.provider).Set(rd.lag.Seconds())
+}
+
+// recordBindingReadiness 只刷 ready / conflict，**不碰 applied_age**。
+//
+// 删除分支专用：那里 rd.lag 恒为零值（见 patchBindingStatus），刷 applied_age 是在
+// 写一个假值；但 ready 必须跟着走——清理失败时 Ready 已经被打成 False，gauge 还停在 1
+// 的话，一个卡在 Terminating 里的对象在看板上依旧是健康的，而 CleanupFailurePolicy=Block
+// 下这个状态会一直持续到有人来处理。
+func recordBindingReadiness(rd *bindingRound) {
+	ns, n := rd.b.Namespace, rd.b.Name
+	bindingReadyGauge.WithLabelValues(ns, n).Set(b2f(bindingCondTrue(rd.b, certsv1alpha1.ConditionReady)))
+	bindingConflictGauge.WithLabelValues(ns, n).Set(b2f(bindingCondTrue(rd.b, certsv1alpha1.ConditionConflict)))
+}
+
+// clearBindingMetrics 在 Binding 删除后移除 series，否则墓碑会一直告警下去。
+func clearBindingMetrics(namespace, name, providerName string) {
+	bindingReadyGauge.DeleteLabelValues(namespace, name)
+	bindingConflictGauge.DeleteLabelValues(namespace, name)
+	bindingAppliedAge.DeleteLabelValues(namespace, name, providerName)
 }
 
 // recordCertMetrics 在每次 status patch 前刷新 gauge。
 func recordCertMetrics(ac *certsv1alpha1.AliyunCertificate) {
 	ns, n := ac.Namespace, ac.Name
-	b2f := func(b bool) float64 {
-		if b {
-			return 1
-		}
-		return 0
-	}
 	if ac.Status.Current != nil {
 		certNotAfter.WithLabelValues(ns, n).Set(float64(ac.Status.Current.NotAfter.Unix()))
 	}

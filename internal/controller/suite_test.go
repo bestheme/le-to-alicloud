@@ -43,6 +43,8 @@ import (
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/fc3"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -153,6 +155,25 @@ var _ = BeforeSuite(func() {
 	}
 	reconciler.SetIssuerDefaults(IssuerDefaults{Name: "letsencrypt-prod", Kind: "ClusterIssuer"})
 	Expect(reconciler.SetupWithManager(k8sManager)).To(Succeed())
+
+	resetFC3()
+	bindingReconciler = &AliyunCertificateBindingReconciler{
+		Client:    k8sManager.GetClient(),
+		APIReader: k8sManager.GetAPIReader(),
+		Scheme:    k8sManager.GetScheme(),
+		Recorder:  k8sManager.GetEventRecorderFor("aliyuncertificatebinding"),
+		ProviderFactory: func(context.Context, *certsv1alpha1.AliyunCertificateBinding,
+			*certsv1alpha1.AliyunCertificate) (provider.Provider, provider.Client, error) {
+			if err := currentFC3FactoryErr(); err != nil {
+				return nil, nil, err
+			}
+			return &fc3.Provider{}, currentFC3(), nil
+		},
+		DriftCheckInterval:   time.Hour,
+		CleanupGracePeriod:   15 * time.Minute,
+		CleanupFailurePolicy: CleanupPolicyAbandon,
+	}
+	Expect(bindingReconciler.SetupWithManager(k8sManager)).To(Succeed())
 
 	go func() {
 		defer GinkgoRecover()

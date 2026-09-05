@@ -40,3 +40,20 @@ func TestParseOperatorFlags_RejectsBadPolicy(t *testing.T) {
 		t.Fatal("非法 policy 应报错")
 	}
 }
+
+func TestParseOperatorFlags_DriftCheckInterval(t *testing.T) {
+	o, err := parseOperatorFlags([]string{"--drift-check-interval=15m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.DriftCheckInterval != 15*time.Minute {
+		t.Errorf("drift-check-interval 未生效: %v", o.DriftCheckInterval)
+	}
+	d, err := parseOperatorFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DriftCheckInterval != time.Hour {
+		t.Errorf("默认应为 1h: %v", d.DriftCheckInterval)
+	}
+}

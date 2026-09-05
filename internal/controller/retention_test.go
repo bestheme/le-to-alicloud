@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -123,18 +124,6 @@ var _ = Describe("证书 controller：回收时序", func() {
 		ExpectWithOffset(1, k8sClient.Status().Update(ctx, b)).To(Succeed())
 	}
 
-	// bumpBindingSpec 改一个可变的 spec 字段，把 metadata.generation 顶到下一位而不动 status，
-	// 制造出「Binding 还没 reconcile 完当前 spec」的状态。spec.target 带 CEL 不可变校验，
-	// 动它会被 apiserver 拒绝，所以改 deletionPolicy。
-	bumpBindingSpec := func(ns, name string) {
-		b := &certsv1alpha1.AliyunCertificateBinding{}
-		ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, b)).To(Succeed())
-		before := b.Generation
-		b.Spec.DeletionPolicy = certsv1alpha1.DeletionPolicyUnbind
-		ExpectWithOffset(1, k8sClient.Update(ctx, b)).To(Succeed())
-		ExpectWithOffset(1, b.Generation).To(BeNumerically(">", before))
-	}
-
 	hasEvent := func(ns, name, reason string) bool {
 		list := &corev1.EventList{}
 		if err := k8sClient.List(ctx, list, client.InNamespace(ns)); err != nil {
@@ -180,7 +169,9 @@ var _ = Describe("证书 controller：回收时序", func() {
 				Spec: certsv1alpha1.AliyunCertificateBindingSpec{
 					CertificateRef: certsv1alpha1.LocalObjectReference{Name: "apirot"},
 					Target: certsv1alpha1.BindingTarget{Type: certsv1alpha1.TargetTypeFC3CustomDomain,
-						FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{Region: "cn-hangzhou", DomainName: bn + ".example.com"}},
+						// 域名带 namespace：TargetKey() 不含 namespace，撞名会被同目标仲裁判成 Conflict。
+						FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{
+							Region: "cn-hangzhou", DomainName: fmt.Sprintf("%s.%s.example.com", bn, ns)}},
 				},
 			})).To(Succeed())
 		}
@@ -211,17 +202,14 @@ var _ = Describe("证书 controller：回收时序", func() {
 		touch(ns, "apirot", "2")
 		Consistently(func() bool { return currentCAS().Has(*gen1.CertID) }, "1500ms", "200ms").Should(BeTrue())
 
-		// 护栏 2：b1 的 spec 前进一代而 status 没跟上，它报出来的 appliedFingerprint 就
-		// 不可信 —— 哪怕 b2 已经推进，也不许删。顺序要紧：先让 b1 落后再推进 b2，
-		// 反过来做中间会闪过一个三重护栏全通的瞬间。
-		bumpBindingSpec(ns, "b1")
+		// b2 也推进：三重护栏全过，gen1 已 30 天前上传 → 删
+		//
+		// 护栏 2（observedGeneration 落后 ⇒ appliedFingerprint 不可信）在这里已经无法用
+		// envtest 复现：suite 里跑着真正的绑定 reconciler，把 generation 顶上去之后它会在
+		// 毫秒级把 observedGeneration 追平，「还没 reconcile 完」是个抓不住的瞬时窗口。
+		// 该护栏由纯函数用例 TestReclaimable 的 binding(2, 1, "new") 确定性覆盖。
 		setBindingStatus(ns, "b2", gen2.Fingerprint)
 		touch(ns, "apirot", "3")
-		Consistently(func() bool { return currentCAS().Has(*gen1.CertID) }, "1500ms", "200ms").Should(BeTrue())
-
-		// b1 的 status 追平 generation：三重护栏全过，gen1 已 30 天前上传 → 删
-		setBindingStatus(ns, "b1", gen2.Fingerprint)
-		touch(ns, "apirot", "4")
 		eventually(func() bool { return !currentCAS().Has(*gen1.CertID) })
 		eventually(func() bool { return len(getAC(ctx, ns, "apirot").Status.History) == 0 })
 
@@ -232,12 +220,12 @@ var _ = Describe("证书 controller：回收时序", func() {
 		gen3 := *getAC(ctx, ns, "apirot").Status.Current
 		setBindingStatus(ns, "b1", gen3.Fingerprint)
 		setBindingStatus(ns, "b2", gen3.Fingerprint)
-		touch(ns, "apirot", "5")
+		touch(ns, "apirot", "4")
 		Consistently(func() bool { return currentCAS().Has(*gen2.CertID) }, "1500ms", "200ms").Should(BeTrue())
 
 		// 时钟越过 minAge → 删
 		advance(25 * time.Hour)
-		touch(ns, "apirot", "6")
+		touch(ns, "apirot", "5")
 		eventually(func() bool { return !currentCAS().Has(*gen2.CertID) })
 	})
 

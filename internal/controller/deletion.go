@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -93,7 +94,10 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	// 之前上传的证书仍需回收）
 	if err := r.cleanupCAS(ctx, ac); err != nil {
 		elapsed := r.now().Sub(ac.Status.CleanupStartedAt.Time)
-		if r.CleanupFailurePolicy == CleanupPolicyBlock || elapsed < r.CleanupGracePeriod {
+		// 与绑定侧共用同一个纯函数（binding_deletion.go）。「还要不要继续重试清理」是
+		// 有界清理的核心判断——它决定一个对象会不会被永远钉在 Terminating 上——两份
+		// 逐字相同的内联表达式迟早会分叉，而只有一份有 TestShouldAbandonCleanup 盯着。
+		if !shouldAbandonCleanup(r.CleanupFailurePolicy, elapsed, r.CleanupGracePeriod) {
 			// 清理失败与上传失败是两码事：这条 reason 会出现在一个正在删除的对象上，
 			// 沿用 UploadFailed 会让人以为签发链路出了问题。
 			setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonCleanupFailed, "CAS 清理失败，重试中: "+err.Error())
@@ -144,8 +148,13 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	}
 
 	// e. 摘 finalizer
+	//
+	// NotFound 必须吸收掉，理由与 finishBindingDeletion 逐字相同：删除分支读的是 informer
+	// cache，对象被真正删除之后缓存里那份带 finalizer 的旧版本还会再唤起一轮，这一轮的
+	// Update 打在已经不存在的对象上。抛上去等于每一次删除都推高一次
+	// controller_runtime_reconcile_errors_total——运维正是拿它配告警的。
 	controllerutil.RemoveFinalizer(ac, certsv1alpha1.FinalizerName)
-	if err := r.Update(ctx, ac); err != nil {
+	if err := client.IgnoreNotFound(r.Update(ctx, ac)); err != nil {
 		return ctrl.Result{}, err
 	}
 	// 对象没了，它的 gauge 也必须跟着消失：留下来的那条 Ready=0 会一直告警下去。
