@@ -12,8 +12,8 @@ import (
 //
 // spec §12.3 #14：已实测（2026-09-05，RESULTS.md #14）——真实错误码即 `DomainNameNotFound`、
 // HTTP 404，`aliyun.classifyCode` 据此归为 `ClassNotFound`，`CodeTargetNotFound` 分支按预期
-// 走得到。这个哨兵不再是猜的，与云侧一致。对照名（非法格式的域名）返回同一个码，说明该码
-// 与域名格式无关。实测结论见 test/integration/RESULTS.md
+// 走得到。这个哨兵不再是猜的，与云侧一致。对照名（`.invalid` 保留顶级域，不可能是真实域名）
+// 返回同一个码，说明该码不依赖域名是否形如可注册域名。实测结论见 test/integration/RESULTS.md
 //
 // Get 与 Update 共用这一个哨兵值：下游测试既可以 errors.Is 也可以直接比较指针。
 // 代价是 Update 路径上报的 Op 也写着 GetCustomDomain——分类与哨兵身份都对，只有这个
