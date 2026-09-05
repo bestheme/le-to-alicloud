@@ -10,10 +10,10 @@ import (
 
 // ErrDomainNotFound 模拟 FC3 对不存在域名的 404。
 //
-// spec §12.3：未实测（FC3 对不存在的自定义域名返回的真实错误码与 HTTP 状态码未核实，
-// 这里的 `DomainNameNotFound` 是猜的；若真实码既不含 `NotFound` 也不是 404，
-// `aliyun.classifyCode` 会把它归成 `ClassPermanent`，`CodeTargetNotFound` 分支就永远走不到），
-// 实测结论见 test/integration/RESULTS.md
+// spec §12.3 #14：已实测（2026-09-05，RESULTS.md #14）——真实错误码即 `DomainNameNotFound`、
+// HTTP 404，`aliyun.classifyCode` 据此归为 `ClassNotFound`，`CodeTargetNotFound` 分支按预期
+// 走得到。这个哨兵不再是猜的，与云侧一致。对照名（非法格式的域名）返回同一个码，说明该码
+// 与域名格式无关。实测结论见 test/integration/RESULTS.md
 //
 // Get 与 Update 共用这一个哨兵值：下游测试既可以 errors.Is 也可以直接比较指针。
 // 代价是 Update 路径上报的 Op 也写着 GetCustomDomain——分类与哨兵身份都对，只有这个

@@ -30,8 +30,10 @@ import (
 // 分类完全交给 aliyun.classifyCode，不在这里按错误码字面量做推测式兜底：
 // 「Code 含 DomainName 且 Permanent 就当 TargetNotFound」之类的规则会把
 // InvalidDomainName 这种真·永久错误误判成「域名还没建」，然后每 5 分钟空转一次。
-// 若后续的集成测试发现「不存在的自定义域名」得到的 aliyun.ClassOf(err) != ClassNotFound，
-// 那时回去修 aliyun.classifyCode（错误码归类的唯一落点），而不是在本文件加分支。
+// 集成测试已量出真实错误码（spec §12.3 #14，2026-09-05；RESULTS.md #14）：
+// DomainNameNotFound / HTTP 404，aliyun.ClassOf 归为 ClassNotFound，下面的 TargetNotFound
+// 分支按预期走得到，classifyCode 无需修改。将来若又有 FC3 错误码该归 NotFound 而没被认出，
+// 仍是回去修 aliyun.classifyCode（错误码归类的唯一落点），而不是在本文件加分支。
 func toProviderError(op string, err error, failReason string) error {
 	if err == nil {
 		return nil

@@ -84,7 +84,8 @@
 
 见 §12.3。**截至 2026-09-05 的进度**：CAS 侧的 #1 / #3 / #4 / #5 / #9 / #12 / #13 已核实（依据 `test/integration/RESULTS.md`），
 cert-manager 侧的 #6 / #7 / #11 也已核实（同一依据；这三项实测于 2026-09-05，cert-manager v1.20.3，SelfSigned Issuer），
-#8 **部分核实**（实测到的只有「当前账号空 `Keyword` 列举返回 0 张」这个计数；列举语义是据 SDK 枚举推导、非实测，配额上限也未测）；余下 FC3 侧的 #2 / #10 / #14
+FC3 侧的 #14 也已核实（同一依据；实测于 2026-09-05，错误码 `DomainNameNotFound`、HTTP 404），
+#8 **部分核实**（实测到的只有「当前账号空 `Keyword` 列举返回 0 张」这个计数；列举语义是据 SDK 枚举推导、非实测，配额上限也未测）；余下 FC3 侧的 #2 / #10
 （以及 #1 / #5 的 FC3 那一半）**仍未核实**，原因逐条写在 §12.3 对应行——**不要把它们当成已核实**。
 两处例外要单独说明：#1 / #5 的 FC3 一半在 §12.3 只写了「FC3 侧未测」没写原因，原因是
 **未设置 `FC3_TEST_DOMAIN`**（`RESULTS.md` #1 的 FC3 行；本项要真的改写一个 FC3 自定义域名的
@@ -836,9 +837,9 @@ type FC3Client interface {
 | 11 | ~~cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在~~ **已核实**：`certificate-name` / `issuer-name` / `issuer-kind` / `issuer-group` **四个注解全部存在**（实测于 2026-09-05，cert-manager v1.20.3，SelfSigned Issuer，见 `RESULTS.md` #11） | `SecretNameConflict` 判定依据。四个注解齐全，可作为判定依据 |
 | 12 | ~~CAS `Keyword` 对通配符域名（`*.example.com`）的匹配行为~~ **已核实**：`Keyword` 对证书域名字符串做**任意子串匹配**，且**不做 DNS 通配符展开**。SAN 为 `*.it.integration.invalid` 的证书，用 `*.it.integration.invalid`、`it.integration.invalid`、`integration`、甚至非标签边界的 `ntegratio` 都能查到，而通配符本应覆盖的 `probe.it.integration.invalid` **查不到**。这同时排除了 DNS 通配符语义、后缀匹配、前缀匹配、按标签对齐的包含四种候选规则 | 通配符证书的首个 SAN 会被原样当 Keyword 传给 `ListUserCertificateOrder`；匹配不到就会让存在性探测持续误判「证书丢了」并反复重传。结论是安全的：原样传 SAN 一定能命中自己 |
 | 13 | ~~CAS 同名不同 `ClientToken` 上传返回的真实错误码~~ **已核实**：`NameRepeat`（Permanent）。**不在**生产代码原先猜的三个候选码里，已追加进 `internal/controller/upload.go` 的 `isDuplicateName` | 认错则 `DuplicateName → findByName` 的认领路径失效，write-ahead 崩溃恢复会退化成反复失败的上传 |
-| 14 | FC3 `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态。**仍未核实**：探针已写好并带四重守卫；实测那一轮凭证子账号只有 CAS 权限，`GetCustomDomain` 返回 `AccessDenied`（`class=Auth`，HTTP 403；`RESULTS.md` #14），守卫二据此判为「鉴权失败而非域名不存在」并记成未实测，因此 `pkg/aliyun/errors.go` 的 `classifyCode` **未做任何条件性修改**。给子账号授予 `fc:GetCustomDomain`（资源可用 `custom-domains/*`）后重跑本用例即可落结论 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。认不出时需补 `pkg/aliyun/errors.go` 的 `classifyCode` |
+| 14 | ~~FC3 `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态~~ **已核实**：错误码 `DomainNameNotFound`、HTTP **404**（实测于 2026-09-05（UTC，`RESULTS.md` 生成时间见文件头），见 `RESULTS.md` #14）。`aliyun.ClassOf` 据此把它归为 `ClassNotFound`，因此 `pkg/aliyun/errors.go` 的 `classifyCode` **无需修改**，绑定 controller 的「域名不存在 → 5m 定时重试」分支按预期工作。对照名（非法格式的 `it-absent-c7a962243765.integration.invalid`）返回**同一个码**，说明该码与域名格式无关 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。已核实认得出：`classifyCode` 现有的 `Contains(code, "NotFound")` 与 `status == 404` 两条规则都命中，不必为 FC3 追加任何条件性分支 |
 
-**上表唯一没有 `RESULTS.md` 行的是 #5 的 FC3 一半**：FC3 的链形状用例与私钥编码用例同在 `TestFC3CertConfigEncodings` 里，而缺 `FC3_TEST_DOMAIN` 时的 `requireFC3Domain` 把跳过记在了 **`#1`** 名下（`test/integration/fc3_test.go`），于是 `RESULTS.md` 里一行 `#5` 的 FC3 记录都没有。其余各行——包括 #2 / #10 / #14 与 #1 的 FC3 一半——的「仍未核实」与其原因都能在 `RESULTS.md` 里逐行找到。
+**上表唯一没有 `RESULTS.md` 行的是 #5 的 FC3 一半**：FC3 的链形状用例与私钥编码用例同在 `TestFC3CertConfigEncodings` 里，而缺 `FC3_TEST_DOMAIN` 时的 `requireFC3Domain` 把跳过记在了 **`#1`** 名下（`test/integration/fc3_test.go`），于是 `RESULTS.md` 里一行 `#5` 的 FC3 记录都没有。其余各行——包括 #2 / #10 与 #1 的 FC3 一半——的「仍未核实」与其原因都能在 `RESULTS.md` 里逐行找到；#14 已在 2026-09-05 那轮落了结论，同样逐行可查。
 
 **FC3 侧的三项探测分别归到哪一行**（刻意不新开编号——同一个问题两个编号会让 `RESULTS.md` 的回填对不上）：`GetCustomDomain` 对不存在域名的错误码归 **#14**（新增）；限流错误码是否以 `Throttling` 开头归 **#10**（既有行，措辞已补全）；`CertConfig` 对 PKCS#1 / EC 私钥的接受情况归 **#1**、对 LE 链形状（leaf+intermediate、仅 leaf）的接受情况归 **#5**（两行本来就写的是「FC3 与 CAS 各自 / 都」，只是至今只测了 CAS 一侧）。
 
