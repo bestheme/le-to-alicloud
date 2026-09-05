@@ -65,6 +65,9 @@ func ParseBundle(certPEM, keyPEM []byte) (*Bundle, error) {
 	return b, nil
 }
 
+// pemTypeCertificate 是证书 PEM 块的类型标识。
+const pemTypeCertificate = "CERTIFICATE"
+
 func parseCertificates(certPEM []byte) ([]*x509.Certificate, error) {
 	var out []*x509.Certificate
 	rest := certPEM
@@ -74,7 +77,7 @@ func parseCertificates(certPEM []byte) ([]*x509.Certificate, error) {
 		if blk == nil {
 			break
 		}
-		if blk.Type != "CERTIFICATE" {
+		if blk.Type != pemTypeCertificate {
 			continue // 忽略 bundle 里夹带的其它块
 		}
 		c, err := x509.ParseCertificate(blk.Bytes)
@@ -203,9 +206,9 @@ func (b *Bundle) DNSNames() []string {
 // CertPEM 由 DER 重新编码：leaf 在前、中间证书紧随、无空行、64 字符/行。
 func (b *Bundle) CertPEM() []byte {
 	var buf bytes.Buffer
-	buf.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b.Leaf.Raw}))
+	buf.Write(pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: b.Leaf.Raw}))
 	for _, c := range b.Intermediates {
-		buf.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw}))
+		buf.Write(pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: c.Raw}))
 	}
 	return buf.Bytes()
 }

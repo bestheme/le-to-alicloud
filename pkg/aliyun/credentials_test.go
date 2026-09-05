@@ -59,7 +59,9 @@ func TestCredentialsFromSecret_MissingSecretKey(t *testing.T) {
 
 func TestCredentialsFromSecret_OIDC(t *testing.T) {
 	c, err := aliyun.CredentialsFromSecret(secretWith(map[string]string{
-		aliyun.KeyRoleARN: "acs:ram::123:role/x", aliyun.KeyOIDCProviderARN: "acs:ram::123:oidc-provider/y", aliyun.KeyOIDCTokenFilePath: "/var/run/token",
+		aliyun.KeyRoleARN:           "acs:ram::123:role/x",
+		aliyun.KeyOIDCProviderARN:   "acs:ram::123:oidc-provider/y",
+		aliyun.KeyOIDCTokenFilePath: "/var/run/token",
 	}))
 	if err != nil {
 		t.Fatal(err)

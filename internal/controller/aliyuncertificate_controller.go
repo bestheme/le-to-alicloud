@@ -133,7 +133,8 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if err := r.Update(ctx, ac); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		// Update 会触发本对象的 watch 事件，不需要显式 requeue。
+		return ctrl.Result{}, nil
 	}
 
 	ac.Status.ObservedGeneration = ac.Generation

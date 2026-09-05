@@ -54,13 +54,15 @@ func TestShouldFetchNextPage_IgnoresTotalCount(t *testing.T) {
 func TestCallCode(t *testing.T) {
 	const leaky = "response body must not become a label"
 	code, status := "Throttling.User", 400
+	// 提到表外只为让表格行不超过 lll 的 120 字符上限。
+	sdkErr := Classify("Upload", &dara.SDKError{Code: &code, StatusCode: &status, Message: dara.String(leaky)})
 	tests := []struct {
 		name string
 		err  error
 		want string
 	}{
 		{"成功", nil, "OK"},
-		{"服务端错误码", Classify("Upload", &dara.SDKError{Code: &code, StatusCode: &status, Message: dara.String(leaky)}), "Throttling.User"},
+		{"服务端错误码", sdkErr, "Throttling.User"},
 		{"网络超时", Classify("Upload", &net.OpError{Op: "dial", Err: syscall.ETIMEDOUT}), "NetTimeout"},
 		{"连接被拒", Classify("Upload", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}), "NetError"},
 		{"未分类错误", Classify("Upload", errors.New(leaky)), "Unknown"},

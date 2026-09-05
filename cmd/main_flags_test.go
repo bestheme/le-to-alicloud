@@ -28,8 +28,9 @@ func TestParseOperatorFlags_Values(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.DefaultIssuerName != "letsencrypt-prod" || o.DefaultIssuerKind != "ClusterIssuer" || o.CleanupFailurePolicy != "Block" ||
-		o.CloudCallTimeout != 10*time.Second || len(o.WatchNamespaces) != 2 {
+	if o.DefaultIssuerName != "letsencrypt-prod" || o.DefaultIssuerKind != "ClusterIssuer" ||
+		o.CleanupFailurePolicy != "Block" || o.CloudCallTimeout != 10*time.Second ||
+		len(o.WatchNamespaces) != 2 {
 		t.Errorf("解析不符: %+v", o)
 	}
 }

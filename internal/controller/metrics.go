@@ -36,21 +36,25 @@ const (
 	resultError     = "error"
 )
 
+// crLabels 是「一个 CR 一条 series」的 label 集合。抽成变量不只是去重：它保证五个
+// 指标的 label 顺序永远一致，recordCertMetrics 里 WithLabelValues(ns, n) 才是对的。
+var crLabels = []string{"namespace", "name"}
+
 // label 集合刻意很小：绝不把 fingerprint / certId 放进 label（每次轮换都会新增永不消失的 series）。
 var (
 	certNotAfter = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "aliyuncert_certificate_not_after_timestamp_seconds",
 		Help: "Unix time when the current certificate expires",
-	}, []string{"namespace", "name"})
+	}, crLabels)
 	certReadyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "aliyuncert_certificate_ready", Help: "1 if Ready condition is True",
-	}, []string{"namespace", "name"})
+	}, crLabels)
 	certIssuanceStalled = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "aliyuncert_certificate_issuance_stalled", Help: "1 if cert-manager issuance is stalled",
-	}, []string{"namespace", "name"})
+	}, crLabels)
 	issuerDefaultDiverged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "aliyuncert_issuer_default_diverged", Help: "1 if pinned issuer differs from current --default-issuer-*",
-	}, []string{"namespace", "name"})
+	}, crLabels)
 	casUploadTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_cas_upload_total", Help: "CAS upload attempts by result",
 	}, []string{"result"})
@@ -60,7 +64,7 @@ var (
 	certManagerCertRecreatedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_certmanager_certificate_recreated_total",
 		Help: "Times the cert-manager Certificate was (re)created after first creation; should stay 0",
-	}, []string{"namespace", "name"})
+	}, crLabels)
 	cleanupAbandonedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_cleanup_abandoned_total",
 		Help: "Number of AliyunCertificate deletions that abandoned CAS cleanup",
