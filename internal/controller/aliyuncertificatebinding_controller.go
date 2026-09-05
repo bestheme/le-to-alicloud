@@ -236,19 +236,15 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 		// 顺手把 appliedFingerprint 与 boundAccountId 补记上——首次接管一个已经装好
 		// 同一张证书的域名时，这两项本来是空的。
 		//
-		// 这是本任务里唯一一处写 appliedFingerprint，而它并不违反「早退路径绝不写
-		// appliedFingerprint」：那条规矩防的是 Conflict / CertificateNotFound / 凭证
-		// 这类**失败与旁路**早退——它们没有核实过云上装的是哪一张证书，写下去会让证书
-		// controller 的保留护栏 3（appliedFingerprint == 该代 ⇒ 不回收）拿一个凭空的
-		// 指纹去比对。这里恰好相反：Observe 刚刚核实了云上装的就是 m.Fingerprint，
-		// 这是一次成功（且无需写云）的 apply。不记下来，护栏 3 反而保护不到这个
-		// Binding 真正在服役的那一代。
-		b.Status.AppliedFingerprint = m.Fingerprint
-		if b.Status.BoundAccountID == "" && obs.AccountID != "" {
-			b.Status.BoundAccountID = obs.AccountID
-		}
-		rd.lag = 0
-		r.setApplied(ctx, rd)
+		// 这里写 appliedFingerprint 并不违反「早退路径绝不写 appliedFingerprint」：
+		// 那条规矩防的是 Conflict / CertificateNotFound / 凭证这类**失败与旁路**早退
+		// ——它们没有核实过云上装的是哪一张证书，写下去会让证书 controller 的保留护栏 3
+		// （appliedFingerprint == 该代 ⇒ 不回收）拿一个凭空的指纹去比对。这里恰好相反：
+		// Observe 刚刚核实了云上装的就是 m.Fingerprint，这是一次成功（且无需写云）的
+		// apply。不记下来，护栏 3 反而保护不到这个 Binding 真正在服役的那一代。
+		//
+		// wrote=false：这一轮一个字节都没写云，lastAppliedTime 不该动。
+		r.freezeApplied(ctx, rd, obs, m, false)
 		aggregateBindingReady(b)
 		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 	}
@@ -265,23 +261,8 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 		return r.handleApplyError(ctx, rd, aerr)
 	}
 
-	// 7. 固化状态
-	now := r.now()
-	b.Status.AppliedFingerprint = m.Fingerprint
-	b.Status.LastAppliedTime = &metav1.Time{Time: now}
-	if b.Status.BoundAccountID == "" && obs.AccountID != "" {
-		// 首次成功写入才固化账号：写成功证明这个账号确实是我们该写的那个。
-		//
-		// obs.AccountID != "" 这道守卫与短路分支的那一道是同一条不变量：boundAccountId
-		// 只许从**非空**观测里记下来。fenceAccount 是失败关闭的（非空 bound 撞上空观测
-		// 一样拦下），它敢这么做的全部依据就是「bound 非空 ⇒ provider 至少报出过一次
-		// 真实账号」。这里记下一个空账号，闸门就再也打不开了——不过 bound 为空时
-		// fenceAccount 本来就放行，所以写空值只是白占一个字段；真正的代价在于它会把
-		// 那条不变量变成假的，让 fail-closed 的推理失去依据。
-		b.Status.BoundAccountID = obs.AccountID
-	}
-	rd.lag = 0
-	r.setApplied(ctx, rd)
+	// 7. 固化状态（wrote=true：这一轮真的写了云，lastAppliedTime 该跟着走）
+	r.freezeApplied(ctx, rd, obs, m, true)
 
 	// 8. Ready = Applied && !Conflict
 	aggregateBindingReady(b)

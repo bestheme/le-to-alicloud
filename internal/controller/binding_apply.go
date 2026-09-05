@@ -86,7 +86,15 @@ func (r *AliyunCertificateBindingReconciler) handleApplyError(
 		reason = pe.Reason
 	}
 	// 错误原文只进日志：事件是广播给用户的对象，云错误里可能夹带 request id。
-	// （ProviderError.Error() 本身也只回显有界的 Code/Retryable/Reason，不含 SDK 响应体。）
+	//
+	// 这行日志的「零凭证泄漏」保证**建立在 provider 契约上**，不是这里自证的：
+	// provider.Provider 的注释要求三个方法返回的 error 一律是经过分类的 *ProviderError，
+	// 而 ProviderError.Error() 只回显有界的 Code/Retryable/Reason，被包住的 SDK 错误进
+	// Unwrap 链、不进消息。上面 pe == nil 的兜底分支因此是**契约被违反**时才走得到的：
+	// 今天 fc3.Provider.Apply 的每一条返回路径都过 provider.Errorf / toProviderError，
+	// 所以到不了；但将来某个 provider 直接返回原始 SDK 错误的话，这一行渲染的就是它
+	// 自己的文本——那时该修的是那个 provider，不是在这里做截断。
+
 	log.Error(err, "写入目标失败", "domain", targetIdentifier(rd.b))
 	// 事件先于 setBindingCondition 发：eventOnReasonChange 比的是 rd.orig 上一轮的
 	// reason，而 rd.b 马上就要被改成本轮的 reason（spec §10.2「只在状态跃迁时发」——
@@ -111,6 +119,38 @@ func (r *AliyunCertificateBindingReconciler) handleApplyError(
 	default:
 		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, nil
 	}
+}
+
+// freezeApplied 固化「证书已经在目标上生效」这一结论（spec §6.2 步骤 7）。
+//
+// 两条成功路径共用它：幂等短路（Observe 核实了云上装的就是这一张，本轮没写云）与真的
+// 写完一次。唯一的差别由 wrote 表达——lastAppliedTime 的含义是「上一次**真的写成功**
+// 是什么时候」，短路一个字节都没写，就不该动它。
+//
+// 合并这两段不是为了省几行：它里面带着账号 fencing 的 fail-closed 不变量
+// （boundAccountId 只许从**非空**观测里记下来）。留成两份独立副本，以后有人只改其中
+// 一份——把观测到的账号做一次归一化、或者放宽这道守卫——另一份会静静地跟着分叉，而
+// 两条路径里只有一条有测试会发现。安全属性不该同时存在两个可编辑的副本。
+//
+// obs.AccountID != "" 这道守卫正是 fenceAccount 敢失败关闭的全部依据：bound 非空就
+// 证明 provider 至少为这个目标报出过一次真实账号，此后再读到空值是异常而非常态。
+// 从空观测里记一次，这条推理就变成假的了——bound 为空时 fenceAccount 本来就放行，
+// 所以写空值不会立刻出事，代价全在「以后闸门凭什么敢关」上。
+func (r *AliyunCertificateBindingReconciler) freezeApplied(
+	ctx context.Context, rd *bindingRound, obs provider.ObservedState, m provider.CertMaterial, wrote bool,
+) {
+	b := rd.b
+	b.Status.AppliedFingerprint = m.Fingerprint
+	if wrote {
+		b.Status.LastAppliedTime = &metav1.Time{Time: r.now()}
+	}
+	if b.Status.BoundAccountID == "" && obs.AccountID != "" {
+		// 首次成功（含短路认下的那一次）才固化账号：走到这里就证明这个账号确实是我们
+		// 该写的那个。
+		b.Status.BoundAccountID = obs.AccountID
+	}
+	rd.lag = 0
+	r.setApplied(ctx, rd)
 }
 
 // setApplied 置 Applied=True，并只在状态跃迁时发一次 Normal 事件。

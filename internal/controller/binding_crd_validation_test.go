@@ -68,10 +68,21 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 	})
 
 	It("target 不可变", func() {
-		b := newBinding("immutable")
-		Expect(k8sClient.Create(ctx, b)).To(Succeed())
-		b.Spec.Target.FC3CustomDomain.DomainName = fmt.Sprintf("other.%s.example.com", ns)
-		Expect(k8sClient.Update(ctx, b)).To(MatchError(ContainSubstring(
+		Expect(k8sClient.Create(ctx, newBinding("immutable"))).To(Succeed())
+		// 不能拿创建时那一份直接改：Binding reconciler 一唤醒就会给新对象补 finalizer，
+		// 那次 Update 推进 resourceVersion，于是这里的写入撞上 409 Conflict 而不是 CEL 的
+		// 不可变错误，用例随机翻车（实测约 1/9）。重读一份也不够——重读与 Update 之间
+		// 同样能插进 finalizer 那一次写——所以整段放进 Eventually：冲突就重来，咬定
+		// 「最终报出来的是不可变」。放宽的只有时机，断言的内容一个字没动：真让 target
+		// 可改了，Update 会成功、返回 nil，匹配照样失败。
+		Eventually(func() error {
+			got := &certsv1alpha1.AliyunCertificateBinding{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "immutable", Namespace: ns}, got); err != nil {
+				return err
+			}
+			got.Spec.Target.FC3CustomDomain.DomainName = fmt.Sprintf("other.%s.example.com", ns)
+			return k8sClient.Update(ctx, got)
+		}, "10s", "100ms").Should(MatchError(ContainSubstring(
 			"spec.target: Invalid value: target 不可变，请新建 Binding")))
 	})
 

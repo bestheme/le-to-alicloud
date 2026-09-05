@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -30,7 +32,18 @@ import (
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki/testutil"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
 )
+
+// applyTotal 读 aliyuncert_binding_apply_total 上某个 result label 的当前值。
+//
+// 只做单调断言（`> before`）而不是精确等于 before+1：envtest 从不回收 namespace，别的
+// 用例的 Binding 还活着，理论上可以在窗口里也记一笔。单调断言在这种噪声下仍然只在
+// 「这一档根本没涨」时失败——而那正是要抓的 bug。
+func applyTotal(result string) float64 {
+	return promtestutil.ToFloat64(
+		bindingApplyTotal.WithLabelValues(certsv1alpha1.TargetTypeFC3CustomDomain, result))
+}
 
 var _ = Describe("绑定 controller：Apply", func() {
 	ctx := context.Background()
@@ -128,6 +141,9 @@ var _ = Describe("绑定 controller：Apply", func() {
 			})
 		}
 
+		throttledBefore := applyTotal(resultThrottled)
+		successBefore := applyTotal(resultSuccess)
+
 		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
 		createBinding(ctx, ns, "b1", "c1", domain, nil)
@@ -136,10 +152,14 @@ var _ = Describe("绑定 controller：Apply", func() {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied)
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonThrottled
 		})
+		// 限流必须落在自己那一档 label 上，而不是和真正的失败混进 error：
+		// 告警要靠这一档区分「该等」与「该找人」。
+		eventually(func() bool { return applyTotal(resultThrottled) > throttledBefore })
 		// 队列排空之后应自愈——限流不需要人介入。
 		eventually(func() bool {
 			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
 		})
+		Expect(applyTotal(resultSuccess)).To(BeNumerically(">", successBefore))
 	})
 
 	// 上一个用例只排了一个错误，自愈得太快，测不到「持续失败」这一侧的两条不变量：
@@ -228,3 +248,38 @@ var _ = Describe("绑定 controller：Apply", func() {
 		})
 	})
 })
+
+// bindingApplyResult 的三档映射在 envtest 里只覆盖得到 success 与 throttled（真云错误的
+// 其余分类没法从 fake 稳定构造成一次 Apply 失败）。而这个函数的**全部**职责就是这张
+// 映射表——判错的代价是告警分不清「该等」与「该找人」，所以在这里逐档钉死。
+//
+// 特别是最后两条：生产里 provider 返回的从来不是裸的 *ProviderError，而是
+// toProviderError 用 fmt.Errorf("%s[%s]: %w", …) 包过一层的。errors.As 必须穿透这层包装，
+// 否则限流会被记成 error，而 envtest 那条断言只覆盖了包装后的形状之一。
+func TestBindingApplyResult(t *testing.T) {
+	wrap := func(pe error) error { return fmt.Errorf("UpdateCustomDomain[Throttling.User]: %w", pe) }
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"成功", nil, resultSuccess},
+		{"限流单独成一档", provider.Errorf(provider.CodeThrottled, true, "", nil), resultThrottled},
+		{"瞬时故障算 error", provider.Errorf(provider.CodeRetryable, true, "", nil), resultError},
+		{"永久错误算 error", provider.Errorf(provider.CodePermanent, false, "", nil), resultError},
+		{"凭证错误算 error", provider.Errorf(provider.CodeAuth, false, "", nil), resultError},
+		{"目标不存在算 error", provider.Errorf(provider.CodeTargetNotFound, false, "", nil), resultError},
+		// 没有分类结论时只能算 error：宁可让告警多叫一次，也不能把一个说不清的失败
+		// 记成 success。
+		{"不是 ProviderError 就算 error", errors.New("裸错误"), resultError},
+		{"包装过的限流仍是 throttled", wrap(provider.Errorf(provider.CodeThrottled, true, "", nil)), resultThrottled},
+		{"包装过的永久错误仍是 error", wrap(provider.Errorf(provider.CodePermanent, false, "", nil)), resultError},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := bindingApplyResult(c.err); got != c.want {
+				t.Errorf("bindingApplyResult(%v) = %q, want %q", c.err, got, c.want)
+			}
+		})
+	}
+}
