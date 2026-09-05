@@ -133,6 +133,27 @@ func TestHarnessScrubRedactsPrivateKey(t *testing.T) {
 		}
 	})
 
+	// 头部截断块：有 END、没有配对的 BEGIN。SDK 通常砍尾，但只回显参数末尾若干字节
+	// 同样会产生这个形状，而 privateKeyBlock 与 redactTruncatedKeys 都要求出现 BEGIN，
+	// 对它一个字符都不会抹——这是 redactHeadTruncatedKeys 存在的全部理由。
+	t.Run("END 无 BEGIN", func(t *testing.T) {
+		lines := strings.Split(strings.TrimSpace(string(ecKey)), "\n")
+		truncated := strings.Join(lines[1:], "\n") // 砍掉 BEGIN 行
+		body := lines[len(lines)-2]
+		const suffix = "（以上是被截断的请求参数）"
+
+		got := scrub(truncated + suffix)
+		if strings.Contains(got, body) {
+			t.Fatal("scrub 没有抹掉头部截断私钥块的正文")
+		}
+		if !strings.Contains(got, redactedKey) {
+			t.Fatal("头部截断的私钥块没有被替换成占位符")
+		}
+		if !strings.HasSuffix(got, suffix) {
+			t.Fatal("截断块之后的正常文本被吞掉了")
+		}
+	})
+
 	// 一段文本里有多个私钥块时，必须逐块替换，而不是从第一个 BEGIN 吞到最后一个 END。
 	two := scrub(string(ecKey) + "中间这段要留下" + string(rsaKey))
 	if !strings.Contains(two, "中间这段要留下") {

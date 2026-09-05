@@ -67,8 +67,11 @@ func RecordSkip(t *testing.T, id, question, why string) {
 var privateKeyBlock = regexp.MustCompile(
 	`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`)
 
-// beginKeyMarker 只匹配一条私钥的 BEGIN 行，用于兜底截断块。
+// beginKeyMarker 只匹配一条私钥的 BEGIN 行，用于兜底尾部被截断的块。
 var beginKeyMarker = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)
+
+// endKeyMarker 只匹配一条私钥的 END 行，用于兜底头部被截断的块。
+var endKeyMarker = regexp.MustCompile(`-----END [A-Z ]*PRIVATE KEY-----`)
 
 // redactedKey 是私钥块被抹掉后留下的占位符。留一个可见的记号而不是删成空白，
 // 是为了让读报告的人知道「这里原本有过一段私钥」，而不是以为证据缺了一块。
@@ -89,6 +92,29 @@ func redactTruncatedKeys(s string) string {
 	return s[:locs[0][0]] + strings.Repeat(redactedKey, len(locs))
 }
 
+// redactHeadTruncatedKeys 是私钥兜底的第三道，与 redactTruncatedKeys 对称：配对块与
+// 「有 BEGIN 无 END」都处理完之后仍然残留的 END，一定是**头部**被截断的块——BEGIN 行
+// 连同它之前的内容被砍掉了，只剩 base64 正文的尾巴与 END 行。前两条规则都要求出现
+// BEGIN，对这种形状一个字符都不抹，正文会原样进到日志与 RESULTS.md。
+//
+// 概率比尾部截断低（SDK 通常砍尾），但 scrub 是「报告绝不含私钥」这条约束唯一的执行点，
+// 唯一的执行点不该留形状上的缺口。
+//
+// 抹的范围是「字符串开头到最后一个孤立 END 为止」的全部内容——每个 END 折成一个占位符。
+// 两个 END 之间的文本也一并抹掉：那段正是上一块的正文，留不得。同样是宁可多抹一段正常
+// 文本，也不让半截私钥漏出去。
+//
+// 调用顺序有依赖：必须排在 redactTruncatedKeys 之后。那一步会把首个 BEGIN 起的全部内容
+// 折成占位符，所以走到这里时字符串里已经不可能有 BEGIN，剩下的 END 只可能是孤儿。
+func redactHeadTruncatedKeys(s string) string {
+	locs := endKeyMarker.FindAllStringIndex(s, -1)
+	if len(locs) == 0 {
+		return s
+	}
+	// 最后一个 END 之后的文本是安全的；它之前的全部内容折成 len(locs) 个占位符。
+	return strings.Repeat(redactedKey, len(locs)) + s[locs[len(locs)-1][1]:]
+}
+
 // scrub 把凭证明文与私钥从报告里抹掉。云 SDK 的错误文本偶尔会回显请求参数，而探针
 // 手里真的握着私钥，这一层是「报告绝不含凭证与私钥」这条约束唯一的执行点。
 //
@@ -101,7 +127,7 @@ func scrub(s string) string {
 		}
 	}
 	s = privateKeyBlock.ReplaceAllLiteralString(s, redactedKey)
-	return redactTruncatedKeys(s)
+	return redactHeadTruncatedKeys(redactTruncatedKeys(s))
 }
 
 // resultsFile 相对 cwd；go test 的 cwd 就是包目录。
