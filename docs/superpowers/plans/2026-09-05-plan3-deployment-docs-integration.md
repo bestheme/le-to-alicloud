@@ -2303,7 +2303,7 @@ patches:
 
 - `resources:` 下的 `- ../rbac` 与 `- ../manager` 两行合并成一行 `- ../operator`（`- ../crd` 保持在最前）。
 - 删掉 `# [METRICS] Expose the controller manager metrics service.` 与 `- metrics_service.yaml` 两行。
-- 删掉 `patches:` 段里 `- path: manager_metrics_patch.yaml` 及其 `target: {kind: Deployment}` 三行和上方的两行 `# [METRICS]` 注释。**`patches:` 键此时已无条目，必须连键一起删掉**——kustomize 不接受一个空的 `patches:` 键（`build` 会直接报错），所以「保留键、清空条目」不是一个可选项。
+- 删掉 `patches:` 段里 `- path: manager_metrics_patch.yaml` 及其 `target: {kind: Deployment}` 三行和上方的两行 `# [METRICS]` 注释。**`patches:` 键此时已无条目，必须连键一起删掉**——理由不是语法：kustomize 其实**接受**一个空的 `patches:` 键（拿本仓库的 `./bin/kustomize` 在一个最小 kustomization 上实测过：只留 `patches:` 键、不给任何条目，`build` 照常 exit 0，输出与整个删掉该键时逐字节相同，不报错）。真正的理由是**归属**：拆分之后 `config/operator` 是 operator 部署件的唯一入口，把一个空键连同下面那些「uncomment 就能用」的指引留在 `config/default`，会把读者引向错误的目录去改 patch。
 
 `patches:` 键下方还留着 `[METRICS-WITH-CERTS]` / `[WEBHOOK]` / `[CERTMANAGER]` 三段被注释掉的 patch 条目，以及「Uncomment the patches line ... 就能用」的指引。删掉键会让这些指引落在一个不存在的键下面。**把这三段注释连同它们的 Uncomment 指引原样搬进 `config/operator/kustomization.yaml` 的 `patches:` 段末尾**（那里的 `patches:` 键是有条目的，指引继续成立）——它们描述的都是给 Deployment 打的 patch，本来就属于 operator 基座，不属于「CRD + operator」的聚合层。搬完之后 `config/default/kustomization.yaml` 里不应再有任何 `patch` 字样。
 
