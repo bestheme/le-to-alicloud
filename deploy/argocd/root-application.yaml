@@ -1,0 +1,49 @@
+# app-of-apps 根应用。它存在的唯一理由：让另外三个 Application 对象上的
+# argocd.argoproj.io/sync-wave 注解真正生效。
+#
+# sync wave 排序的是「**单次 sync 操作内部**的资源」。写在 Application 对象自身上的
+# wave 注解，只有当这些 Application 本身是某个父 Application / ApplicationSet 的资源、
+# 由父应用在一次 sync 里一起下发时才会被读取。如果直接
+# `oc apply -f deploy/argocd/`，三个 Application 会各自独立 automated sync、并发执行，
+# -2 / -1 / 0 全是死字符串——operator 的 Deployment 可能先于 CRD 起来，
+# controller-runtime 在 SetupWithManager 阶段 RESTMapper 找不到
+# certs.bestheme.ac.cn/v1alpha1，进程直接退出并 CrashLoopBackOff，直到 CRD 落地才自愈。
+#
+# 所以推荐的部署方式是只 apply 这一个文件，由它去拉起其余三个：
+#   oc apply -f deploy/argocd/root-application.yaml
+#
+# 不用 app-of-apps 也可以，但必须人工保证顺序：先 apply application-crds.yaml，
+# 等两个 CRD 变成 Established，再 apply 其余的。
+#
+# 注意 source.path 指向 deploy/argocd 这个目录本身，Argo 只会捡其中的 .yaml / .yml /
+# .json；application-credentials.yaml.example 因为后缀是 .example 天然被排除在外，
+# 那份模板不会被误当成真实 Application 下发。使用者把它复制成
+# application-credentials.yaml 并填好占位符之后，才会被本根应用捡起来。
+#
+# 本文件自己也在 deploy/argocd 目录下，所以这个根应用同时管理它自己——这是
+# app-of-apps 的常规形态，不是笔误。
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: le-to-alicloud-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://git.dev.bestheme.ac.cn/infra/le-to-alicloud.git
+    targetRevision: main
+    path: deploy/argocd
+  destination:
+    server: https://kubernetes.default.svc
+    # 子 Application 对象本身住在 argocd namespace。
+    namespace: argocd
+  syncPolicy:
+    automated:
+      # 刻意不开 prune。开了之后，从 deploy/argocd 里挪走一个文件就会让根应用删掉
+      # 对应的子 Application；而删除子 Application 是否级联删除它管的资源，取决于
+      # 那一刻对象上有没有 resources-finalizer——这是个不该为了排序而引入的破坏面。
+      # 要下线某个子 Application，请人工删，并想清楚 --cascade。
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
