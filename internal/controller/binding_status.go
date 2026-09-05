@@ -78,8 +78,6 @@ func setBindingReadyFalse(b *certsv1alpha1.AliyunCertificateBinding, reason, mes
 // targetIdentifier 返回目标标识，供日志使用。**必须 nil-safe**：错误处置路径也会被
 // 「target.type 不认识 / 内嵌块缺失」这类失败触发，而那正是 FC3CustomDomain 为 nil 的
 // 时候，直接解引用会把一次配置错误变成 panic。
-//
-//nolint:unused // Task 8 起的 apply / observe 日志与事件使用；本任务先把 nil-safe 语义立住。
 func targetIdentifier(b *certsv1alpha1.AliyunCertificateBinding) string {
 	if b.Spec.Target.FC3CustomDomain != nil {
 		return b.Spec.Target.FC3CustomDomain.DomainName
@@ -89,7 +87,11 @@ func targetIdentifier(b *certsv1alpha1.AliyunCertificateBinding) string {
 
 // targetRegion 同上，供 region label 使用；取不到时返回空串（label 允许空值）。
 //
-//nolint:unused // 同 targetIdentifier。
+// 原抑制理由写的是「同 targetIdentifier（Task 8 起使用）」，是错的：Task 11 消费了
+// targetIdentifier，却用不上 region——绑定侧三个 gauge 的 label 里根本没有 region。
+// 真正的首个调用者是 Task 13 的 cleanupAbandonedTotal.WithLabelValues(targetRegion(b), …)。
+//
+//nolint:unused // 调用点由 Task 13 的 Abandon 分支补上，见上方说明。
 func targetRegion(b *certsv1alpha1.AliyunCertificateBinding) string {
 	if b.Spec.Target.FC3CustomDomain != nil {
 		return b.Spec.Target.FC3CustomDomain.Region
