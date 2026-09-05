@@ -204,7 +204,7 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 	}
 
 	// 4. 解析凭证并构造 provider client（spec §6.2 步骤 4）
-	p, cl, err := r.ProviderFactory(ctx, b, ac)
+	p, cl, err := r.providerClient(ctx, b, ac)
 	if err != nil {
 		return r.handleFactoryError(ctx, rd, err)
 	}
@@ -219,6 +219,21 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 
 	aggregateBindingReady(b)
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
+}
+
+// providerClient 通过 ProviderFactory 取 provider 与 client；与证书侧的 casClient 同构。
+//
+// 显式挡住未配置的工厂：接线漏了就在 worker 里 nil 函数调用 panic，而 panic 出在
+// reconcile 循环里比一条 ApplyFailed 难查得多。
+//
+//nolint:unparam // 返回的 Provider 目前被 `_ = p` 丢弃，调用点由 Task 11 的 Observe 补上。
+func (r *AliyunCertificateBindingReconciler) providerClient(ctx context.Context,
+	b *certsv1alpha1.AliyunCertificateBinding, ac *certsv1alpha1.AliyunCertificate,
+) (provider.Provider, provider.Client, error) {
+	if r.ProviderFactory == nil {
+		return nil, nil, errors.New("ProviderFactory 未配置")
+	}
+	return r.ProviderFactory(ctx, b, ac)
 }
 
 // handleFactoryError 处置「连 client 都没造出来」的失败。

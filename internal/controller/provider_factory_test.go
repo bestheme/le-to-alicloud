@@ -26,12 +26,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
 )
 
 func TestCredentialsSecretNameFor_InheritsFromCertificate(t *testing.T) {
@@ -122,14 +124,19 @@ func akSecret(name string) *corev1.Secret {
 	})
 }
 
-// factoryFixture 造出 (工厂, 缓存, Binding, 证书)。证书的凭证叫 cas-cred，
+// factoryFixture 把一次工厂调用需要的全部零件收在一起。证书的凭证叫 cas-cred，
 // Binding 自己的（若设置）叫 fc-cred，两者都真实存在于 fake client 里。
-func factoryFixture(t *testing.T, objs ...client.Object) (
-	ProviderFactory, *aliyun.ClientCache[aliyun.FC3Client],
-	*certsv1alpha1.AliyunCertificateBinding, *certsv1alpha1.AliyunCertificate,
-) {
+type factoryFixture struct {
+	f     ProviderFactory
+	c     client.Client
+	cache *aliyun.ClientCache[aliyun.FC3Client]
+	b     *certsv1alpha1.AliyunCertificateBinding
+	ac    *certsv1alpha1.AliyunCertificate
+}
+
+func newFactoryFixture(t *testing.T, objs ...client.Object) *factoryFixture {
 	t.Helper()
-	r := fake.NewClientBuilder().WithScheme(factoryScheme(t)).WithObjects(objs...).Build()
+	c := fake.NewClientBuilder().WithScheme(factoryScheme(t)).WithObjects(objs...).Build()
 	cache := aliyun.NewClientCache[aliyun.FC3Client]()
 	b := bindingWithDomain("api.example.com")
 	b.Namespace = "ns1"
@@ -142,7 +149,41 @@ func factoryFixture(t *testing.T, objs ...client.Object) (
 			},
 		},
 	}
-	return NewProviderFactory(r, cache, aliyun.NewLimiters(), 5*time.Second), cache, b, ac
+	return &factoryFixture{
+		f: NewProviderFactory(c, cache, aliyun.NewLimiters(), 5*time.Second),
+		c: c, cache: cache, b: b, ac: ac,
+	}
+}
+
+// call 跑一次工厂。
+func (fx *factoryFixture) call(t *testing.T) (provider.Provider, provider.Client, error) {
+	t.Helper()
+	return fx.f(context.Background(), fx.b, fx.ac)
+}
+
+// rotate 改写凭证 Secret 的内容，fake client 会随之推进 resourceVersion——
+// 这正是线上轮换 AK 的形状。
+func (fx *factoryFixture) rotate(t *testing.T, name string) {
+	t.Helper()
+	s := &corev1.Secret{}
+	if err := fx.c.Get(context.Background(),
+		types.NamespacedName{Namespace: "ns1", Name: name}, s); err != nil {
+		t.Fatalf("取凭证 Secret: %v", err)
+	}
+	before := s.ResourceVersion
+	s.Data[aliyun.KeyAccessKeySecret] = []byte(testAKSecret + "-rotated")
+	if err := fx.c.Update(context.Background(), s); err != nil {
+		t.Fatalf("轮换凭证 Secret: %v", err)
+	}
+	if err := fx.c.Get(context.Background(),
+		types.NamespacedName{Namespace: "ns1", Name: name}, s); err != nil {
+		t.Fatalf("回读凭证 Secret: %v", err)
+	}
+	// 这条断言守的是 fixture 本身：fake client 若不推进 resourceVersion，
+	// 下面的「轮换后必须重建」用例就会变成一个什么都不检验的用例。
+	if s.ResourceVersion == before {
+		t.Fatalf("fake client 没有推进 resourceVersion，用例前提不成立")
+	}
 }
 
 // assertNoAKLeak 是零凭证泄漏那条约束的可执行版本。
@@ -155,10 +196,10 @@ func assertNoAKLeak(t *testing.T, msg string) {
 	}
 }
 
-func TestNewProviderFactory_InheritsCertificateSecretAndCaches(t *testing.T) {
-	f, cache, b, ac := factoryFixture(t, akSecret("cas-cred"))
+func TestNewProviderFactory_InheritsCertificateSecret(t *testing.T) {
+	fx := newFactoryFixture(t, akSecret("cas-cred"))
 
-	p, cl, err := f(context.Background(), b, ac)
+	p, cl, err := fx.call(t)
 	if err != nil {
 		t.Fatalf("应能用证书的凭证造出 client: %v", err)
 	}
@@ -168,29 +209,67 @@ func TestNewProviderFactory_InheritsCertificateSecretAndCaches(t *testing.T) {
 	if cl == nil {
 		t.Fatal("client 不应为 nil")
 	}
-	// 同一个 (Secret, resourceVersion, region) 只造一次：AK 轮换靠 resourceVersion 触发重建。
-	if _, _, err := f(context.Background(), b, ac); err != nil {
+}
+
+// 缓存必须按**实例**断言，不能只看条目数：缓存是就地覆盖同一个 identity 的，
+// 每次都重建照样只有一条，`cache.Len() == 1` 对「根本没复用」和「复用了」一样绿。
+func TestNewProviderFactory_ReusesClientForSameSecretVersion(t *testing.T) {
+	fx := newFactoryFixture(t, akSecret("cas-cred"))
+
+	_, first, err := fx.call(t)
+	if err != nil {
+		t.Fatalf("第一次调用: %v", err)
+	}
+	_, second, err := fx.call(t)
+	if err != nil {
 		t.Fatalf("第二次调用: %v", err)
 	}
-	if cache.Len() != 1 {
-		t.Errorf("同一凭证应复用同一个 client，缓存条目数 = %d", cache.Len())
+	if first != second {
+		t.Error("同一 (Secret, resourceVersion, region) 应复用同一个 client 实例")
+	}
+	if fx.cache.Len() != 1 {
+		t.Errorf("缓存条目数 = %d，应为 1", fx.cache.Len())
+	}
+}
+
+// 轮换 AK 之后必须换一个新 client。这是「AK 被吊销后仍被缓存里的旧 client 一直用下去」
+// 那个 bug 的直接反面：ClientKey 的 identity() 刻意不含 resourceVersion，全靠工厂把
+// Secret 的 resourceVersion 填进 key——把它写死成空串，本用例会红，上一个则不会。
+func TestNewProviderFactory_RebuildsClientAfterSecretRotation(t *testing.T) {
+	fx := newFactoryFixture(t, akSecret("cas-cred"))
+
+	_, before, err := fx.call(t)
+	if err != nil {
+		t.Fatalf("轮换前: %v", err)
+	}
+	fx.rotate(t, "cas-cred")
+	_, after, err := fx.call(t)
+	if err != nil {
+		t.Fatalf("轮换后: %v", err)
+	}
+	if before == after {
+		t.Error("凭证 Secret 的 resourceVersion 变了就必须重建 client")
+	}
+	// 重建是替换而不是堆积：identity 不含 resourceVersion，旧条目应被就地覆盖。
+	if fx.cache.Len() != 1 {
+		t.Errorf("缓存条目数 = %d，应为 1（就地覆盖而不是堆积）", fx.cache.Len())
 	}
 }
 
 func TestNewProviderFactory_BindingCredentialsWin(t *testing.T) {
 	// 只放 fc-cred：如果工厂错误地用了证书的 cas-cred，就会 NotFound。
-	f, _, b, ac := factoryFixture(t, akSecret("fc-cred"))
-	b.Spec.CredentialsRef = &certsv1alpha1.LocalSecretReference{Name: "fc-cred"}
+	fx := newFactoryFixture(t, akSecret("fc-cred"))
+	fx.b.Spec.CredentialsRef = &certsv1alpha1.LocalSecretReference{Name: "fc-cred"}
 
-	if _, _, err := f(context.Background(), b, ac); err != nil {
+	if _, _, err := fx.call(t); err != nil {
 		t.Fatalf("Binding 自己的凭证应优先: %v", err)
 	}
 }
 
 func TestNewProviderFactory_SecretNotFound(t *testing.T) {
-	f, _, b, ac := factoryFixture(t)
+	fx := newFactoryFixture(t)
 
-	_, _, err := f(context.Background(), b, ac)
+	_, _, err := fx.call(t)
 	var ce *credentialsError
 	if !errors.As(err, &ce) || ce.Reason != certsv1alpha1.ReasonCredentialsNotFound {
 		t.Fatalf("应是 CredentialsSecretNotFound: %v", err)
@@ -198,10 +277,11 @@ func TestNewProviderFactory_SecretNotFound(t *testing.T) {
 }
 
 func TestNewProviderFactory_NoCredentialsRefAtAll(t *testing.T) {
-	f, _, b, _ := factoryFixture(t)
-
+	fx := newFactoryFixture(t)
 	// ac 为 nil 且 Binding 没设 credentialsRef：无从解析，属于凭证类失败而不是接线错误。
-	_, _, err := f(context.Background(), b, nil)
+	fx.ac = nil
+
+	_, _, err := fx.call(t)
 	var ce *credentialsError
 	if !errors.As(err, &ce) || ce.Reason != certsv1alpha1.ReasonCredentialsNotFound {
 		t.Fatalf("应是 CredentialsSecretNotFound: %v", err)
@@ -210,11 +290,11 @@ func TestNewProviderFactory_NoCredentialsRefAtAll(t *testing.T) {
 
 func TestNewProviderFactory_InvalidCredentials(t *testing.T) {
 	// 只有 accessKeyId、没有 accessKeySecret：CredentialsFromSecret 判定无效。
-	f, _, b, ac := factoryFixture(t, credSecret("cas-cred", map[string][]byte{
+	fx := newFactoryFixture(t, credSecret("cas-cred", map[string][]byte{
 		aliyun.KeyAccessKeyID: []byte(testAKID),
 	}))
 
-	_, _, err := f(context.Background(), b, ac)
+	_, _, err := fx.call(t)
 	var ce *credentialsError
 	if !errors.As(err, &ce) || ce.Reason != certsv1alpha1.ReasonCredentialsInvalid {
 		t.Fatalf("应是 CredentialsInvalid: %v", err)
@@ -224,10 +304,10 @@ func TestNewProviderFactory_InvalidCredentials(t *testing.T) {
 }
 
 func TestNewProviderFactory_UnknownTargetType(t *testing.T) {
-	f, _, b, ac := factoryFixture(t, akSecret("cas-cred"))
-	b.Spec.Target = certsv1alpha1.BindingTarget{Type: "Nope"}
+	fx := newFactoryFixture(t, akSecret("cas-cred"))
+	fx.b.Spec.Target = certsv1alpha1.BindingTarget{Type: "Nope"}
 
-	_, _, err := f(context.Background(), b, ac)
+	_, _, err := fx.call(t)
 	if err == nil {
 		t.Fatal("未知 target.type 应报错")
 	}
@@ -235,6 +315,14 @@ func TestNewProviderFactory_UnknownTargetType(t *testing.T) {
 	var ce *credentialsError
 	if errors.As(err, &ce) {
 		t.Errorf("不该被归成凭证错误: %v", err)
+	}
+}
+
+func TestProviderClient_NilFactory(t *testing.T) {
+	// 接线漏了 ProviderFactory 时给一条错误，而不是在 worker 里 nil 函数调用 panic。
+	r := &AliyunCertificateBindingReconciler{}
+	if _, _, err := r.providerClient(context.Background(), bindingWithDomain("a.example.com"), nil); err == nil {
+		t.Error("未配置 ProviderFactory 应报错而不是 panic")
 	}
 }
 
