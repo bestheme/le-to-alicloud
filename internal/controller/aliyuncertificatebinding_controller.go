@@ -345,14 +345,23 @@ func (r *AliyunCertificateBindingReconciler) handleObserveError(
 		return ctrl.Result{RequeueAfter: credentialsRequeue}, r.patchBinding(ctx, rd)
 	}
 	log.Error(err, "Observe 失败", "domain", targetIdentifier(rd.b))
-	// 只在 reason 相对上一轮变化时发事件（spec §10.2「只在状态跃迁时发」）：旁路失败
-	// 每一轮都会重来，每轮发一条 Warning 就是在刷事件表。
-	r.eventOnReasonChange(rd, certsv1alpha1.ConditionApplied, certsv1alpha1.ReasonObserveFailed,
-		corev1.EventTypeWarning, certsv1alpha1.ReasonObserveFailed, observeFailedMessage)
 	// Applied 的 status 一个字节都不改——那才是「旁路失败不降级」的含义。只把 reason
 	// 换成 ObserveFailed：kubectl describe 因此看得出「证书还生效着，但上一轮观测失败」，
 	// 上面那个跃迁判断也才有可比较的痕迹。
-	noteObserveFailed(rd.b)
+	//
+	// 事件与这条痕迹必须同进同退，所以先写痕迹、再按它决定发不发。noteObserveFailed
+	// 在 Applied 不存在时刻意什么都不写（绝不凭空造 Applied=False），而跃迁判断读的
+	// 正是这条痕迹——少了它，比较基准永远是空串，**永不收敛**：一个从没 Applied 过的
+	// Binding 首次观测撞上 retryable 错误，会以 5ms、10ms、20ms… 的退避一轮轮重来，
+	// 每一轮都发一条 Warning。客户端事件聚合只是把它压成一条 Count 疯涨的记录，
+	// 这正是「只在跃迁时发」要防的那场刷屏。
+	// 这种对象「还没绑成功」由 Ready 说就够了，不需要事件再重复一遍。
+	noted := noteObserveFailed(rd.b)
+	if noted {
+		// 只在 reason 相对上一轮变化时发事件（spec §10.2「只在状态跃迁时发」）。
+		r.eventOnReasonChange(rd, certsv1alpha1.ConditionApplied, certsv1alpha1.ReasonObserveFailed,
+			corev1.EventTypeWarning, certsv1alpha1.ReasonObserveFailed, observeFailedMessage)
+	}
 	aggregateBindingReady(rd.b)
 	if perr := r.patchBinding(ctx, rd); perr != nil {
 		return ctrl.Result{}, perr
@@ -378,22 +387,27 @@ func (r *AliyunCertificateBindingReconciler) eventOnReasonChange(
 }
 
 // noteObserveFailed 把 Applied 的 reason 改成 ObserveFailed，status 不动。
+// 返回是否真的留下了痕迹。
 //
 // 只在 condition 已经存在时改：从没 Applied 过的对象上凭空造一个 Applied=False，
 // 就把旁路失败变成了真降级，正是这条路径要避免的事。status 不变，
 // metav1.SetStatusCondition 的 lastTransitionTime 语义也不受影响（这里直接改字段，
 // 不走 SetStatusCondition，免得它按「新 condition」处理）。
 //
+// 返回值是给事件用的：跃迁判断的比较基准就是这条痕迹，没写下痕迹就没有可收敛的基准，
+// 调用方必须据此跳过事件（见 handleObserveError）。
+//
 // 反方向由 setApplied 负责：观测恢复后它会把 reason 写回 Applied，否则一次瞬时故障
 // 会让一个健康的 Binding 永远显示 ObserveFailed。
-func noteObserveFailed(b *certsv1alpha1.AliyunCertificateBinding) {
+func noteObserveFailed(b *certsv1alpha1.AliyunCertificateBinding) bool {
 	for i := range b.Status.Conditions {
 		if b.Status.Conditions[i].Type == certsv1alpha1.ConditionApplied {
 			b.Status.Conditions[i].Reason = certsv1alpha1.ReasonObserveFailed
 			b.Status.Conditions[i].Message = "上一轮观测失败，保留既有判定"
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // fenceAccount 实现账号 fencing（spec §6.2 步骤 5）：status.boundAccountId 一旦固化，
@@ -401,14 +415,48 @@ func noteObserveFailed(b *certsv1alpha1.AliyunCertificateBinding) {
 //
 // 触发场景是凭证 Secret 被换成了另一个账号的 AK，而同名域名恰好也存在于那个账号。
 // 没有这道闸，operator 会安静地把证书写进陌生人的资源。
+//
+// **观测到空账号也算不一致，一样拦下（fail closed）**。brief 给的是放行的写法，这里
+// 按 spec §6.2 步骤 5 的原文改成失败关闭：它要求的是「非空的 boundAccountId 与观测
+// 不一致就停写」，而空值与一个非空值就是不一致。失败关闭在这里不花任何代价——
+// boundAccountId 只会从**非空**观测里记下来（见短路分支的 obs.AccountID != "" 守卫），
+// 所以 bound 非空本身就证明 provider 至少为这个目标报出过一次真实账号；此后再读到空
+// 值是异常，不是正常状态。放行的代价恰恰是这道闸存在的理由：AK 被换成另一个账号的、
+// 同名域名恰好也存在于那里、而那个账号的响应没带账号 ID——闸门打开，下一步的 Apply
+// 就把证书写进了陌生人的域名。
 func (r *AliyunCertificateBindingReconciler) fenceAccount(rd *bindingRound, obs provider.ObservedState) bool {
 	bound := rd.b.Status.BoundAccountID
-	if bound == "" || obs.AccountID == "" || bound == obs.AccountID {
+	// bound 为空 = 还没固化过，本轮正是首次观测，放行（随后由短路 / Apply 记下来）。
+	if bound == "" || bound == obs.AccountID {
 		return false
 	}
-	setBindingCondition(rd.b, certsv1alpha1.ConditionConflict, metav1.ConditionTrue,
-		certsv1alpha1.ReasonAccountMismatch, "目标所属账号与首次绑定时不一致")
+	setFencedConflict(rd)
 	return true
+}
+
+// setFencedConflict 写 Conflict=True/AccountMismatch，并在上一轮已经是同一个判定时
+// 沿用它的 lastTransitionTime。
+//
+// 不能直接用 setBindingCondition：步骤 2 的仲裁排在 Observe 之前（顺序由 spec §6.2
+// 定死），每一轮都会先把 Conflict 写成 False/NoConflict，fencing 随即再翻回 True。
+// 两次翻转都会让 meta.SetStatusCondition 重新盖一个 lastTransitionTime，于是
+// ①「从什么时候开始被 fencing 的」被刷成了「上一次 reconcile 是什么时候」，运维读不
+// 出真正的起点；② 每一次外部唤醒都多出一次非空 status patch 和它引发的一轮 reconcile。
+func setFencedConflict(rd *bindingRound) {
+	cond := metav1.Condition{
+		Type:               certsv1alpha1.ConditionConflict,
+		Status:             metav1.ConditionTrue,
+		Reason:             certsv1alpha1.ReasonAccountMismatch,
+		Message:            "目标所属账号与首次绑定时不一致",
+		ObservedGeneration: rd.b.Generation,
+	}
+	// 判据取 rd.orig（本轮开始前 API server 上的那一份），而不是 rd.b——b 里的
+	// Conflict 刚被仲裁改成过 False，已经不是「上一轮的结论」了。
+	if prev := meta.FindStatusCondition(rd.orig.Status.Conditions, certsv1alpha1.ConditionConflict); prev != nil &&
+		prev.Status == metav1.ConditionTrue && prev.Reason == certsv1alpha1.ReasonAccountMismatch {
+		cond.LastTransitionTime = prev.LastTransitionTime
+	}
+	meta.SetStatusCondition(&rd.b.Status.Conditions, cond)
 }
 
 // noteDrift 在观测到「既不是我们上次写的、也不是当前该写的」证书时记一笔。

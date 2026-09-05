@@ -21,11 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
@@ -52,7 +55,32 @@ func issueAndBind(ctx context.Context, ns, certName, bindingName, domain, protoc
 	})
 }
 
-// 每个用例用自己的一组对象名（b1/c1 … b9/c9）而不是全体叫 b1/c1。两个理由：
+// bindingEventCount 统计某个对象上某个 reason 的事件**总次数**。
+//
+// 只数 Event 对象个数是不够的：K8s 的事件聚合会把 reason+message 完全相同的事件并进
+// 同一个对象并累加 Count，而「又发了一条」正表现为 Count 从 1 变成 2。所以这里累加
+// Count 而不是 len(items)——否则一场刷屏在断言里看着仍然只有「一条事件」。
+func bindingEventCount(ctx context.Context, ns, name, reason string) int {
+	list := &corev1.EventList{}
+	if err := k8sClient.List(ctx, list, client.InNamespace(ns)); err != nil {
+		return -1
+	}
+	total := 0
+	for i := range list.Items {
+		e := &list.Items[i]
+		if e.InvolvedObject.Name != name || e.Reason != reason {
+			continue
+		}
+		if e.Count <= 0 {
+			total++ // 刚创建、还没被聚合器回填 Count
+			continue
+		}
+		total += int(e.Count)
+	}
+	return total
+}
+
+// 每个用例用自己的一组对象名（b1/c1 … b12/c12）而不是全体叫 b1/c1。两个理由：
 // ① 失败信息里一眼看得出是哪个用例的对象；② issueAndBind 的 certName / bindingName /
 // domain / protocol 因此真的各取各的值，unparam 的「always receives」不再成立。
 // unparam 报得对，而正确的修法是让 fixture 名字真的不同：它一次只报一个形参，逐个删
@@ -252,14 +280,64 @@ var _ = Describe("绑定 controller：Observe", func() {
 		})
 		Expect(bindingCond(ctx, ns, "b7", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionFalse))
 		Expect(currentFC3().UpdateCalls()).To(BeZero())
+
 		// fencing 每一轮都要把 Conflict 从仲裁刚写下的 False 再翻回 True（步骤 2 排在
-		// Observe 之前，顺序由 spec §6.2 定死）。这一翻若每轮都改写 lastTransitionTime，
-		// status patch 就每轮都非空，自己的 watch 会立刻把自己叫醒——一个满速自旋的
-		// reconcile 循环，而云侧一个字节都没写，指标上也看不出异常。收敛之后
-		// resourceVersion 必须停住。
-		rv := getBinding(ctx, ns, "b7").ResourceVersion
-		Consistently(func() string { return getBinding(ctx, ns, "b7").ResourceVersion },
-			"2s", "200ms").Should(Equal(rv), "fencing 在稳态下必须是幂等的，不能每轮刷一次 status")
+		// Observe 之前，顺序由 spec §6.2 定死）。这一翻若每轮都盖一个新的
+		// lastTransitionTime，① 运维再也读不出「从什么时候起被 fencing 的」，
+		// ② 每一次外部唤醒都多出一次非空 status patch 和它引发的一轮 reconcile。
+		//
+		// 静置断言测不到这一条——被 fencing 的对象一小时才自己醒一次，窗口里根本没有
+		// reconcile。必须**主动再唤醒一次**，然后要求跃迁时间纹丝不动。
+		fencedAt := bindingCond(ctx, ns, "b7", certsv1alpha1.ConditionConflict).LastTransitionTime
+		Expect(fencedAt.IsZero()).To(BeFalse())
+		// 必须跨过一个整秒再唤醒：metav1.Time 序列化到**秒**精度，同一秒内重新盖的
+		// lastTransitionTime 和原值比起来是相等的，churn 就此隐形——这条断言会变成
+		// 一个看着通过、其实什么都没测的空断言（已实测：不睡这一秒，去掉修复它照样绿）。
+		time.Sleep(1100 * time.Millisecond)
+		gets := currentFC3().GetCalls()
+		b = getBinding(ctx, ns, "b7")
+		b.Annotations = map[string]string{"poke": "2"}
+		Expect(k8sClient.Update(ctx, b)).To(Succeed())
+		eventually(func() bool { return currentFC3().GetCalls() > gets }) // 确实又跑了一轮
+
+		c := bindingCond(ctx, ns, "b7", certsv1alpha1.ConditionConflict)
+		Expect(c.Status).To(Equal(metav1.ConditionTrue))
+		Expect(c.Reason).To(Equal(certsv1alpha1.ReasonAccountMismatch))
+		Expect(c.LastTransitionTime).To(Equal(fencedAt),
+			"fencing 是幂等的：同一个判定重复写不该盖新的 lastTransitionTime")
+		Expect(currentFC3().UpdateCalls()).To(BeZero())
+	})
+
+	It("观测到空账号时 fencing 也必须拦下（fail closed）", func() {
+		ns := newNamespace(ctx)
+		domain := fmt.Sprintf("b10.%s.example.com", ns)
+		ca := testutil.NewCA(GinkgoT())
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{
+			DomainName: domain, Protocol: "HTTPS",
+			CertName: "pre-existing", CertPEM: certPEM, KeyPEM: keyPEM, Echo: "routes",
+		})
+		createCertificate(ctx, ns, "c10", domain)
+		simulateIssuance(ctx, ns, "c10", 1, certPEM, keyPEM)
+		createBinding(ctx, ns, "b10", "c10", domain, nil)
+		eventually(func() bool {
+			return getBinding(ctx, ns, "b10").Status.BoundAccountID == testAccountID
+		})
+
+		// AK 被换成了另一个账号的，而那个账号的响应恰好没带账号 ID。放行的话，
+		// 下一步的 Apply 就把证书写进了陌生人的域名——这正是这道闸存在的理由。
+		// boundAccountId 只会从非空观测里记下来，所以此刻读到空值是异常而非常态。
+		currentFC3().SetAccountID("")
+		b := getBinding(ctx, ns, "b10")
+		b.Annotations = map[string]string{"poke": "1"}
+		Expect(k8sClient.Update(ctx, b)).To(Succeed())
+
+		eventually(func() bool {
+			c := bindingCond(ctx, ns, "b10", certsv1alpha1.ConditionConflict)
+			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonAccountMismatch
+		})
+		Expect(bindingCond(ctx, ns, "b10", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionFalse))
+		Expect(currentFC3().UpdateCalls()).To(BeZero())
 	})
 
 	It("接管之后 Observe 未知失败：旁路，不降级 Applied，只把 reason 换成 ObserveFailed", func() {
@@ -298,6 +376,81 @@ var _ = Describe("绑定 controller：Observe", func() {
 		})
 	})
 
+	It("已 Applied 的对象观测连续失败：reason 变成 ObserveFailed，事件只发一条", func() {
+		ns := newNamespace(ctx)
+		domain := fmt.Sprintf("b11.%s.example.com", ns)
+		ca := testutil.NewCA(GinkgoT())
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{
+			DomainName: domain, Protocol: "HTTP",
+			CertName: "pre-existing", CertPEM: certPEM, KeyPEM: keyPEM, Echo: "routes",
+		})
+		createCertificate(ctx, ns, "c11", domain)
+		simulateIssuance(ctx, ns, "c11", 1, certPEM, keyPEM)
+		createBinding(ctx, ns, "b11", "c11", domain, nil)
+		eventually(func() bool {
+			return bindingCond(ctx, ns, "b11", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
+		})
+
+		// Retryable：controller-runtime 会以 5ms 起步的退避一轮轮重来，制造出真实的
+		// 「旁路失败反复重试」场景。排够多的错误，让它在整个断言窗口里都恢复不了。
+		for range 200 {
+			currentFC3().QueueGetErr(&aliyun.Error{
+				Class: aliyun.ClassRetryable, Op: aliyun.ActionGetCustomDomain,
+				Code: "InternalError", Err: errors.New("boom"),
+			})
+		}
+		b := getBinding(ctx, ns, "b11")
+		b.Annotations = map[string]string{"poke": "1"}
+		Expect(k8sClient.Update(ctx, b)).To(Succeed())
+
+		// 痕迹：status 仍是 True（旁路不降级），reason 换成 ObserveFailed。
+		// 这条 reason 此前没有任何用例覆盖，而它正是跃迁判断的比较基准。
+		eventually(func() bool {
+			c := bindingCond(ctx, ns, "b11", certsv1alpha1.ConditionApplied)
+			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonObserveFailed
+		})
+		// 事件只在跃迁那一轮发。等到失败轮次远多于事件数，「每轮一条」就无处躲藏。
+		eventually(func() bool { return currentFC3().GetCalls() >= 8 })
+		n := bindingEventCount(ctx, ns, "b11", certsv1alpha1.ReasonObserveFailed)
+		Expect(n).To(BeNumerically(">=", 1), "跃迁那一轮必须发一条")
+		// 不断言恰好等于 1：跃迁判据取自 informer cache 里的那一份（rd.orig），缓存
+		// 滞后时紧邻的一两轮可能仍看着旧 reason，于是多发一条——**有界**的重复。
+		// 要钉死的是「有界」：坏掉的实现是每一轮都发，事件数跟着轮次一起涨。
+		Expect(n).To(BeNumerically("<=", 3),
+			fmt.Sprintf("已失败 %d 轮却发了 %d 条事件——事件数不该跟轮次一起涨",
+				currentFC3().GetCalls(), n))
+	})
+
+	It("从没 Applied 过的对象观测反复失败：不留痕迹，也一条事件都不发", func() {
+		ns := newNamespace(ctx)
+		domain := fmt.Sprintf("b12.%s.example.com", ns)
+		ca := testutil.NewCA(GinkgoT())
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP", Echo: "routes"})
+		// 每一轮观测都失败，而且是 Retryable——controller-runtime 会以 5ms、10ms、20ms…
+		// 的退避一轮轮重来。这正是事件刷屏的场景：跃迁判断的基准是
+		// noteObserveFailed 留下的痕迹，而这种对象上它什么都不写，基准永远是空串。
+		for range 40 {
+			currentFC3().QueueGetErr(&aliyun.Error{
+				Class: aliyun.ClassRetryable, Op: aliyun.ActionGetCustomDomain,
+				Code: "InternalError", Err: errors.New("boom"),
+			})
+		}
+		createCertificate(ctx, ns, "c12", domain)
+		simulateIssuance(ctx, ns, "c12", 1, certPEM, keyPEM)
+		createBinding(ctx, ns, "b12", "c12", domain, nil)
+
+		// 先确认重试风暴真的发生了，否则下面的「零事件」是空断言。
+		eventually(func() bool { return currentFC3().GetCalls() >= 5 })
+		// 绝不凭空造 Applied=False。
+		Expect(bindingCond(ctx, ns, "b12", certsv1alpha1.ConditionApplied).Status).To(BeEmpty())
+		// 「还没绑成功」由 Ready 说就够了，不需要每一轮再发一条 Warning 重复一遍。
+		Consistently(func() int {
+			return bindingEventCount(ctx, ns, "b12", certsv1alpha1.ReasonObserveFailed)
+		}, "2s", "200ms").Should(BeZero(), "没有痕迹可比较，就不该发事件——否则永不收敛")
+	})
+
 	It("云上装着别人的证书时记一次 drift", func() {
 		ns := newNamespace(ctx)
 		domain := fmt.Sprintf("b9.%s.example.com", ns)
@@ -320,6 +473,10 @@ var _ = Describe("绑定 controller：Observe", func() {
 		eventually(func() bool {
 			return promtestutil.ToFloat64(
 				bindingDriftTotal.WithLabelValues(certsv1alpha1.TargetTypeFC3CustomDomain)) > before
+		})
+		// 指标是给告警看的，事件是给 kubectl describe 看的，两者都要有。
+		eventually(func() bool {
+			return bindingEventCount(ctx, ns, "b9", certsv1alpha1.ReasonDriftCorrected) > 0
 		})
 	})
 })
@@ -362,7 +519,9 @@ func TestProtocolSatisfied(t *testing.T) {
 func TestNoteObserveFailed(t *testing.T) {
 	t.Run("没有 Applied 时一个 condition 都不造", func(t *testing.T) {
 		b := &certsv1alpha1.AliyunCertificateBinding{}
-		noteObserveFailed(b)
+		if noteObserveFailed(b) {
+			t.Error("返回值必须是 false：没留下痕迹，调用方就不该发事件（否则跃迁判断永不收敛）")
+		}
 		if len(b.Status.Conditions) != 0 {
 			t.Fatalf("凭空造出了 condition: %+v", b.Status.Conditions)
 		}
@@ -375,7 +534,9 @@ func TestNoteObserveFailed(t *testing.T) {
 			Reason: certsv1alpha1.ReasonApplied, LastTransitionTime: metav1.Now(),
 		}}
 		before := b.Status.Conditions[0].LastTransitionTime
-		noteObserveFailed(b)
+		if !noteObserveFailed(b) {
+			t.Error("返回值必须是 true：痕迹已写下，调用方据此决定发事件")
+		}
 		got := b.Status.Conditions[0]
 		if got.Status != metav1.ConditionTrue {
 			t.Errorf("status 被改成了 %s，旁路失败不该降级", got.Status)
