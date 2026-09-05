@@ -116,6 +116,10 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 test-race: manifests generate fmt vet setup-envtest ## Run tests with the race detector.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -race $$(go list ./... | grep -v /e2e)
 
+.PHONY: test-integration
+test-integration: ## Run the real-cloud integration probes (spec §12.3). Skips without credentials.
+	go test -tags=integration ./test/integration/... -v -count=1 -timeout 30m
+
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # CertManager is installed by default; skip with:

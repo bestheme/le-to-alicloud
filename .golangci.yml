@@ -1,6 +1,8 @@
 version: "2"
 run:
   allow-parallel-runners: true
+  build-tags:
+    - integration
 linters:
   default: none
   enable:
@@ -54,6 +56,18 @@ linters:
       # 折行只会让「哪一项在记什么」更难读；Task 3 建的 test/integration/ 整目录豁免 lll
       - linters:
           - lll
+        path: test/integration/
+      # 探针类用例天然长得几乎一样（换个私钥编码、换个链形状），dupl 会把它们全报出来，
+      # 而合并成表驱动反而让「哪一项失败了」在输出里看不清
+      - linters:
+          - dupl
+        path: _test\.go
+      # 脚手架期的临时豁免：test/integration/ 的探针 helper（requireCAS / newCAS /
+      # uploadForTest / outcome 等）调用方要到 Task 4–8 才出现，而 unused 做的是从
+      # 测试函数与导出标识符出发的可达性分析，整条链会一起被判死。
+      # Task 14 负责删除这条排除，并验证 `make lint` 仍为 0 issues。
+      - linters:
+          - unused
         path: test/integration/
     paths:
       - third_party$
