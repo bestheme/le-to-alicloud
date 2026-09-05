@@ -55,7 +55,7 @@ func (p *Provider) Observe(ctx context.Context, t provider.Target, c provider.Cl
 	cd, err := cl.GetCustomDomain(ctx, t.Identifier)
 	if err != nil {
 		return provider.ObservedState{},
-			toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonApplyFailed)
+			toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonObserveFailed)
 	}
 	obs := provider.ObservedState{
 		Exists:    true,
@@ -139,7 +139,7 @@ func (p *Provider) Cleanup(
 	}
 	cd, err := cl.GetCustomDomain(ctx, t.Identifier)
 	if err != nil {
-		gerr := toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonApplyFailed)
+		gerr := toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonCleanupFailed)
 		if pe := provider.ErrorOf(gerr); pe != nil && pe.Code == provider.CodeTargetNotFound {
 			return nil // 域名已经不在了，解绑的目的已经达到
 		}
@@ -151,7 +151,7 @@ func (p *Provider) Cleanup(
 		in.Protocol = protocolHTTP
 	}
 	if err := cl.UpdateCustomDomain(ctx, t.Identifier, in); err != nil {
-		return toProviderError(aliyun.ActionUpdateCustomDomain, err, certsv1alpha1.ReasonApplyFailed)
+		return toProviderError(aliyun.ActionUpdateCustomDomain, err, certsv1alpha1.ReasonCleanupFailed)
 	}
 	return nil
 }

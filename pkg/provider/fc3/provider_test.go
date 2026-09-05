@@ -308,3 +308,51 @@ func TestProvider_ObserveUnparsableCertIsNoCert(t *testing.T) {
 		t.Errorf("应观测成「域名在、但没有我们的证书」: %+v", obs)
 	}
 }
+
+// permanentErr 是一个必定落进 toProviderError 兜底分支（default）的错误——
+// NotFound / Auth / Throttled 三支各自带着自己的 reason，只有兜底分支会用到 failReason。
+func permanentErr() error {
+	return &aliyun.Error{
+		Class: aliyun.ClassPermanent, Op: aliyun.ActionGetCustomDomain,
+		Code: "InvalidParameter", Err: errAny,
+	}
+}
+
+func TestProvider_FallbackReasonDiffersPerOperation(t *testing.T) {
+	ctx := context.Background()
+	m, _ := materialFor(t)
+
+	// Observe 失败要建议 ObserveFailed。写成 ApplyFailed 等于告诉用户我们尝试过写入，
+	// 而此刻我们连「云上现在是什么」都还没读到——condition 会指向错误的排查方向。
+	fObs := fake.NewFC3()
+	fObs.QueueGetErr(permanentErr())
+	_, err := (&fc3.Provider{}).Observe(ctx, targetFor(), fObs)
+	if pe := provider.ErrorOf(err); pe == nil || pe.Reason != certsv1alpha1.ReasonObserveFailed {
+		t.Errorf("Observe 的兜底 reason 应是 ObserveFailed: %v", err)
+	}
+
+	fApply := fake.NewFC3()
+	fApply.AddDomain(fake.Domain{DomainName: testDomain, Protocol: "HTTP"})
+	fApply.QueueUpdateErr(permanentErr())
+	err = (&fc3.Provider{}).Apply(ctx, targetFor(), fApply, m, provider.ApplyOptions{})
+	if pe := provider.ErrorOf(err); pe == nil || pe.Reason != certsv1alpha1.ReasonApplyFailed {
+		t.Errorf("Apply 的兜底 reason 应是 ApplyFailed: %v", err)
+	}
+
+	fClean := fake.NewFC3()
+	fClean.AddDomain(fake.Domain{DomainName: testDomain, Protocol: "HTTP"})
+	fClean.QueueUpdateErr(permanentErr())
+	err = (&fc3.Provider{}).Cleanup(ctx, targetFor(), fClean, provider.DeletionPolicyUnbind)
+	if pe := provider.ErrorOf(err); pe == nil || pe.Reason != certsv1alpha1.ReasonCleanupFailed {
+		t.Errorf("Cleanup 写入失败的兜底 reason 应是 CleanupFailed: %v", err)
+	}
+
+	// Cleanup 的读失败走的是另一个调用点（not-found 要在那里被吞掉），reason 同样是 CleanupFailed。
+	fCleanGet := fake.NewFC3()
+	fCleanGet.AddDomain(fake.Domain{DomainName: testDomain, Protocol: "HTTP"})
+	fCleanGet.QueueGetErr(permanentErr())
+	err = (&fc3.Provider{}).Cleanup(ctx, targetFor(), fCleanGet, provider.DeletionPolicyUnbind)
+	if pe := provider.ErrorOf(err); pe == nil || pe.Reason != certsv1alpha1.ReasonCleanupFailed {
+		t.Errorf("Cleanup 读取失败的兜底 reason 应是 CleanupFailed: %v", err)
+	}
+}

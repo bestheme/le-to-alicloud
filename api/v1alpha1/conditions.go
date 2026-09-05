@@ -56,6 +56,7 @@ const (
 	ReasonConflictingBinding  = "ConflictingBinding"
 	ReasonAccountMismatch     = "AccountMismatch"
 	ReasonApplyFailed         = "ApplyFailed"
+	ReasonObserveFailed       = "ObserveFailed"
 	ReasonDriftCorrected      = "DriftCorrected"
 	ReasonApplied             = "Applied"
 )

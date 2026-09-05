@@ -15,8 +15,10 @@ import (
 // 通用层不认识任何 SDK 错误——这正是 provider 抽象的意义。翻译只在这一处发生，
 // Reason 用的是 v1alpha1 的常量，好让 condition 的取值集合仍然是有界的。
 //
-// failReason 是「说不出更具体的话时」写进 condition 的 reason：Observe 传
-// ReasonApplyFailed 没有意义，所以由调用方给。
+// failReason 是「说不出更具体的话时」写进 condition 的 reason，由调用方给：一次读失败
+// 建议 ApplyFailed 是错的建议——它告诉用户我们尝试过写入，而此刻连「云上现在是什么」
+// 都还没读到。三条路径因此各给各的：Observe → ObserveFailed，Apply → ApplyFailed，
+// Cleanup → CleanupFailed。bool 表达不了这三选一。
 //
 // op 作为错误消息前缀（`op + "[" + code + "]: " + …`）：一个 ProviderError 只说
 // 「Permanent」时分不清是 Get 还是 Update 挂了，加上前缀才有诊断价值——顺带让 unparam
@@ -30,13 +32,6 @@ import (
 // InvalidDomainName 这种真·永久错误误判成「域名还没建」，然后每 5 分钟空转一次。
 // 若后续的集成测试发现「不存在的自定义域名」得到的 aliyun.ClassOf(err) != ClassNotFound，
 // 那时回去修 aliyun.classifyCode（错误码归类的唯一落点），而不是在本文件加分支。
-//
-// unparam 会报 failReason「恒为 ReasonApplyFailed」——今天的三个调用点确实如此，但它不是
-// 冗余形参：Observe 与 Apply 的兜底 reason 在语义上是两件事，bool 表达不了；只是 v1alpha1
-// 眼下还没有比 ApplyFailed 更贴切的「观测失败」reason。等它出现，要改的是调用点而不是签名，
-// 现在把形参去掉等于把这个选择权也一起删掉。
-//
-//nolint:unparam // failReason 是刻意保留的契约入口，取值当下相同只是巧合
 func toProviderError(op string, err error, failReason string) error {
 	if err == nil {
 		return nil
