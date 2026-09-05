@@ -85,13 +85,14 @@ func createCertificate(ctx context.Context, ns, name string, dnsNames ...string)
 // namespace——两个测试文件用同一个字面量域名，先建的那个 Binding 会一直把后建的判成
 // Conflict，Applied 永远不为 True。helper 不给默认域名，就是为了逼调用方写出这一点。
 //
-// 这条 //nolint 是声明级的，盖住两条 unparam：返回值供 Task 8 起的用例读 UID /
-// generation；mutate 目前所有调用点都传 nil，Task 8 起才会用它改 deletionPolicy /
-// credentialsRef。两者都在后续任务里自然消解。
+// 无返回值：全部十四份 task brief 里都没有 `x := createBinding(...)`，这个返回值是
+// 永久死的（与 createCertificate 同理）。需要读回对象的地方用 getBinding()。
 //
-//nolint:unparam // 见上：返回值与 mutate 参数都由 Task 8 起使用。
+// mutate 目前所有调用点都传 nil，Task 12 才会用它改 deletionPolicy / credentialsRef。
+//
+//nolint:unparam // mutate 恒为 nil，调用点由 Task 12 补上。
 func createBinding(ctx context.Context, ns, name, certName, domain string,
-	mutate func(*certsv1alpha1.AliyunCertificateBinding)) *certsv1alpha1.AliyunCertificateBinding {
+	mutate func(*certsv1alpha1.AliyunCertificateBinding)) {
 	b := &certsv1alpha1.AliyunCertificateBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: certsv1alpha1.AliyunCertificateBindingSpec{
@@ -108,7 +109,6 @@ func createBinding(ctx context.Context, ns, name, certName, domain string,
 		mutate(b)
 	}
 	ExpectWithOffset(1, k8sClient.Create(ctx, b)).To(Succeed())
-	return b
 }
 
 // bindingCond 读回一个 condition；不存在时返回零值。

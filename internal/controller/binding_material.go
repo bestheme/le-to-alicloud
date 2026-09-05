@@ -72,11 +72,13 @@ func loadBindingMaterial(
 		return m, &materialError{certsv1alpha1.ReasonSecretInvalid, kerr.Error()}
 	}
 
-	// spec §12.3：未实测（FC3 对私钥编码与证书链形状的接受面未核实——CertPEM 是
-	// leaf + intermediates、无根、无空行的 LE 链，KeyPEM 是 PKCS#1/SEC1；FC3 是否要求
-	// PKCS#8、是否要求带根、是否对顺序敏感都没有实测过。猜错的失效方式是静默的：
-	// UpdateCustomDomain 直接返回一个参数类错误，被归成 Permanent），
-	// 实测结论见 test/integration/RESULTS.md
+	// spec §12.3 #1：未实测（KeyPEM 是 PKCS#1（RSA）/ SEC1（ECDSA），FC3 是否要求
+	// PKCS#8 没有实测过），实测结论见 test/integration/RESULTS.md
+	// spec §12.3 #5：未实测（CertPEM 是 leaf + intermediates、无根、无空行的 LE 链，
+	// FC3 是否要求带根、是否对顺序敏感没有实测过），实测结论见 test/integration/RESULTS.md
+	//
+	// 这两条猜错的失效方式都是静默的：UpdateCustomDomain 直接返回一个参数类错误，
+	// 被归成 Permanent，域名上仍是旧证书。
 	m = provider.CertMaterial{
 		Fingerprint: b.Fingerprint,
 		CertPEM:     b.CertPEM(),
