@@ -81,12 +81,21 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingDelete(ctx context.
 			// 状态——没有 condition、没有事件、（gauge 已按上面的理由不再刷新）没有
 			// 指标变化，运维手里一条线索都没有。
 			setBindingReadyFalse(b, certsv1alpha1.ReasonCleanupFailed, "解绑失败，重试中: "+err.Error())
-			// ready gauge 要跟着 condition 走，否则看板上这个卡死的对象仍然是绿的；
-			// applied_age 不刷，理由见 patchBindingStatus。
-			recordBindingReadiness(rd)
 			if perr := r.patchBindingStatus(ctx, rd); perr != nil {
 				return ctrl.Result{}, perr
 			}
+			// ready gauge 要跟着 condition 走，否则看板上这个卡死的对象仍然是绿的；
+			// applied_age 不刷，理由见 patchBindingStatus。
+			//
+			// **必须在 patch 成功之后**，否则会立一块永远清不掉的墓碑：对象已经被上一轮
+			// 删干净了，而 informer cache 还持有带 finalizer 的旧版本，据此再进一轮删除
+			// 分支（这一轮真实存在，见 binding_deletion_test.go 里的实测记录）；这一轮的
+			// 解绑若撞上宽限期内的瞬时云错误，先刷 gauge 就会把 ready=0 重新建出来，
+			// 紧接着 patch 以 NotFound 失败——而 clearBindingMetrics 在这条路径上再也
+			// 不会被走到。于是一个已经不存在的对象留下一条永久为 0 的告警 series，
+			// 正是 clearBindingMetrics 存在的理由被反过来违反。patch 成功了才说明对象
+			// 还在，这时刷 gauge 才有对应的清理点。
+			recordBindingReadiness(rd)
 			return ctrl.Result{}, err // 指数退避
 		}
 		// Abandon：把足以人工兜底的信息留在日志里，然后走完删除。
