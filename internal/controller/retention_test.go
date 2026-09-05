@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -168,7 +169,9 @@ var _ = Describe("证书 controller：回收时序", func() {
 				Spec: certsv1alpha1.AliyunCertificateBindingSpec{
 					CertificateRef: certsv1alpha1.LocalObjectReference{Name: "apirot"},
 					Target: certsv1alpha1.BindingTarget{Type: certsv1alpha1.TargetTypeFC3CustomDomain,
-						FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{Region: "cn-hangzhou", DomainName: bn + ".example.com"}},
+						// 域名带 namespace：TargetKey() 不含 namespace，撞名会被同目标仲裁判成 Conflict。
+						FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{
+							Region: "cn-hangzhou", DomainName: fmt.Sprintf("%s.%s.example.com", bn, ns)}},
 				},
 			})).To(Succeed())
 		}
@@ -199,15 +202,14 @@ var _ = Describe("证书 controller：回收时序", func() {
 		touch(ns, "apirot", "2")
 		Consistently(func() bool { return currentCAS().Has(*gen1.CertID) }, "1500ms", "200ms").Should(BeTrue())
 
+		// b2 也推进：三重护栏全过，gen1 已 30 天前上传 → 删
+		//
 		// 护栏 2（observedGeneration 落后 ⇒ appliedFingerprint 不可信）在这里已经无法用
 		// envtest 复现：suite 里跑着真正的绑定 reconciler，把 generation 顶上去之后它会在
 		// 毫秒级把 observedGeneration 追平，「还没 reconcile 完」是个抓不住的瞬时窗口。
 		// 该护栏由纯函数用例 TestReclaimable 的 binding(2, 1, "new") 确定性覆盖。
 		setBindingStatus(ns, "b2", gen2.Fingerprint)
-
-		// b1 也推进：三重护栏全过，gen1 已 30 天前上传 → 删
-		setBindingStatus(ns, "b1", gen2.Fingerprint)
-		touch(ns, "apirot", "4")
+		touch(ns, "apirot", "3")
 		eventually(func() bool { return !currentCAS().Has(*gen1.CertID) })
 		eventually(func() bool { return len(getAC(ctx, ns, "apirot").Status.History) == 0 })
 
@@ -218,12 +220,12 @@ var _ = Describe("证书 controller：回收时序", func() {
 		gen3 := *getAC(ctx, ns, "apirot").Status.Current
 		setBindingStatus(ns, "b1", gen3.Fingerprint)
 		setBindingStatus(ns, "b2", gen3.Fingerprint)
-		touch(ns, "apirot", "5")
+		touch(ns, "apirot", "4")
 		Consistently(func() bool { return currentCAS().Has(*gen2.CertID) }, "1500ms", "200ms").Should(BeTrue())
 
 		// 时钟越过 minAge → 删
 		advance(25 * time.Hour)
-		touch(ns, "apirot", "6")
+		touch(ns, "apirot", "5")
 		eventually(func() bool { return !currentCAS().Has(*gen2.CertID) })
 	})
 

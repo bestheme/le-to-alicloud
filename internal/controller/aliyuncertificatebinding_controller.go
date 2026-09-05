@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -195,6 +196,10 @@ func (r *AliyunCertificateBindingReconciler) SetupWithManager(mgr ctrl.Manager) 
 				if err := mgr.GetClient().List(ctx, list,
 					client.InNamespace(o.GetNamespace()),
 					client.MatchingFields{certsv1alpha1.IndexBindingByCertificate: o.GetName()}); err != nil {
+					// 这一次唤醒就此丢失，而它守的正是「续期成功却没推到线上」那条主线。
+					// DriftCheckInterval 的 requeue 会兜住，但没有这行日志，运维侧收不到任何信号。
+					logf.FromContext(ctx).Error(err, "list bindings for certificate failed",
+						"certificate", client.ObjectKeyFromObject(o))
 					return nil
 				}
 				out := make([]reconcile.Request, 0, len(list.Items))

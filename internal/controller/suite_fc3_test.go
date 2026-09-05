@@ -83,7 +83,11 @@ func createCertificate(ctx context.Context, ns, name string, dnsNames ...string)
 // namespace——两个测试文件用同一个字面量域名，先建的那个 Binding 会一直把后建的判成
 // Conflict，Applied 永远不为 True。helper 不给默认域名，就是为了逼调用方写出这一点。
 //
-//nolint:unparam // 返回值供 Task 8 起的用例读 UID / generation；骨架用例只需要副作用。
+// 这条 //nolint 是声明级的，盖住两条 unparam：返回值供 Task 8 起的用例读 UID /
+// generation；mutate 目前所有调用点都传 nil，Task 8 起才会用它改 deletionPolicy /
+// credentialsRef。两者都在后续任务里自然消解。
+//
+//nolint:unparam // 见上：返回值与 mutate 参数都由 Task 8 起使用。
 func createBinding(ctx context.Context, ns, name, certName, domain string,
 	mutate func(*certsv1alpha1.AliyunCertificateBinding)) *certsv1alpha1.AliyunCertificateBinding {
 	b := &certsv1alpha1.AliyunCertificateBinding{

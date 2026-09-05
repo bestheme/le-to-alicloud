@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -33,6 +34,8 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 	var ns string
 	BeforeEach(func() { ns = newNamespace(ctx) })
 
+	// 域名一律 <name>.<namespace>.example.com：TargetKey() 不含 namespace，跨 namespace
+	// 撞名的 fixture 会被同目标仲裁判成 Conflict。
 	newBinding := func(name string) *certsv1alpha1.AliyunCertificateBinding {
 		return &certsv1alpha1.AliyunCertificateBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -41,7 +44,7 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 				Target: certsv1alpha1.BindingTarget{
 					Type: certsv1alpha1.TargetTypeFC3CustomDomain,
 					FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{
-						Region: "cn-hangzhou", DomainName: "api.example.com",
+						Region: "cn-hangzhou", DomainName: fmt.Sprintf("%s.%s.example.com", name, ns),
 					},
 				},
 			},
@@ -54,7 +57,7 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 		got := &certsv1alpha1.AliyunCertificateBinding{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "defaults", Namespace: ns}, got)).To(Succeed())
 		Expect(got.Spec.DeletionPolicy).To(Equal(certsv1alpha1.DeletionPolicyOrphan))
-		Expect(got.TargetKey()).To(Equal("FC3CustomDomain/cn-hangzhou/api.example.com"))
+		Expect(got.TargetKey()).To(Equal(fmt.Sprintf("FC3CustomDomain/cn-hangzhou/defaults.%s.example.com", ns)))
 	})
 
 	It("拒绝 type=FC3CustomDomain 但缺少 fc3CustomDomain", func() {
@@ -67,7 +70,7 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 	It("target 不可变", func() {
 		b := newBinding("immutable")
 		Expect(k8sClient.Create(ctx, b)).To(Succeed())
-		b.Spec.Target.FC3CustomDomain.DomainName = "other.example.com"
+		b.Spec.Target.FC3CustomDomain.DomainName = fmt.Sprintf("other.%s.example.com", ns)
 		Expect(k8sClient.Update(ctx, b)).To(MatchError(ContainSubstring(
 			"spec.target: Invalid value: target 不可变，请新建 Binding")))
 	})

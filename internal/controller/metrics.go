@@ -142,15 +142,17 @@ func aliyunAPICallRecorder(service string) func(action, code string, d time.Dura
 	}
 }
 
+// b2f 把布尔折成 gauge 的 0/1。证书侧与绑定侧共用一份。
+func b2f(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
+}
+
 // recordBindingMetrics 在每次 status patch 前刷新 binding 侧 gauge。
 func recordBindingMetrics(rd *bindingRound) {
 	ns, n, p := rd.b.Namespace, rd.b.Name, rd.provider
-	b2f := func(v bool) float64 {
-		if v {
-			return 1
-		}
-		return 0
-	}
 	bindingReadyGauge.WithLabelValues(ns, n).Set(b2f(bindingCondTrue(rd.b, certsv1alpha1.ConditionReady)))
 	bindingConflictGauge.WithLabelValues(ns, n).Set(b2f(bindingCondTrue(rd.b, certsv1alpha1.ConditionConflict)))
 	bindingAppliedAge.WithLabelValues(ns, n, p).Set(rd.lag.Seconds())
@@ -166,12 +168,6 @@ func clearBindingMetrics(namespace, name, providerName string) {
 // recordCertMetrics 在每次 status patch 前刷新 gauge。
 func recordCertMetrics(ac *certsv1alpha1.AliyunCertificate) {
 	ns, n := ac.Namespace, ac.Name
-	b2f := func(b bool) float64 {
-		if b {
-			return 1
-		}
-		return 0
-	}
 	if ac.Status.Current != nil {
 		certNotAfter.WithLabelValues(ns, n).Set(float64(ac.Status.Current.NotAfter.Unix()))
 	}

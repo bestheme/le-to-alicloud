@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -245,7 +246,9 @@ var _ = Describe("证书 controller：删除", func() {
 			Spec: certsv1alpha1.AliyunCertificateBindingSpec{
 				CertificateRef: certsv1alpha1.LocalObjectReference{Name: "blocked"},
 				Target: certsv1alpha1.BindingTarget{Type: certsv1alpha1.TargetTypeFC3CustomDomain,
-					FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{Region: "cn-hangzhou", DomainName: "x.example.com"}},
+					// 域名带 namespace：TargetKey() 不含 namespace，撞名会被同目标仲裁判成 Conflict。
+					FC3CustomDomain: &certsv1alpha1.FC3CustomDomainTarget{
+						Region: "cn-hangzhou", DomainName: fmt.Sprintf("b.%s.example.com", ns)}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, b)).To(Succeed())
