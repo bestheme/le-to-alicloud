@@ -103,9 +103,8 @@ func createCertificate(ctx context.Context, ns, name string, dnsNames ...string)
 // 无返回值：全部十四份 task brief 里都没有 `x := createBinding(...)`，这个返回值是
 // 永久死的（与 createCertificate 同理）。需要读回对象的地方用 getBinding()。
 //
-// mutate 目前所有调用点都传 nil，Task 12 才会用它改 deletionPolicy / credentialsRef。
-//
-//nolint:unparam // mutate 恒为 nil，调用点由 Task 12 补上。
+// mutate 的非 nil 调用点是 binding_apply_test.go 的 ensureHTTPSProtocol 用例——
+// spec.target 是 CRD 层不可变的，那一项只能在创建时就写进去。
 func createBinding(ctx context.Context, ns, name, certName, domain string,
 	mutate func(*certsv1alpha1.AliyunCertificateBinding)) {
 	b := &certsv1alpha1.AliyunCertificateBinding{

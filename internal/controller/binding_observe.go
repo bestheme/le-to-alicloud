@@ -16,7 +16,8 @@ limitations under the License.
 
 // 本文件是 spec §6.2 步骤 5（Observe）的落点：幂等短路的判据、账号 fencing、
 // 漂移检测，以及这一步的失败处置与事件规则。从 aliyuncertificatebinding_controller.go
-// 原样搬出，行为零变化——那个文件已经是包里最大的一个，而 Apply 与删除两步还要往上加。
+// 原样搬出，行为零变化——那个文件已经是包里最大的一个，而 Apply 与删除两步还要往上加
+// （Apply 已落在 binding_apply.go，setApplied 与四条事件文案随它一并搬了过去）。
 // 状态机主干（Reconcile / reconcileBindingReady）留在原处。
 
 package controller
@@ -33,18 +34,6 @@ import (
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
-)
-
-// 事件文案。spec §10.2 要求 Message 不含变量——K8s 只聚合 Reason+Message 完全相同的
-// 事件，带上域名或指纹就等于每个对象各刷一条，很快把 etcd 里的事件淹掉。变量只进日志。
-//
-// applyFailedMessage 的调用点是 Task 12 的 handleApplyError；四条文案在这里一次定死，
-// 是为了让「事件 Message 不含变量」这条约束有一处集中的落点，而不是散在各分支里。
-const (
-	observeFailedMessage  = "failed to observe the binding target; the applied state is unchanged"
-	driftCorrectedMessage = "target certificate was changed outside the operator; re-applying"
-	appliedMessage        = "certificate applied to the binding target"
-	applyFailedMessage    = "failed to apply the certificate to the binding target"
 )
 
 // protocolSatisfied 判断当前 protocol 是否已经满足 ensureHTTPSProtocol 的要求。
@@ -218,22 +207,4 @@ func (r *AliyunCertificateBindingReconciler) noteDrift(
 		"domain", targetIdentifier(rd.b),
 		"observed", shortFP(cur), "expected", shortFP(m.Fingerprint))
 	r.Recorder.Event(rd.b, corev1.EventTypeWarning, certsv1alpha1.ReasonDriftCorrected, driftCorrectedMessage)
-}
-
-// setApplied 置 Applied=True，并只在状态跃迁时发一次 Normal 事件。
-//
-// 每轮都发会让一个健康的 Binding 每小时刷一条事件；只在 False→True 时发，事件流才
-// 真正对应「发生了什么」。
-//
-// 无条件重写 reason（meta.SetStatusCondition 即使 status 不变也会更新 Reason/Message），
-// 这正是 noteObserveFailed 的反方向：上一轮把 reason 改成了 ObserveFailed 而 status
-// 留在 True，观测一旦恢复就必须写回 Applied，否则那个诊断痕迹会永久留在一个健康对象上。
-func (r *AliyunCertificateBindingReconciler) setApplied(ctx context.Context, rd *bindingRound) {
-	was := bindingCondTrue(rd.b, certsv1alpha1.ConditionApplied)
-	setBindingCondition(rd.b, certsv1alpha1.ConditionApplied, metav1.ConditionTrue, certsv1alpha1.ReasonApplied, "")
-	if !was {
-		logf.FromContext(ctx).Info("证书已在目标上生效",
-			"domain", targetIdentifier(rd.b), "fingerprint", shortFP(rd.b.Status.AppliedFingerprint))
-		r.Recorder.Event(rd.b, corev1.EventTypeNormal, certsv1alpha1.ReasonApplied, appliedMessage)
-	}
 }

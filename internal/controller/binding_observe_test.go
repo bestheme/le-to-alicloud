@@ -112,10 +112,9 @@ var _ = Describe("绑定 controller：Observe", func() {
 		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 	})
 
-	// PIt：本用例要先有一次成功的 Apply（issueAndBind 等的是 Applied=True），而 Apply
-	// 落在 Task 12。用例体逐字保留，Task 12 把 PIt 改回 It 即可——验收项是
-	// `grep -n "PIt" internal/controller/binding_observe_test.go` 为空。
-	PIt("指纹一致时短路：不写云，但仍然 Observe", func() {
+	// 本用例要先有一次成功的 Apply（issueAndBind 等的是 Applied=True）。Task 11 交付时
+	// Apply 还不存在，所以它连同下面三个用例一起是待定状态；Task 12 补上写入之后转正。
+	It("指纹一致时短路：不写云，但仍然 Observe", func() {
 		ns := newNamespace(ctx)
 		domain := fmt.Sprintf("b2.%s.example.com", ns)
 		issueAndBind(ctx, ns, "c2", "b2", domain, "HTTP")
@@ -135,8 +134,8 @@ var _ = Describe("绑定 controller：Observe", func() {
 		Expect(getBinding(ctx, ns, "b2").Status.LastObservedTime).NotTo(BeNil())
 	})
 
-	// PIt：同上，Task 12 解除。
-	PIt("账号变了就 fencing：Conflict=True/AccountMismatch 且不写", func() {
+	// 同上：Task 12 补上 Apply 之后解除。
+	It("账号变了就 fencing：Conflict=True/AccountMismatch 且不写", func() {
 		ns := newNamespace(ctx)
 		domain := fmt.Sprintf("b3.%s.example.com", ns)
 		issueAndBind(ctx, ns, "c3", "b3", domain, "HTTPS")
@@ -159,8 +158,8 @@ var _ = Describe("绑定 controller：Observe", func() {
 		Expect(currentFC3().UpdateCallsFor(domain)).To(Equal(writes))
 	})
 
-	// PIt：同上，Task 12 解除。
-	PIt("云侧被人换了证书时判定为 drift 并纠正", func() {
+	// 同上：Task 12 补上 Apply 之后解除。
+	It("云侧被人换了证书时判定为 drift 并纠正", func() {
 		ns := newNamespace(ctx)
 		domain := fmt.Sprintf("b4.%s.example.com", ns)
 		// 真实的漂移场景发生在一个已经在跑 HTTPS 的域名上；顺带钉住 read-modify-write
@@ -193,8 +192,8 @@ var _ = Describe("绑定 controller：Observe", func() {
 		Expect(d2.CertName).NotTo(Equal("someone-elses"))
 	})
 
-	// PIt：同上，Task 12 解除。
-	PIt("Observe 未知失败属于旁路：不降级 Applied", func() {
+	// 同上：Task 12 补上 Apply 之后解除。
+	It("Observe 未知失败属于旁路：不降级 Applied", func() {
 		ns := newNamespace(ctx)
 		issueAndBind(ctx, ns, "c5", "b5", fmt.Sprintf("b5.%s.example.com", ns), "HTTP")
 
@@ -213,12 +212,11 @@ var _ = Describe("绑定 controller：Observe", func() {
 		}, "2s", "200ms").Should(Equal(metav1.ConditionTrue))
 	})
 
-	// 上面四个 PIt 全都要先有一次成功的 Apply 才能起步，于是本任务自己产出的三条逻辑
-	// （短路、fencing、旁路失败不降级）在 Task 12 之前一行都跑不到。下面三个用例走
-	// **接管**这条路进同一批状态：云上本来就装着同一张证书，Observe 一比对指纹就短路，
-	// Applied=True 完全不经过 Apply。它们因此今天就是活的，而且顺带覆盖了 PIt 那几个
-	// 用例覆盖不到的东西——「首次接管」正是 appliedFingerprint / boundAccountId 由空
-	// 变成有值的那一刻。
+	// 上面四个用例全都要先有一次成功的 Apply 才能起步（Task 11 交付时因此是待定的）。
+	// 下面三个用例走**接管**这条路进同一批状态：云上本来就装着同一张证书，Observe 一
+	// 比对指纹就短路，Applied=True 完全不经过 Apply。它们因此在 Task 11 当天就是活的，
+	// 而且顺带覆盖了上面那几个用例覆盖不到的东西——「首次接管」正是 appliedFingerprint
+	// / boundAccountId 由空变成有值的那一刻。
 	It("目标上已经是同一张证书：短路接管，一个字节都不写", func() {
 		ns := newNamespace(ctx)
 		domain := fmt.Sprintf("b6.%s.example.com", ns)
@@ -470,7 +468,8 @@ var _ = Describe("绑定 controller：Observe", func() {
 		simulateIssuance(ctx, ns, "c9", 1, certPEM, keyPEM)
 		createBinding(ctx, ns, "b9", "c9", domain, nil)
 
-		// 纠正那一步要等 Task 12 的 Apply；本任务只保证「检测到了」。
+		// 这里只钉「检测到了」这一半；纠正那一半由上面的 drift 用例断言（它从一个
+		// 已经 Applied 的对象出发，能区分「重写了一次」和「本来就没写过」）。
 		eventually(func() bool {
 			return promtestutil.ToFloat64(
 				bindingDriftTotal.WithLabelValues(certsv1alpha1.TargetTypeFC3CustomDomain)) > before

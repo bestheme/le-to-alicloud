@@ -79,8 +79,8 @@ func (r *AliyunCertificateBindingReconciler) SetNow(fn func() time.Time) {
 	r.Now = fn
 }
 
-// now 与 SetNow 成对：只留 SetNow 会让时钟注入点只写不读。读取点是 appliedLag
-// （binding_status.go），Task 11 的 lastAppliedTime 会再加一个。
+// now 与 SetNow 成对：只留 SetNow 会让时钟注入点只写不读。读取点有三处：appliedLag
+// （binding_status.go）、status.lastObservedTime 与 status.lastAppliedTime。
 func (r *AliyunCertificateBindingReconciler) now() time.Time {
 	r.mu.RLock()
 	fn := r.Now
@@ -155,7 +155,9 @@ func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req 
 	return r.reconcileBindingReady(ctx, rd, ac)
 }
 
-// reconcileBindingReady 处理证书可用之后的步骤 2–8。Task 10–12 逐步填充剩下的步骤。
+// reconcileBindingReady 处理证书可用之后的步骤 2–8：仲裁 → 装载材料 → 造 client →
+// Observe → Apply → 固化状态 → 聚合 Ready。每一步的细节分别在 binding_conflict.go、
+// binding_material.go、provider_factory.go、binding_observe.go、binding_apply.go。
 func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 	ctx context.Context, rd *bindingRound, ac *certsv1alpha1.AliyunCertificate,
 ) (ctrl.Result, error) {
@@ -253,6 +255,35 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 
 	r.noteDrift(ctx, rd, obs, m)
 
+	// 6. Apply（spec §6.2 步骤 6）
+	aerr := p.Apply(ctx, tg, cl, m, provider.ApplyOptions{
+		EnsureHTTPSProtocol: ensureHTTPS,
+		PreviousFingerprint: b.Status.AppliedFingerprint,
+	})
+	bindingApplyTotal.WithLabelValues(rd.provider, bindingApplyResult(aerr)).Inc()
+	if aerr != nil {
+		return r.handleApplyError(ctx, rd, aerr)
+	}
+
+	// 7. 固化状态
+	now := r.now()
+	b.Status.AppliedFingerprint = m.Fingerprint
+	b.Status.LastAppliedTime = &metav1.Time{Time: now}
+	if b.Status.BoundAccountID == "" && obs.AccountID != "" {
+		// 首次成功写入才固化账号：写成功证明这个账号确实是我们该写的那个。
+		//
+		// obs.AccountID != "" 这道守卫与短路分支的那一道是同一条不变量：boundAccountId
+		// 只许从**非空**观测里记下来。fenceAccount 是失败关闭的（非空 bound 撞上空观测
+		// 一样拦下），它敢这么做的全部依据就是「bound 非空 ⇒ provider 至少报出过一次
+		// 真实账号」。这里记下一个空账号，闸门就再也打不开了——不过 bound 为空时
+		// fenceAccount 本来就放行，所以写空值只是白占一个字段；真正的代价在于它会把
+		// 那条不变量变成假的，让 fail-closed 的推理失去依据。
+		b.Status.BoundAccountID = obs.AccountID
+	}
+	rd.lag = 0
+	r.setApplied(ctx, rd)
+
+	// 8. Ready = Applied && !Conflict
 	aggregateBindingReady(b)
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 }

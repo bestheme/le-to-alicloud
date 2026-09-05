@@ -84,9 +84,14 @@ var _ = Describe("绑定 controller：证书材料", func() {
 		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
 		createBinding(ctx, ns, "b1", "c1", domain, nil)
+		// 先等它真的绑成功再拆台。Task 12 之前这里等的是「Ready 有了 reason」，而那时
+		// Apply 还不存在，云上永远是零次写入，下面那条 BeZero() 因此恒真——一条空断言。
+		// 现在从一个**已经写过一次**的稳定态出发，再记下基线，断言才回到它本来的意思：
+		// 材料读不出来的那一轮，一个字节都不许再写。
 		eventually(func() bool {
-			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady).Reason != ""
+			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
 		})
+		writesBefore := currentFC3().UpdateCallsFor(domain)
 
 		s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "c1-tls"}}
 		Expect(k8sClient.Delete(ctx, s)).To(Succeed())
@@ -100,7 +105,8 @@ var _ = Describe("绑定 controller：证书材料", func() {
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonCertificateNotReady
 		})
 		// 材料读不出来就一个字节都不写：这才是这条路径真正要守住的东西。
-		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
+		Consistently(func() int { return currentFC3().UpdateCallsFor(domain) },
+			"2s", "200ms").Should(Equal(writesBefore))
 		// 证书 controller 的判定与绑定侧的 reason 同源，钉住上面那段推理。
 		Expect(condReason(getAC(ctx, ns, "c1"), certsv1alpha1.ConditionIssued)).
 			To(Equal(certsv1alpha1.ReasonSecretNotFound))
