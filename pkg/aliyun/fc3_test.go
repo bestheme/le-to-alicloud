@@ -2,6 +2,7 @@ package aliyun_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,14 +15,40 @@ const fakeKeyPEM = "-----BEGIN RSA PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n---
 // 私钥泄漏的真实通道是结构化日志：zap 对未知类型走反射 JSON 编码，导出字段会被原样写出。
 // 这三个用例分别堵住 %v / %#v / json.Marshal 三条路，值与指针两种形态都覆盖。
 func TestCertConfig_StringRedactsKey(t *testing.T) {
-	cc := aliyun.CertConfig{CertName: "n", CertPEM: []byte("CERT"), KeyPEM: []byte(fakeKeyPEM)}
+	// certName 必须取一个区分度足够的值：用单字符 "n" 时，格式串里的 "aliyun." 就已经
+	// 含有它，断言即使在 String() 完全丢掉 CertName 的情况下也会通过，等于没测。
+	cc := aliyun.CertConfig{CertName: "cert-abc123", CertPEM: []byte("CERT"), KeyPEM: []byte(fakeKeyPEM)}
 	for _, s := range []string{cc.String(), cc.GoString()} {
 		if strings.Contains(s, "SUPERSECRET") {
 			t.Fatalf("私钥出现在格式化输出里: %s", s)
 		}
-		if !strings.Contains(s, "n") {
+		if !strings.Contains(s, "cert-abc123") {
 			t.Errorf("应保留 certName: %s", s)
 		}
+	}
+}
+
+// CustomDomain 自己没有任何方法，Echo.Payload 又是 any：%v / %#v / json.Marshal 三条路
+// 都会走反射钻进去，把 payload 里的东西原样打出来。挡住它的必须是 DomainEcho 自己的
+// 脱敏方法，而不是「别往 Payload 里塞 certConfig」这句注释——注释拦不住下一个作者。
+func TestCustomDomain_RedactsEchoPayload(t *testing.T) {
+	cd := aliyun.CustomDomain{
+		DomainName: "d.example.com",
+		Echo: aliyun.DomainEcho{Payload: map[string]any{
+			"certConfig": map[string]any{"privateKey": fakeKeyPEM},
+		}},
+	}
+	b, err := json.Marshal(cd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{fmt.Sprintf("%v", cd), fmt.Sprintf("%#v", cd), string(b)} {
+		if strings.Contains(s, "SUPERSECRET") {
+			t.Fatalf("Echo.Payload 里的私钥经反射逃逸: %s", s)
+		}
+	}
+	if !strings.Contains(string(b), "d.example.com") {
+		t.Errorf("domainName 应保留: %s", b)
 	}
 }
 

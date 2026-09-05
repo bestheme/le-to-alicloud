@@ -9,11 +9,18 @@ import (
 // redactedKey 是私钥在任何格式化输出里的占位符。
 const redactedKey = "<redacted>"
 
+// echoOpaque 是 DomainEcho 载荷在任何格式化输出里的占位符。
+const echoOpaque = "<opaque>"
+
 // CertConfig 是要写入 FC3 自定义域名的证书。
 //
-// KeyPEM 是明文私钥。它必须能被序列化进 HTTP 请求体，又绝不能进日志 / 事件 / status；
+// KeyPEM 是明文私钥。它必须能被送进 HTTP 请求体，又绝不能进日志 / 事件 / status；
 // 下面三个方法就是这条约束的护栏，与 pki.Bundle 用的是同一套手法（值接收者，让值与
 // 指针两种形态都被覆盖）。
+//
+// **注意**：MarshalJSON 是一个脱敏投影，不是线上格式——它输出的是 `key=<redacted>`。
+// 绝不能用 json.Marshal(certConfig) 去拼 FC3 的请求体，那样发上云的会是占位符而不是私钥。
+// 构造写入体时必须从 CertPEM / KeyPEM 逐字段取值填进 SDK 的结构体。
 type CertConfig struct {
 	CertName string
 	CertPEM  []byte
@@ -43,9 +50,20 @@ func (c CertConfig) MarshalJSON() ([]byte, error) { return json.Marshal(c.redact
 // Payload 只由构造它的 client 解释：真实 client 放 SDK 的写入体，fake 放一个标记值。
 // 其它任何代码都不许读它——这既让 fake 能断言「回填没丢」，也保证证书配置永远不会
 // 混进回填体（私钥因此不可能从这条路径逃逸）。
+// 既然没有任何代码许可读 Payload，它在格式化输出里也就没有任何该露面的理由。下面三个
+// 方法把它整体折叠成一个占位符——这不是提醒，是编译期就生效的护栏：CustomDomain 自己
+// 没有方法，%v / %#v / json.Marshal 都会走反射钻进 Payload；而 fmt 在 depth>0 处会调用
+// 嵌套字段的 Stringer / GoStringer，encoding/json 也会认嵌套的 Marshaler，所以这一处
+// 同时堵死了 CustomDomain 与 UpdateCustomDomainInput 两条路。
 type DomainEcho struct {
 	Payload any
 }
+
+func (e DomainEcho) String() string { return "aliyun.DomainEcho{" + echoOpaque + "}" }
+
+func (e DomainEcho) GoString() string { return e.String() }
+
+func (e DomainEcho) MarshalJSON() ([]byte, error) { return json.Marshal(echoOpaque) }
 
 // CustomDomain 是 GetCustomDomain 响应的裁剪。**私钥已在构造时丢弃**，本结构体不含它。
 type CustomDomain struct {
