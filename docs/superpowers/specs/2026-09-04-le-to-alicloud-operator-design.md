@@ -50,13 +50,13 @@
 
 | 事实 | 来源 |
 |---|---|
-| `UploadUserCertificate(Name, Cert, Key, ClientToken, ResourceGroupId)` 返回 `CertId`；**同账号内 `Name` 唯一**，≤ 63 字符，文档描述字符集为「字母、数字、下划线」（**未提及 `-` 和 `.`**）；QPS 100。 | [UploadUserCertificate](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-uploadusercertificate) |
+| `UploadUserCertificate(Name, Cert, Key, ClientToken, ResourceGroupId)` 返回 `CertId`；**同账号内 `Name` 唯一**，≤ 63 字符，文档描述字符集为「字母、数字、下划线」（**未提及 `-` 和 `.`**）；QPS 100。**实测（2026-09-05, cn-hangzhou，§12.3 #4）：`-` 与 `.` 都接受，且云上原样保存、不做归一化**（回查列举里的名字与提交值逐字相同），因此 `findByName` 可以按提交的名字精确比对。**实测（2026-09-05, cn-hangzhou，§12.3 #13）：同名冲突返回 `NameRepeat`（Permanent）**——不在 Plan 1 猜的三个候选码里，已追加进 `internal/controller/upload.go` 的 `isDuplicateName`。**实测（2026-09-05, cn-hangzhou，§12.3 #3）：`ClientToken` 不做上传幂等**——同 token、同 Name 重传同样报 `NameRepeat`，而不是回放首次的 `CertId`。 | [UploadUserCertificate](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-uploadusercertificate)；实测见 `test/integration/RESULTS.md` #3 / #4 / #13 |
 | `DeleteUserCertificate(CertId, ClientToken)`；QPS 100。 | [DeleteUserCertificate](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-deleteusercertificate) |
-| `ListUserCertificateOrder` 的 `Keyword` **只匹配域名或资源 ID，不匹配证书 `Name`**；`OrderType=UPLOAD` 时返回项含 `CertificateId`、`Name`、`Sans`、`EndDate`（`YYYY-MM-DD`）等；**QPS 仅 10**。 | [ListUserCertificateOrder](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-listusercertificateorder) |
+| `ListUserCertificateOrder` 的 `Keyword` **只匹配域名或资源 ID，不匹配证书 `Name`**；`OrderType=UPLOAD` 时返回项含 `CertificateId`、`Name`、`Sans`、`EndDate`（`YYYY-MM-DD`）等；**QPS 仅 10**。**实测（2026-09-05, cn-hangzhou，§12.3 #12）：`Keyword` 对证书域名做任意子串匹配，且不做 DNS 通配符展开**——SAN 为 `*.it.integration.invalid` 的证书，用 `*.it.integration.invalid` / `it.integration.invalid` / `integration` / 甚至非标签边界的 `ntegratio` 都能查到，而通配符本应覆盖的 `probe.it.integration.invalid` 查不到。**实测（2026-09-05, cn-hangzhou，§12.3 #8）：`Status` 留空的列举不含已过期证书**；配了 `ResourceGroupId` 时仅限该资源组。 | [ListUserCertificateOrder](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-listusercertificateorder)；实测见 `test/integration/RESULTS.md` #8 / #12 |
 | `GetUserCertificateDetail` **会返回私钥**。本设计不使用、不授权。 | [GetUserCertificateDetail](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-getusercertificatedetail) |
 | CAS 拒绝删除已部署到阿里云产品的证书；FC3 使用内联 PEM，CAS 侧不视为「已部署」。 | [吊销和删除证书](https://help.aliyun.com/zh/ssl-certificate/revoke-and-delete-a-certificate) |
 | **RAM code 为 `yundun-cert`，不是 `cas`**。全部 action 的资源类型为「全部资源」，**无法资源级收窄**。 | [CAS RAM](https://help.aliyun.com/zh/ssl-certificate/developer-reference/api-cas-2020-04-07-ram) |
-| **仅支持 PEM 编码**（「数字证书管理服务仅支持上传PEM格式编码（.pem和.crt后缀）的证书文件」）。证书链顺序：服务器证书 → 中间证书 → 根证书。私钥接受 `-----BEGIN RSA PRIVATE KEY-----`（PKCS#1）与 `-----BEGIN EC PRIVATE KEY-----`；**加密私钥被拒绝**（需 `openssl rsa -in encrypted.key -out decrypted.key` 解密）。证书与私钥不匹配时报「证书与私钥不匹配」。控制台的格式转换工具把「PFX、JKS、PKCS8」转为 PEM——暗示 PKCS#8 不是 CAS 的原生期望格式。 | [上传 SSL 证书](https://help.aliyun.com/zh/ssl-certificate/user-guide/upload-an-ssl-certificate) |
+| **仅支持 PEM 编码**（「数字证书管理服务仅支持上传PEM格式编码（.pem和.crt后缀）的证书文件」）。证书链顺序：服务器证书 → 中间证书 → 根证书。私钥接受 `-----BEGIN RSA PRIVATE KEY-----`（PKCS#1）与 `-----BEGIN EC PRIVATE KEY-----`；**加密私钥被拒绝**（需 `openssl rsa -in encrypted.key -out decrypted.key` 解密）。证书与私钥不匹配时报「证书与私钥不匹配」。控制台的格式转换工具把「PFX、JKS、PKCS8」转为 PEM——暗示 PKCS#8 不是 CAS 的原生期望格式。**实测（2026-09-05, cn-hangzhou，§12.3 #1）：PKCS#1 RSA、SEC1 EC、PKCS#8 三种未加密编码 CAS 一律接受**（各自上传成功）——控制台提供 PKCS#8 转换工具，不等于 API 会拒绝 PKCS#8；带 `Proc-Type: 4,ENCRYPTED` 头的私钥块被拒，错误码 `PrivateKeyFormatException`（Permanent）——即 CAS 报的是**格式**错误而非配对错误，格式校验先于配对校验。（这一条只说明「带 ENCRYPTED 头的块被拒」，**不**说明 CAS 能解析并拒绝一个格式良好的加密私钥；FC3 侧未测。）**实测（2026-09-05, cn-hangzhou，§12.3 #5）：leaf + 其签发 CA（两块）接受，仅 leaf 也接受**，故不要求带根；把 CA 放在 leaf 前面**被拒**（`NotMatch.CertificateAndPrivateKey`，Permanent），即顺序敏感、leaf 必须在首位。这两条合起来说明 LE 的「leaf + intermediate、无 root」形状在 CAS 可用。FC3 侧未测。 | [上传 SSL 证书](https://help.aliyun.com/zh/ssl-certificate/user-guide/upload-an-ssl-certificate)；实测见 `test/integration/RESULTS.md` #1 / #5 |
 | 阿里云统一的 PEM 规范（CDN 文档）：「将服务器证书放在第一位，中间证书放在第二位，证书之间不能有空行」；每行 64 字符；PKCS#8 私钥须用 `openssl rsa -in old.pem -out new.pem` 转为 PKCS#1；密钥长度建议 ≥ 2048。 | [CDN 证书格式](https://help.aliyun.com/zh/cdn/user-guide/certificate-formats) |
 
 ### 2.3 cert-manager
@@ -82,7 +82,9 @@
 
 ### 2.5 未核实项（必测）
 
-见 §12.3。
+见 §12.3。**截至 2026-09-05 的进度**：CAS 侧的 #1 / #3 / #4 / #5 / #9 / #12 / #13 已核实（依据 `test/integration/RESULTS.md`），
+#8 部分核实（列举语义已定，配额上限未测）；cert-manager 侧的 #6 / #7 / #11 与 FC3 侧的 #2 / #10 / #14
+（以及 #1 / #5 的 FC3 那一半）**仍未核实**，原因逐条写在 §12.3 对应行——**不要把它们当成已核实**。
 
 ---
 
@@ -744,7 +746,11 @@ Reason+Message 完全相同的事件）。下表是证书 controller 实际发�
 两条独立告警，缺一不可：
 
 - `aliyuncert_certificate_not_after_timestamp_seconds - time() < 7*86400`（证书即将过期）
-- `aliyuncert_binding_applied_age_seconds > 86400 and on(namespace,name) aliyuncert_certificate_ready == 1`（证书更新了但线上没跟上）。按滞后语义，该式子表示「证书已推进超过一天而线上仍是旧代」——同步完成时该指标归 0，因此不会对健康证书误报。
+- `aliyuncert_binding_applied_age_seconds > 86400`（证书更新了但线上没跟上）。按滞后语义，该式子表示「证书已推进超过一天而线上仍是旧代」——同步完成时该指标归 0，因此不会对健康证书误报。
+
+  **原式子里的 `and on (namespace, name) aliyuncert_certificate_ready == 1` 守卫已去掉**（Ruling P3-R42，`config/prometheus/prometheusrule.yaml` 为准）。理由：两个指标的 `namespace` / `name` 指的不是同一个对象——`aliyuncert_binding_applied_age_seconds` 打的是 **Binding** 的 namespace/name，`aliyuncert_certificate_ready` 打的是 **AliyunCertificate** 的（见 `internal/controller/metrics.go`）。本仓库自带样例就是 Certificate `timehorse-api` 配 Binding `timehorse-api-fc3`，`on (namespace, name)` 根本匹配不上，整条表达式**恒为空**，这条本节点名必配的告警会静默失效。
+
+  去掉守卫是安全的：它本来就是冗余而非承重。`appliedLag`（`internal/controller/binding_status.go:139-141`）在证书 `status.current` 为 nil 或 `fingerprint` 为空时直接返回 0，未签发的证书产生不了非零 lag。更完备的做法是给 `bindingAppliedAge` 加一个 `certificate` label 再用 `group_left` 关联回 `aliyuncert_certificate_ready`，那要改 `metrics.go`，尚未做。**不要因为「少了个守卫」把 `on (namespace, name)` 加回来**——那会让这条告警重新变成恒空。
 
 以及 `increase(aliyuncert_certmanager_certificate_recreated_total[1d]) > 0`、`increase(aliyuncert_cleanup_abandoned_total[1d]) > 0`。
 
@@ -812,7 +818,7 @@ type FC3Client interface {
 | # | 待核实 | 影响 |
 |---|---|---|
 | 1 | ~~CAS 对 PKCS#1 / PKCS#8 / `EC PRIVATE KEY` 私钥的接受情况~~ **CAS 侧已核实**：PKCS#1 RSA、SEC1 EC、PKCS#8 三种未加密编码**一律接受**（各自上传成功）；带 `Proc-Type: 4,ENCRYPTED` 头的私钥块被拒，错误码 `PrivateKeyFormatException`（Permanent）——CAS 报的是格式错误而非配对错误。**FC3 侧未测**（`CertConfig.privateKey` 的接受情况由 FC3 探针补测，仍记在本行下） | 决定 6 的默认编码；`privateKey.encoding: PKCS8` 是否要在 CRD 层直接拒绝。CAS 侧已确定三种编码都不需要转换 |
-| 2 | `UpdateCustomDomain` 全量替换 vs 部分合并（构造含 routeConfig+wafConfig+tlsConfig 的域名，只提交 certConfig） | read-modify-write 两种语义下都安全，但决定 last-write-wins 风险大小 |
+| 2 | `UpdateCustomDomain` 全量替换 vs 部分合并（构造含 routeConfig+wafConfig+tlsConfig 的域名，只提交 certConfig）。**仍未核实**：探针已写好（`test/integration/fc3_test.go`），但它需要一个可被改写 `certConfig` 的 `FC3_TEST_DOMAIN`，上一轮执行时没有配 | read-modify-write 两种语义下都安全（§6.3 走的就是 read-modify-write），所以这一行不阻塞实现，只决定 last-write-wins 的风险大小 |
 | 3 | ~~CAS `ClientToken` 语义（同 token 重复上传返回同 certId？报错？有效期？）~~ **已核实**：`ClientToken` **不做上传幂等**——同 token、同 Name 重传直接报 `NameRepeat`（Permanent），而不是回放首次的 certId | write-ahead 幂等能否落地；结论见 `test/integration/RESULTS.md`。既然不幂等，write-ahead 的崩溃恢复 100% 依赖 `isDuplicateName` → `findByName` 认领既有 certId 这条路径 |
 | 4 | ~~CAS `Name` 是否接受 `-` / `.`~~ **已核实**：两者都**接受**，且**原样保存、不做归一化**（回查云上存的名字与提交值逐字相同） | 命名 sanitize 规则；`findByName` 可以按提交的名字精确比对，无需考虑云侧改名 |
 | 5 | ~~LE 链（leaf + intermediate，无 root）FC3 与 CAS 是否都接受、是否要求带根证书、顺序是否敏感~~ **CAS 侧已核实**：leaf + 其签发 CA（两块）**接受**，**仅 leaf 也接受**（故不要求带根）；把 CA 放在 leaf 前面**被拒**（`NotMatch.CertificateAndPrivateKey`，Permanent）——**顺序敏感，leaf 必须在首位**。这两条合起来说明 LE 的「leaf + intermediate、无 root」形状在 CAS 可用。**FC3 侧未测**（由 FC3 探针补测，仍记在本行下） | §5.4 第 7 条 PEM 规范化的输出形状：只需保证 leaf 在首位，不需要补根 |
@@ -820,11 +826,13 @@ type FC3Client interface {
 | 7 | Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision` | 不缓存 Secret 决定的盲区大小。**仍未核实**：同 #6，集群上无 cert-manager |
 | 8 | ~~CAS 单账号上传证书数量配额~~ **部分核实**：空 `Keyword` 列举当前返回 **0 张**已上传证书（`Status` 留空的列举**不含已过期证书**；配了 `ALIYUN_RESOURCE_GROUP_ID` 时**仅限该资源组**）。**配额上限本身未实测**——撞上限会污染账号，需在控制台「数字证书管理服务 → 证书管理 → 上传证书」页核对账号总量与上限 | `cleanup_abandoned_total` 是否必须配告警。列举语义已定：存在性探测按 Name 客户端过滤时要意识到过期证书不在默认结果里 |
 | 9 | ~~CAS endpoint 是否 region 化~~ **已核实**（Go SDK v4 内置 `EndpointMap`）：全部中国区域及 `eu-west-1` / `us-east-1` / `us-west-1` 映射到同一个 `cas.aliyuncs.com`；`ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `me-central-1` / `ap-south-1` / `me-east-1` 各有独立 endpoint（`cas.<region>.aliyuncs.com`）。结论：CAS **部分 region 化**，`casRegion` 字段保留；实现上把 `casRegion` 作为 SDK `RegionId` 传入，由 SDK 的 `EndpointRule=regional` 自动选 endpoint，`endpointOverride` 非空时直接覆盖。**跨 endpoint 可见性也已核实**：两个 endpoint 的证书集合**互相隔离（双向验证）**——同一份 PEM 在 `cn-hangzhou` 与 `ap-southeast-1` 分别上传得到两个不在同一量级的 certId，各自在对方的列举里都看不见，是**两套独立的 ID 空间**而非复制延迟 | `casRegion` 语义已定。隔离意味着 `casRegion` 一旦改变，`status.current.certId` 在新 endpoint 上必然查不到，存在性探测会重新上传一次——这是预期行为，不是 bug |
-| 10 | FC3 API 账号级频控阈值与 Throttling 错误码，**特别是错误码是否以 `Throttling` 开头** | drift 1h 在数百 Binding 下是否安全；错误分类表。不以 `Throttling` 开头则 `aliyun.Classify` 会把限流判成不可重试，退避逻辑失效 |
+| 10 | FC3 API 账号级频控阈值与 Throttling 错误码，**特别是错误码是否以 `Throttling` 开头**。**仍未核实**：阈值**刻意不测**——触发账号级频控只能对真实云连续打满请求，会波及同账号的其它调用，违反探针「不污染账号」的纪律；且 `pkg/aliyun` 的 `LimitFC3` 是 5 QPS / burst 1 的客户端限流，探针先被自己限住，摸不到云侧阈值。错误码这一半留给只读探针偶遇限流时顺带记录，上一轮未偶遇 | drift 1h 在数百 Binding 下是否安全；错误分类表。不以 `Throttling` 开头则 `aliyun.Classify` 会把限流判成不可重试，退避逻辑失效 |
 | 11 | cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在 | `SecretNameConflict` 判定依据。**仍未核实**：同 #6，集群上无 cert-manager |
 | 12 | ~~CAS `Keyword` 对通配符域名（`*.example.com`）的匹配行为~~ **已核实**：`Keyword` 对证书域名字符串做**任意子串匹配**，且**不做 DNS 通配符展开**。SAN 为 `*.it.integration.invalid` 的证书，用 `*.it.integration.invalid`、`it.integration.invalid`、`integration`、甚至非标签边界的 `ntegratio` 都能查到，而通配符本应覆盖的 `probe.it.integration.invalid` **查不到**。这同时排除了 DNS 通配符语义、后缀匹配、前缀匹配、按标签对齐的包含四种候选规则 | 通配符证书的首个 SAN 会被原样当 Keyword 传给 `ListUserCertificateOrder`；匹配不到就会让存在性探测持续误判「证书丢了」并反复重传。结论是安全的：原样传 SAN 一定能命中自己 |
 | 13 | ~~CAS 同名不同 `ClientToken` 上传返回的真实错误码~~ **已核实**：`NameRepeat`（Permanent）。**不在**生产代码原先猜的三个候选码里，已追加进 `internal/controller/upload.go` 的 `isDuplicateName` | 认错则 `DuplicateName → findByName` 的认领路径失效，write-ahead 崩溃恢复会退化成反复失败的上传 |
-| 14 | FC3 `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。认不出时需补 `pkg/aliyun/errors.go` 的 `classifyCode` |
+| 14 | FC3 `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态。**仍未核实**：探针已写好并带四重守卫；上一轮执行时凭证子账号只有 CAS 权限，`GetCustomDomain` 返回 `AccessDenied`（`class=Auth`），守卫二据此判为「鉴权失败而非域名不存在」并记成未实测，因此 `pkg/aliyun/errors.go` 的 `classifyCode` **未做任何条件性修改**。给子账号授予 `fc:GetCustomDomain`（资源可用 `custom-domains/*`）后重跑本用例即可落结论 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。认不出时需补 `pkg/aliyun/errors.go` 的 `classifyCode` |
+
+**注意 `RESULTS.md` 目前没有 FC3 侧的行**：该文件最后一次由 `make test-integration` 生成，早于 FC3 探针（`test/integration/fc3_test.go`）落地，所以 #2 / #10 / #14 以及 #1 / #5 的 FC3 一半，上表写的「仍未核实」与其原因依据的是**探针代码本身的跳过条件与上一轮执行记录**，不是 `RESULTS.md`。下一次在有 FC3 权限的凭证下跑 `make test-integration`，这些行会连同原因一起进 `RESULTS.md`。
 
 **FC3 侧的三项探测分别归到哪一行**（刻意不新开编号——同一个问题两个编号会让 `RESULTS.md` 的回填对不上）：`GetCustomDomain` 对不存在域名的错误码归 **#14**（新增）；限流错误码是否以 `Throttling` 开头归 **#10**（既有行，措辞已补全）；`CertConfig` 对 PKCS#1 / EC 私钥的接受情况归 **#1**、对 LE 链形状（leaf+intermediate、仅 leaf）的接受情况归 **#5**（两行本来就写的是「FC3 与 CAS 各自 / 都」，只是至今只测了 CAS 一侧）。
 

@@ -249,6 +249,18 @@ func casDomainHint(ac *certsv1alpha1.AliyunCertificate) string {
 
 // casFindHint 决定这一次 FindUploaded 用哪个 Keyword。
 //
+// Keyword 的语义已实测（2026-09-05, cn-hangzhou；spec §12.3 #12，依据
+// test/integration/RESULTS.md）：CAS 对证书域名做**任意子串匹配**，且**不做 DNS 通配符
+// 展开**。SAN 为 `*.it.integration.invalid` 的证书，用 `*.it.integration.invalid`、
+// `it.integration.invalid`、`integration`、甚至非标签边界的 `ntegratio` 都能查到，而
+// 通配符本应覆盖的 `probe.it.integration.invalid` 查不到。
+//
+// 对本函数的直接后果：把 SAN 原样当 Keyword 传一定能命中自己（子串匹配的自反性），所以
+// 正常路径安全。要咬人的是反方向——把 spec.dnsNames 从 `*.example.com` 改成任何**不是它
+// 子串**的域名之后，preferred / spec 回退算出来的是新域名，拿它去找旧代次的 certId 必然
+// 落空。probeCAS 会据此判定「云上那张没了」并重传，旧那张就被无痕孤儿化。DomainHint 优先
+// 正是为了把这个窗口收窄到「连快照都没有」的情形。
+//
 // pendingUpload.DomainHint 优先级最高：它是写 write-ahead 记录那一刻的快照，而云上那张
 // 证书正是按当时的域名建的；spec.dnsNames 之后被改过的话，用它去找只会一无所获，那张
 // 证书就被无痕地孤儿化了。preferred 是调用方从 leaf SAN 现算出来的域名（只有拿得到

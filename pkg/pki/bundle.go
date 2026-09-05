@@ -224,6 +224,21 @@ func (b *Bundle) CertPEM() []byte {
 }
 
 // KeyPEM 输出阿里云期望的私钥编码：RSA → PKCS#1，ECDSA → SEC1。
+//
+// CAS 侧的接受范围比这里输出的宽。实测（2026-09-05, cn-hangzhou；spec §12.3 #1，
+// 依据 test/integration/RESULTS.md）：PKCS#1 RSA、SEC1 EC、PKCS#8 三种**未加密**编码
+// UploadUserCertificate 一律接受；带 `Proc-Type: 4,ENCRYPTED` 头的私钥块被拒，错误码
+// PrivateKeyFormatException（Permanent）——CAS 报的是格式错误而非配对错误，说明格式校验
+// 先于配对校验。（这一条只支撑「带 ENCRYPTED 头的块被拒」，**不**支撑「CAS 能解析并拒绝
+// 一个格式良好的加密私钥」。）
+//
+// **FC3 侧未测**：CertConfig.privateKey 的接受范围由 FC3 探针补测（spec §12.3 #1 的
+// FC3 那一半，至今没有实测依据）。
+//
+// 既然 CAS 三种都收，为什么仍固定输出 PKCS#1 / SEC1：一是阿里云文档（CAS 上传页与 CDN
+// 证书格式页）明写期望 PKCS#1，控制台的格式转换工具还专门把 PKCS#8 转过去，官方口径与
+// 实测口径不一致时按更严的那个走；二是 FC3 侧没有实测依据，输出一种两边文档都点名的编码
+// 是唯一不用赌的选择。要放宽必须先有 FC3 的实测结论。
 func (b *Bundle) KeyPEM() ([]byte, error) {
 	switch k := b.Signer.(type) {
 	case *rsa.PrivateKey:
