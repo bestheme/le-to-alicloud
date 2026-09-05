@@ -1,0 +1,19 @@
+# restricted-v2 会为 namespace 注入自己的 UID 区间，任何写死的 runAsUser /
+# runAsGroup（kubebuilder 脚手架默认的 65532）都会被 SCC 拒绝。base 里现在没有
+# 这两个字段，这份 patch 是护栏：将来有人重新生成脚手架把它们带回来时，overlay
+# 会把它们抹掉，而不是等到上线才发现 Pod 起不来。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsUser: null
+        runAsGroup: null
+      containers:
+      - name: manager
+        securityContext:
+          runAsUser: null
+          runAsGroup: null

@@ -1,0 +1,9 @@
+# Deployment 排在最后一波：ServiceAccount / ClusterRole / ClusterRoleBinding 留在
+# 默认的 wave 0，Argo CD 会等它们健康之后才进 wave 1。CRD 由另一个 Application
+# 负责，它的 wave 标在 Application 对象上（deploy/argocd/application-crds.yaml）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"

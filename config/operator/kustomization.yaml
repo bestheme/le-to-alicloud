@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# operator 自身：RBAC + Deployment + metrics Service。刻意不含 CRD——Argo CD 下
+# CRD 由独立的 Application 拥有，两个 Application 的资源集合必须不相交，否则
+# Argo 会把它们报成 shared resource 并在两边反复 sync。
+#
+# 这个目录是**有意从脚手架布局里拆出来的**，不是 operator-sdk 生成的。将来重新
+# 生成 config/default（升级 operator-sdk、重跑 init 之类）时不要用生成结果覆盖
+# config/operator，也不要把 metrics_service.yaml 与 manager_metrics_patch.yaml
+# 挪回 config/default——那会让两个 Argo Application 重新拥有同一批资源。
+# 布局的完整说明在 README 的「开发」一节。
+resources:
+- ../rbac
+- ../manager
+- metrics_service.yaml
+
+patches:
+- path: manager_metrics_patch.yaml
+  target:
+    kind: Deployment
+
+# 下面两段被注释掉的 patch 条目原本在 config/default/kustomization.yaml 的 patches:
+# 段里。拆分时 config/default 的 patches: 键已无条目而被整键删除（kustomize 不接受
+# 空的 patches: 键，build 会直接报错），所以把它们连同 Uncomment 指引搬到这里——
+# 它们打的都是 Deployment 的 patch，本来就属于 operator 基座，不属于「CRD + operator」
+# 的聚合层。这里的 patches: 键有条目，指引继续成立。
+#
+# 注意：cert_metrics_manager_patch.yaml 仍然放在 config/default/ 下，从这里引用要写成
+# ../default/cert_metrics_manager_patch.yaml。
+
+# Uncomment the patches line if you enable Metrics and CertManager
+# [METRICS-WITH-CERTS] To enable metrics protected with certManager, uncomment the following line.
+# This patch will protect the metrics with certManager self-signed certs.
+#- path: cert_metrics_manager_patch.yaml
+#  target:
+#    kind: Deployment
+
+# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
+# crd/kustomization.yaml
+#- path: manager_webhook_patch.yaml
+#  target:
+#    kind: Deployment
