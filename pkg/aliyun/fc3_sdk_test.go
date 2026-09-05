@@ -1,6 +1,7 @@
 package aliyun
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -77,7 +78,7 @@ func TestUpdateInputToSDK_SetsCertOverEcho(t *testing.T) {
 		t.Errorf("protocol 应被覆盖: %v", dara.StringValue(out.Protocol))
 	}
 	if dara.StringValue(out.CertConfig.PrivateKey) != "K" {
-		t.Errorf("私钥必须写进请求体: %+v", out.CertConfig)
+		t.Errorf("私钥必须写进请求体: %s", certConfigDigest(out.CertConfig))
 	}
 	// 覆盖必须作用在副本上，否则同一个 Echo 被两次 Apply 复用时会互相污染。
 	if dara.StringValue(echo.Protocol) != "HTTP" || echo.CertConfig != nil {
@@ -112,5 +113,41 @@ func TestUpdateInputToSDK_RejectsForeignEcho(t *testing.T) {
 	}
 	if ClassOf(err) != ClassPermanent {
 		t.Errorf("接线错误应是 Permanent，得到 %v", ClassOf(err))
+	}
+}
+
+// certConfigDigest 是本包测试里**唯一**允许用来描述 SDK certConfig 的形式。
+//
+// 绝不把 *fc.CertConfig 交给 %v / %+v：它的 String() 会把 privateKey 原样打出来，而
+// 「零凭证泄漏」同样管着测试输出——CI 日志是公开的，失败信息会被贴进 issue。
+// 只报无害的 certName 与私钥长度，足够诊断「私钥有没有写进请求体」。
+func certConfigDigest(c *fc.CertConfig) string {
+	if c == nil {
+		return "<nil certConfig>"
+	}
+	return fmt.Sprintf("certName=%q, len(certificate)=%d, len(privateKey)=%d",
+		dara.StringValue(c.CertName),
+		len(dara.StringValue(c.Certificate)),
+		len(dara.StringValue(c.PrivateKey)))
+}
+
+func TestCertConfigDigest_NeverRendersThePrivateKey(t *testing.T) {
+	const key = "SUPERSECRETKEYMATERIAL"
+	c := &fc.CertConfig{
+		CertName:    dara.String("cert_abc"),
+		Certificate: dara.String("PUBLIC-CERT"),
+		PrivateKey:  dara.String(key),
+	}
+	if got := certConfigDigest(c); strings.Contains(got, key) {
+		t.Fatalf("测试输出泄漏了私钥: %s", got)
+	}
+	// 反向钉住这条规矩存在的理由：SDK 类型的默认格式化**确实**会把私钥打出来，
+	// 所以 %+v 在本包的测试里是禁用的。哪天 SDK 自己开始脱敏，这一行会失败，
+	// 那时该做的是更新上面那段说明，而不是把 %+v 放回去。
+	if !strings.Contains(fmt.Sprintf("%+v", c), key) {
+		t.Error("SDK 的 certConfig 不再回显私钥了——请复核 certConfigDigest 的注释")
+	}
+	if certConfigDigest(nil) == "" {
+		t.Error("nil 也要有可读的描述，否则失败信息会是一片空白")
 	}
 }

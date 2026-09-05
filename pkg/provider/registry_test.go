@@ -28,6 +28,8 @@ func (s *stubProvider) Cleanup(context.Context, provider.Target, provider.Client
 }
 
 func TestRegistry_RegisterAndGet(t *testing.T) {
+	// 注册表是包级全局：不复位，同一进程里的第二遍（go test -count=2）必然撞重名 panic。
+	t.Cleanup(provider.ResetForTest)
 	provider.Register(&stubProvider{name: "StubTarget"})
 
 	got, ok := provider.Get("StubTarget")
@@ -53,11 +55,18 @@ func TestRegistry_RegisterAndGet(t *testing.T) {
 }
 
 func TestRegistry_DuplicatePanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Error("重复注册应 panic —— 这是编译期就该发现的接线错误")
-		}
+	t.Cleanup(provider.ResetForTest)
+	// 第一次注册**必须成功**，而且必须落在 recover 的作用域之外：把两次调用罩在同一个
+	// defer/recover 下，第一次注册自己 panic（上一轮跑剩的同名条目）时用例照样通过——
+	// 捕获到的是错误的那个 panic，这个用例就变成了永远绿的空壳。
+	provider.Register(&stubProvider{name: "DupTarget"})
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("重复注册应 panic —— 这是编译期就该发现的接线错误")
+			}
+		}()
+		provider.Register(&stubProvider{name: "DupTarget"})
 	}()
-	provider.Register(&stubProvider{name: "DupTarget"})
-	provider.Register(&stubProvider{name: "DupTarget"})
 }
