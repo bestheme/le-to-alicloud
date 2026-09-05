@@ -42,7 +42,14 @@ spec:
       # 刻意不开 prune。开了之后，从 deploy/argocd 里挪走一个文件就会让根应用删掉
       # 对应的子 Application；而删除子 Application 是否级联删除它管的资源，取决于
       # 那一刻对象上有没有 resources-finalizer——这是个不该为了排序而引入的破坏面。
-      # 要下线某个子 Application，请人工删，并想清楚 --cascade。
+      #
+      # 代价是「下线一个子 Application」得分两步，而且**顺序不能颠倒**：下面开了
+      # selfHeal，只要文件还在 git 里，人工删掉的子 Application 会在下一个 reconcile
+      # 周期被原样重建回来。正确顺序是：
+      #   1. 先从 deploy/argocd 删掉那个 .yaml 并推上去（prune=false，根应用不会代劳，
+      #      所以对象这时还在，什么都不会被级联删）；
+      #   2. 再人工删那个 Application 对象，并想清楚 --cascade——CRD 那个尤其要用
+      #      --cascade=false，见 README「删除 CRD Application 时必须 --cascade=false」。
       prune: false
       selfHeal: true
     syncOptions:
