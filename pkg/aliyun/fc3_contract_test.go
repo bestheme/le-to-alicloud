@@ -56,13 +56,16 @@ func TestFC3SDKContract(t *testing.T) {
 	// 方法值：只做签名绑定，不调用。对指针接收者取方法值，nil 接收者是安全的。
 	// 声明式写成多行只是为了不超过 lll 的 120 列上限，签名本身与 SDK 完全一致。
 	var c *fc.Client
+	//nolint:staticcheck // QF1011: 显式函数类型正是本契约测试的意义，类型推断会让签名漂移无法被编译期发现
 	var get func(
 		context.Context, *string, map[string]*string, *dara.RuntimeOptions,
 	) (*fc.GetCustomDomainResponse, error) = c.GetCustomDomainWithContext
+	//nolint:staticcheck // QF1011: 显式函数类型正是本契约测试的意义，类型推断会让签名漂移无法被编译期发现
 	var upd func(
 		context.Context, *string, *fc.UpdateCustomDomainRequest,
 		map[string]*string, *dara.RuntimeOptions,
 	) (*fc.UpdateCustomDomainResponse, error) = c.UpdateCustomDomainWithContext
+	//nolint:staticcheck // QF1011: 显式函数类型正是本契约测试的意义，类型推断会让签名漂移无法被编译期发现
 	var newClient func(*openapiutil.Config) (*fc.Client, error) = fc.NewClient
 	if get == nil || upd == nil || newClient == nil {
 		t.Fatal("方法值绑定失败")
