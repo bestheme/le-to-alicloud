@@ -24,6 +24,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -41,7 +42,7 @@ import (
 // targetNotFoundRequeue 是「域名还不存在」时的固定重试间隔（spec §6.2 步骤 5）。
 // 不用指数退避：域名可能由 Terraform 稍后创建，这是等待而不是故障。
 //
-//nolint:unused // 由 Task 8 的 TargetNotFound 分支引用；两个重试间隔在本任务一次定死。
+//nolint:unused // 由 Task 11 的 TargetNotFound 分支引用；两个重试间隔在 Task 7 一次定死。
 const targetNotFoundRequeue = 5 * time.Minute
 
 // credentialsRequeue 是凭证类错误的长 requeue：等人换 AK 或补授权，重试再快也没用。
@@ -147,16 +148,38 @@ func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req 
 	return r.reconcileBindingReady(ctx, rd, ac)
 }
 
-// reconcileBindingReady 处理证书可用之后的步骤 2–8。Task 8–12 逐步填充。
+// reconcileBindingReady 处理证书可用之后的步骤 2–8。Task 9–12 逐步填充剩下的步骤。
 //
-// ac 是步骤 2–8 的输入（SAN 校验、证书材料、凭证继承），存根阶段还用不上；现在删掉它，
-// 下一个任务就要连同全部调用点一起改回来。
+// ac 是步骤 3 起的输入（证书材料、代次闸门、凭证继承），本任务的仲裁还用不上它；现在
+// 删掉这个参数，下一个任务就要连同全部调用点一起改回来。
 //
-//nolint:unparam // 见上：参数由 Task 8 起使用。
+//nolint:unparam // 见上：参数由 Task 9 的 loadBindingMaterial / certificateGate 使用。
 func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 	ctx context.Context, rd *bindingRound, ac *certsv1alpha1.AliyunCertificate,
 ) (ctrl.Result, error) {
-	aggregateBindingReady(rd.b)
+	b := rd.b
+
+	// 2. 冲突仲裁（spec §6.2 步骤 2）
+	winner, err := r.arbitrate(ctx, b)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if winner.UID != b.UID {
+		setBindingCondition(b, certsv1alpha1.ConditionConflict, metav1.ConditionTrue,
+			certsv1alpha1.ReasonConflictingBinding,
+			fmt.Sprintf("同目标已由 %s/%s 绑定", winner.Namespace, winner.Name))
+		aggregateBindingReady(b)
+		// 云侧一个字节都不写。胜者消失会经 watch 唤醒我们，drift 周期是兜底。
+		// 注意这里是一次早退，而 patchBinding → recordBindingMetrics 会用 rd.lag 刷
+		// applied_age。Task 9 会把 rd.lag = r.appliedLag(b, ac) 提到 Reconcile 里取完
+		// 证书之后、进本函数之前，所以这条路径上的 lag 是真值而不是 0；本任务里
+		// appliedLag 还不存在，rd.lag 暂为 0，Task 9 落地后自动补齐。
+		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
+	}
+	setBindingCondition(b, certsv1alpha1.ConditionConflict, metav1.ConditionFalse,
+		certsv1alpha1.ReasonApplied, "")
+
+	aggregateBindingReady(b)
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 }
 
