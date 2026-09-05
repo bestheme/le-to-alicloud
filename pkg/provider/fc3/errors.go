@@ -75,3 +75,18 @@ func asAliyunError(err error) *aliyun.Error {
 // 若不是，被限流会落进 CodeRetryable 走指数退避而不是 CodeThrottled，指标里也看不到
 // throttled），实测结论见 test/integration/RESULTS.md
 func isThrottling(code string) bool { return strings.HasPrefix(code, "Throttling") }
+
+// swallowNotFound 把「目标已经不在了」翻译成成功，供 Cleanup 的两个调用点共用。
+//
+// 解绑要达到的是「云上不再挂着我们的证书」，域名整个消失同样满足这个目的——
+// pkg/aliyun 给 ClassNotFound 写的定义本来就是「资源不存在（Delete 时视为成功）」。
+//
+// 必须同时盖住 Get 与 Update：域名可能恰好在这两次调用之间被 Terraform 删掉。漏掉
+// Update 那一侧的代价不是多重试一次——CodeTargetNotFound 的 Retryable 是 false，通用层
+// 会用固定的长 requeue 反复空转，finalizer 永远摘不掉，Binding 一直卡在 Terminating。
+func swallowNotFound(err error) error {
+	if pe := provider.ErrorOf(err); pe != nil && pe.Code == provider.CodeTargetNotFound {
+		return nil
+	}
+	return err
+}

@@ -38,6 +38,11 @@ func (p *Provider) Capabilities() provider.Capabilities {
 }
 
 // clientOf 断言通用层传进来的 client。失败是接线错误，不是运行时故障。
+//
+// 这里的 reason 三个调用方共用一个，与 toProviderError 逐操作分流的做法不同，是有意的：
+// CodeInvalidClient 只可能由「通用层构造 client 的那段代码传错了类型」导致，在能跑起来的
+// 构建里到不了任何用户的 condition。给它按操作分流等于假装这个取值有诊断价值——真正有
+// 价值的是错误消息里的 %T。ReasonApplyFailed 在这里只是个取值有界的占位符。
 func clientOf(c provider.Client) (aliyun.FC3Client, error) {
 	cl, ok := c.(aliyun.FC3Client)
 	if !ok {
@@ -90,9 +95,11 @@ func (p *Provider) Apply(
 	}
 
 	// read-modify-write：先读回完整对象，再把除 certConfig / protocol 之外的一切原样回填。
-	// 这在「全量替换」和「部分合并」两种语义下都正确（spec §6.3）——而这两种到底是哪一种，
-	// 文档没说（§12.3 #2）。代价是 Get 与 Update 之间没有乐观锁，是 last-write-wins；
-	// 缓解是窗口极短、写入频率极低（正常一年 4–6 次）。
+	// 这在「全量替换」和「部分合并」两种语义下都正确（spec §6.3）。代价是 Get 与 Update
+	// 之间没有乐观锁，是 last-write-wins；缓解是窗口极短、写入频率极低（正常一年 4–6 次）。
+	//
+	// spec §12.3 #2：未实测（FC3 UpdateCustomDomain 是全量替换还是按字段合并语义未核实），
+	// 实测结论见 test/integration/RESULTS.md
 	cd, err := cl.GetCustomDomain(ctx, t.Identifier)
 	if err != nil {
 		return toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonApplyFailed)
@@ -139,11 +146,8 @@ func (p *Provider) Cleanup(
 	}
 	cd, err := cl.GetCustomDomain(ctx, t.Identifier)
 	if err != nil {
-		gerr := toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonCleanupFailed)
-		if pe := provider.ErrorOf(gerr); pe != nil && pe.Code == provider.CodeTargetNotFound {
-			return nil // 域名已经不在了，解绑的目的已经达到
-		}
-		return gerr
+		return swallowNotFound(
+			toProviderError(aliyun.ActionGetCustomDomain, err, certsv1alpha1.ReasonCleanupFailed))
 	}
 	in := &aliyun.UpdateCustomDomainInput{Protocol: cd.Protocol, Echo: cd.Echo, ClearCert: true}
 	// 纯 HTTPS 的域名被拿掉证书后会彻底无法访问，必须同时降到 HTTP。
@@ -151,7 +155,9 @@ func (p *Provider) Cleanup(
 		in.Protocol = protocolHTTP
 	}
 	if err := cl.UpdateCustomDomain(ctx, t.Identifier, in); err != nil {
-		return toProviderError(aliyun.ActionUpdateCustomDomain, err, certsv1alpha1.ReasonCleanupFailed)
+		// 域名可能在 Get 与 Update 之间被删掉；对解绑而言那同样是成功。
+		return swallowNotFound(
+			toProviderError(aliyun.ActionUpdateCustomDomain, err, certsv1alpha1.ReasonCleanupFailed))
 	}
 	return nil
 }

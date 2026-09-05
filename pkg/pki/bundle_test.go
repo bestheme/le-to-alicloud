@@ -267,14 +267,26 @@ func TestLeafFingerprint_MatchesBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := pki.LeafFingerprint(certPEM)
-	if err != nil {
-		t.Fatal(err)
+	// 这个用例的意义在于「链」：指纹必须锚在 leaf 上，而不是整个 PEM 或末尾那张。
+	if len(b.Intermediates) == 0 {
+		t.Fatal("testutil.IssueLeaf 应返回 leaf + 中间证书，链断了这个用例就没意义了")
 	}
 	// 两条路径必须给出同一个指纹：一条有私钥（证书侧），一条没有（云侧只能看到公开证书）。
 	// 不相等就意味着 Binding 永远认为云上那张不是自己写的，于是每一轮都重写一次。
-	if got != b.Fingerprint {
-		t.Errorf("指纹不一致: %s != %s", got, b.Fingerprint)
+	//
+	// 两种编码都要试：certPEM 是签发时的原始字节；b.CertPEM() 是重新编码后的规范形式，
+	// 而后者才是真正写上云、再被 provider 的 Observe 从 certConfig.certificate 读回来的那串。
+	for _, c := range []struct {
+		name string
+		pem  []byte
+	}{{"原始", certPEM}, {"规范化", b.CertPEM()}} {
+		got, err := pki.LeafFingerprint(c.pem)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != b.Fingerprint {
+			t.Errorf("%s 指纹不一致: %s != %s", c.name, got, b.Fingerprint)
+		}
 	}
 }
 

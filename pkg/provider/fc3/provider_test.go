@@ -176,6 +176,13 @@ func TestProvider_ApplyErrorClasses(t *testing.T) {
 			code:   provider.CodeAuth, retryable: false, reason: certsv1alpha1.ReasonCredentialsInvalid,
 		},
 		{
+			// 非限流的瞬时故障：网络抖动、5xx、空响应都落在这里，是生产上最常见的一支，
+			// 也是唯一一处 Retryable=true 与 failReason 同时生效的组合。
+			name:   "retryable-not-throttling",
+			inject: &aliyun.Error{Class: aliyun.ClassRetryable, Op: op, Code: "InternalError", Err: errAny},
+			code:   provider.CodeRetryable, retryable: true, reason: certsv1alpha1.ReasonApplyFailed,
+		},
+		{
 			name:   "permanent",
 			inject: &aliyun.Error{Class: aliyun.ClassPermanent, Op: op, Code: "InvalidParameter", Err: errAny},
 			code:   provider.CodePermanent, retryable: false, reason: certsv1alpha1.ReasonApplyFailed,
@@ -354,5 +361,20 @@ func TestProvider_FallbackReasonDiffersPerOperation(t *testing.T) {
 	err = (&fc3.Provider{}).Cleanup(ctx, targetFor(), fCleanGet, provider.DeletionPolicyUnbind)
 	if pe := provider.ErrorOf(err); pe == nil || pe.Reason != certsv1alpha1.ReasonCleanupFailed {
 		t.Errorf("Cleanup 读取失败的兜底 reason 应是 CleanupFailed: %v", err)
+	}
+}
+
+func TestProvider_CleanupSwallowsNotFoundOnUpdate(t *testing.T) {
+	f := fake.NewFC3()
+	f.AddDomain(fake.Domain{DomainName: testDomain, Protocol: "HTTPS", CertName: "c1"})
+	// Get 读得到，Update 才发现域名没了——Terraform 在这两次调用之间把它删了。
+	f.QueueUpdateErr(fake.ErrDomainNotFound)
+
+	err := (&fc3.Provider{}).Cleanup(context.Background(), targetFor(), f, provider.DeletionPolicyUnbind)
+	// 这条路径上报错的代价特别高：CodeTargetNotFound 的 Retryable 是 false，通用层会用固定的
+	// 长 requeue 反复空转，finalizer 永远摘不掉，Binding 就一直卡在 Terminating 等人来手动摘。
+	// 而域名整个消失，本来就已经满足了「云上不再挂着我们的证书」这个目的。
+	if err != nil {
+		t.Errorf("Update 撞上域名已删除应视为解绑成功: %v", err)
 	}
 }
