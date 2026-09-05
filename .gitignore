@@ -30,3 +30,5 @@ go.work
 *~
 # Claude Code worktrees
 .claude/worktrees/
+# Superpowers manual worktrees
+.worktrees/
