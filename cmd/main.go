@@ -293,7 +293,7 @@ func main() {
 		os.Exit(1)
 	}
 	limiters := aliyun.NewLimiters()
-	casCache := aliyun.NewClientCache()
+	casCache := aliyun.NewClientCache[aliyun.CASClient]()
 	certReconciler := &controller.AliyunCertificateReconciler{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),

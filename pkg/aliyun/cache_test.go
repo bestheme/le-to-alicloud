@@ -8,7 +8,7 @@ import (
 )
 
 func TestClientCache_ReusesSameResourceVersion(t *testing.T) {
-	c := aliyun.NewClientCache()
+	c := aliyun.NewClientCache[aliyun.CASClient]()
 	builds := 0
 	build := func() (aliyun.CASClient, error) { builds++; return fake.NewCAS(), nil }
 	k := aliyun.ClientKey{Namespace: "ns", Name: "s", ResourceVersion: "1", Region: "cn-hangzhou"}
@@ -20,7 +20,7 @@ func TestClientCache_ReusesSameResourceVersion(t *testing.T) {
 }
 
 func TestClientCache_RebuildsOnResourceVersionChange(t *testing.T) {
-	c := aliyun.NewClientCache()
+	c := aliyun.NewClientCache[aliyun.CASClient]()
 	builds := 0
 	build := func() (aliyun.CASClient, error) { builds++; return fake.NewCAS(), nil }
 	k1 := aliyun.ClientKey{Namespace: "ns", Name: "s", ResourceVersion: "1", Region: "cn-hangzhou"}
@@ -49,7 +49,7 @@ func TestClientCache_DistinguishesNonCredentialComponents(t *testing.T) {
 	}
 	for name, mutate := range variants {
 		t.Run(name, func(t *testing.T) {
-			c := aliyun.NewClientCache()
+			c := aliyun.NewClientCache[aliyun.CASClient]()
 			builds := 0
 			build := func() (aliyun.CASClient, error) { builds++; return fake.NewCAS(), nil }
 			other := base
