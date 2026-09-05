@@ -54,11 +54,13 @@ const (
 	ReasonTargetNotFound      = "TargetNotFound"
 	ReasonDomainNotCovered    = "DomainNotCovered"
 	ReasonConflictingBinding  = "ConflictingBinding"
-	ReasonAccountMismatch     = "AccountMismatch"
-	ReasonApplyFailed         = "ApplyFailed"
-	ReasonObserveFailed       = "ObserveFailed"
-	ReasonDriftCorrected      = "DriftCorrected"
-	ReasonApplied             = "Applied"
+	// ReasonNoConflict 是 Conflict=False 的原因：同目标只有自己，或自己是仲裁胜者。
+	ReasonNoConflict      = "NoConflict"
+	ReasonAccountMismatch = "AccountMismatch"
+	ReasonApplyFailed     = "ApplyFailed"
+	ReasonObserveFailed   = "ObserveFailed"
+	ReasonDriftCorrected  = "DriftCorrected"
+	ReasonApplied         = "Applied"
 )
 
 const (

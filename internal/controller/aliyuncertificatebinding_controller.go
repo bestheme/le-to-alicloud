@@ -169,7 +169,8 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 			certsv1alpha1.ReasonConflictingBinding,
 			fmt.Sprintf("同目标已由 %s/%s 绑定", winner.Namespace, winner.Name))
 		aggregateBindingReady(b)
-		// 云侧一个字节都不写。胜者消失会经 watch 唤醒我们，drift 周期是兜底。
+		// 云侧一个字节都不写。胜者变化或消失会经 SetupWithManager 里的同目标 watch
+		// 唤醒我们（For 只入队变化的对象本身，唤不醒输者），drift 周期是兜底。
 		// 注意这里是一次早退，而 patchBinding → recordBindingMetrics 会用 rd.lag 刷
 		// applied_age。Task 9 会把 rd.lag = r.appliedLag(b, ac) 提到 Reconcile 里取完
 		// 证书之后、进本函数之前，所以这条路径上的 lag 是真值而不是 0；本任务里
@@ -177,7 +178,7 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 	}
 	setBindingCondition(b, certsv1alpha1.ConditionConflict, metav1.ConditionFalse,
-		certsv1alpha1.ReasonApplied, "")
+		certsv1alpha1.ReasonNoConflict, "")
 
 	aggregateBindingReady(b)
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
@@ -207,7 +208,18 @@ func certIssued(ac *certsv1alpha1.AliyunCertificate) bool {
 	return meta.IsStatusConditionTrue(ac.Status.Conditions, certsv1alpha1.ConditionIssued)
 }
 
-// SetupWithManager 注册 watch：主资源，外加证书变化的反查。
+// bindingRequests 把一批 Binding 转成 reconcile 请求。
+func bindingRequests(list *certsv1alpha1.AliyunCertificateBindingList) []reconcile.Request {
+	out := make([]reconcile.Request, 0, len(list.Items))
+	for i := range list.Items {
+		out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: list.Items[i].Namespace, Name: list.Items[i].Name,
+		}})
+	}
+	return out
+}
+
+// SetupWithManager 注册 watch：主资源，外加证书变化与同目标 peer 的反查。
 func (r *AliyunCertificateBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&certsv1alpha1.AliyunCertificateBinding{}).
@@ -225,14 +237,11 @@ func (r *AliyunCertificateBindingReconciler) SetupWithManager(mgr ctrl.Manager) 
 						"certificate", client.ObjectKeyFromObject(o))
 					return nil
 				}
-				out := make([]reconcile.Request, 0, len(list.Items))
-				for i := range list.Items {
-					out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{
-						Namespace: list.Items[i].Namespace, Name: list.Items[i].Name,
-					}})
-				}
-				return out
+				return bindingRequests(list)
 			})).
+		// 同目标的 peer 变化要唤醒**其余**候选者，见 bindingPeerRequests。
+		Watches(&certsv1alpha1.AliyunCertificateBinding{},
+			handler.EnqueueRequestsFromMapFunc(bindingPeerRequests(mgr.GetClient()))).
 		Named("aliyuncertificatebinding").
 		Complete(r)
 }
