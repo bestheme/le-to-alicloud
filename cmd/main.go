@@ -317,6 +317,23 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "AliyunCertificate")
 		os.Exit(1)
 	}
+
+	fc3Cache := aliyun.NewClientCache[aliyun.FC3Client]()
+	bindingReconciler := &controller.AliyunCertificateBindingReconciler{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("aliyuncertificatebinding"),
+		// Secret 已 DisableFor，mgr.GetClient() 对它就是直读。
+		ProviderFactory:      controller.NewProviderFactory(mgr.GetClient(), fc3Cache, limiters, opts.CloudCallTimeout),
+		DriftCheckInterval:   opts.DriftCheckInterval,
+		CleanupGracePeriod:   opts.CleanupGracePeriod,
+		CleanupFailurePolicy: opts.CleanupFailurePolicy,
+	}
+	if err := bindingReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "AliyunCertificateBinding")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {
