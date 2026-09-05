@@ -222,38 +222,47 @@ kubectl -n le-to-alicloud-system get deploy le-to-alicloud-controller-manager
 唯一安全的顺序是：**operator 还活着的时候先删 CR、等 finalizer 把云侧清理跑完，再拆 operator。** 已经封装成一个目标：
 
 ```bash
-make undeploy-safe    # 1) 删全部 CR → 2) 硬闸检查无残留 → 3) 才跑 undeploy
+make undeploy-safe    # 1) 删全部 CR → 2) 闸门确认无残留 → 3) 才跑 undeploy
 make uninstall        # 只删 CRD；undeploy-safe 已经带 CRD 了，通常不必再跑
 ```
 
-手工做也可以，两套命令等价：
+闸门是 **fail-closed** 的：`kubectl` 查不动（集群不可达、上下文错、没有 list 权限）时它**不会**当作「已清空」放行，而是 `exit 1` 停住。`--cleanup-grace-period` 默认 `15m` 而删除的等待默认 `5m`，云侧清理慢时闸门会先拦下来——这时把超时调大再跑一次即可，别改用 `make undeploy` 绕过去：
 
 ```bash
+make undeploy-safe CLEANUP_TIMEOUT=20m
+```
+
+手工做也可以，但**三步的顺序不能改**：
+
+```bash
+# 第 1 步：删 CR（operator 仍在运行，finalizer 会去清理云侧）
 # oc
 oc delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=5m
 oc delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=5m
-oc get aliyuncertificates,aliyuncertificatebindings -A     # 必须为空再往下
-make undeploy
-```
-
-```bash
 # kubectl
 kubectl delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=5m
 kubectl delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=5m
-kubectl get aliyuncertificates,aliyuncertificatebindings -A   # 必须为空再往下
-make undeploy
 ```
 
-**怎么确认 finalizer 真的跑完了、而不是放弃了。** 删 CR 时 operator 有 `--cleanup-grace-period`（默认 `15m`）的有界重试，超时后按 `--cleanup-failure-policy`（默认 `Abandon`）**放弃清理并照常删掉对象**——对象没了不等于云上干净。两个信号能区分：
+**第 2 步：确认 finalizer 真的跑完了，而不是放弃了。这一步必须在 `make undeploy` 之前做**——`undeploy` 会删掉 Deployment，指标端点随之消失，下面那条指标判据事后就抓不到了。
+
+删 CR 时 operator 有 `--cleanup-grace-period`（默认 `15m`）的有界重试，超时后按 `--cleanup-failure-policy`（默认 `Abandon`）**放弃清理并照常删掉对象**——**对象没了不等于云上干净**。所以要同时看三个信号：
 
 ```bash
-# 事件：放弃清理会发 Warning，message 里带 casName
+# a) CR 必须为空
+kubectl get aliyuncertificates,aliyuncertificatebindings -A
+# b) 事件：放弃清理会发 Warning，message 里带 casName
 kubectl get events -A --field-selector reason=CleanupAbandoned
-# 指标：这个计数器涨了就说明有孤儿留在云上
-#   aliyuncert_cleanup_abandoned_total
+# c) 指标：这个计数器涨了就说明有孤儿留在云上（抓法见「指标与告警」一节的端口转发）
+#    aliyuncert_cleanup_abandoned_total
 ```
 
-只要 `aliyuncert_cleanup_abandoned_total` 没涨、也没有 `Warning CleanupAbandoned` 事件，CR 又已经删干净，就说明云侧清理确实完成了。反之请拿事件里的 `casName` 去 CAS 控制台手工删除。
+三条同时满足——CR 为空、没有 `Warning CleanupAbandoned`、`aliyuncert_cleanup_abandoned_total` 没涨——才说明云侧清理确实完成了。有 Abandon 的，拿事件里的 `casName` 去 CAS 控制台手工删除，再往下走。
+
+```bash
+# 第 3 步：确认过了才拆 operator 与 CRD
+make undeploy
+```
 
 ## CRD 参考
 

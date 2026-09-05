@@ -242,20 +242,60 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 # 唯一安全的顺序是：operator 还活着的时候先删 CR、等 finalizer 把云侧清理跑完，再拆 operator。
 # 第 2 步的残留检查是硬闸：CR 没删干净就 exit 1，绝不带着孤儿风险往下走。
 CLEANUP_TIMEOUT ?= 5m
-CR_TYPES := aliyuncertificatebindings.certs.bestheme.ac.cn,aliyuncertificates.certs.bestheme.ac.cn
+
+# 一行一个类型，**刻意不用逗号连写**：`kubectl get a,b` 只要其中一个类型未知就整体报错，
+# 而且**不打印已知那个类型的行**。两个 CRD 只装了一个时，逗号写法既拿不到数据、又分不清
+# 是哪一半出的问题——闸门要是照着那个输出推断状态，会把「查询失败」读成「已清空」。
+CR_KINDS := aliyuncertificates.certs.bestheme.ac.cn aliyuncertificatebindings.certs.bestheme.ac.cn
 
 .PHONY: undeploy-safe
 undeploy-safe: kustomize ## Delete all CRs first (finalizers do the cloud cleanup), then undeploy. Use this instead of undeploy.
 	@echo ">>> 1/3 删除全部 Binding 与 Certificate（operator 仍在运行，finalizer 会去清理云侧）"
 	-$(KUBECTL) delete aliyuncertificatebindings.certs.bestheme.ac.cn --all --all-namespaces --wait --timeout=$(CLEANUP_TIMEOUT)
 	-$(KUBECTL) delete aliyuncertificates.certs.bestheme.ac.cn --all --all-namespaces --wait --timeout=$(CLEANUP_TIMEOUT)
-	@echo ">>> 2/3 确认没有 CR 残留"
-	@n=$$($(KUBECTL) get $(CR_TYPES) --all-namespaces --no-headers 2>/dev/null | wc -l | tr -d ' '); \
-	if [ "$$n" != "0" ]; then \
-	  echo "!!! 仍有 $$n 个 CR 没删干净，说明 finalizer 还没跑完（或正卡在云侧清理上）。"; \
-	  echo "!!! 现在继续拆 operator 一定会留下云上孤儿，所以停在这里。"; \
-	  echo "!!! 排查见 README「故障排查」；确认可以放弃云侧清理时，把 operator 的"; \
-	  echo "!!! --cleanup-failure-policy 设为 Abandon（默认就是），等 --cleanup-grace-period 走完。"; \
+	@echo ">>> 2/3 闸门：确认没有 CR 残留"
+	@#
+	@# 这个闸门必须 fail-closed：说不清就停住。一个 fail-open 的安全闸比没有闸更糟——
+	@# 它给出虚假信心，而这个目标存在的唯一理由就是防住「CR 还在、operator 被拆掉」。
+	@# 所以每一次查询都单独看退出码，绝不靠「stderr 丢掉之后数 stdout 行数」推断状态。
+	@#
+	@# 先用一次「列出全部 CRD」当连通性与授权探针：它失败就意味着连「CRD 装没装」都答不了，
+	@# 无从判断有没有 CR 残留。不能拿 `kubectl get crd <name>` 当探针——集群不可达时它同样
+	@# 失败，会被误读成「CRD 没装、不可能有残留」，闸门又变回 fail-open。
+	@crds=`$(KUBECTL) get crd -o name 2>&1`; \
+	if [ $$? -ne 0 ]; then \
+	  echo "!!! 列不出 CRD，也就无从确认 CR 是否已清空——拒绝继续。"; \
+	  printf '!!!     %s\n' "$$crds"; \
+	  echo "!!! 常见原因：集群不可达、当前 kubeconfig 上下文错、或没有 CRD 的 list 权限。"; \
+	  echo "!!! 修好之后重跑本目标。绝不要改用 make undeploy 绕过去。"; \
+	  exit 1; \
+	fi; \
+	blocked=0; \
+	for t in $(CR_KINDS); do \
+	  if ! printf '%s\n' "$$crds" | grep -qx "customresourcedefinition.apiextensions.k8s.io/$$t"; then \
+	    echo "    $${t}：CRD 未安装，不可能有 CR 残留"; \
+	    continue; \
+	  fi; \
+	  err=`mktemp`; \
+	  out=`$(KUBECTL) get "$$t" --all-namespaces -o name 2>"$$err"`; \
+	  if [ $$? -ne 0 ]; then \
+	    echo "!!! 无法确认 $$t 是否已清空——kubectl get 以非 0 退出："; \
+	    sed 's/^/!!!     /' "$$err"; \
+	    blocked=1; \
+	  elif [ -n "$$out" ]; then \
+	    echo "!!! $$t 仍有 `printf '%s\n' "$$out" | grep -c .` 个对象没删干净——finalizer 还没跑完"; \
+	    echo "!!! （或正卡在云侧清理上）。"; \
+	    blocked=1; \
+	  else \
+	    echo "    $${t}：已清空"; \
+	  fi; \
+	  rm -f "$$err"; \
+	done; \
+	if [ "$$blocked" != "0" ]; then \
+	  echo "!!! 闸门未通过，停在这里——继续拆 operator 会留下云上孤儿。"; \
+	  echo "!!! 云侧确实清不动时：把 CLEANUP_TIMEOUT 调大（当前 $(CLEANUP_TIMEOUT)；operator 的"; \
+	  echo "!!! --cleanup-grace-period 默认 15m，比它小的超时会在 operator 放弃之前就先返回）"; \
+	  echo "!!! 再跑一次本目标；仍然清不动的，按 README「故障排查」处置。"; \
 	  exit 1; \
 	fi
 	@echo ">>> 3/3 CR 已清空，拆掉 operator 与 CRD"
