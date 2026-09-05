@@ -30,10 +30,25 @@ spec:
           annotations:
             summary: "AliyunCertificate {{ $labels.namespace }}/{{ $labels.name }} 将在 7 天内过期"
         # 新鲜度。独有的失败模式：证书续期成功，但没被推到线上。必须与上一条并存。
+        #
+        # 这里**刻意没有** `and on (namespace, name) aliyuncert_certificate_ready == 1`
+        # 这个守卫（spec §10.3 的原式子有，Ruling P3-R42 裁定去掉）。原因是两个指标的
+        # namespace/name 指的不是同一个对象：applied_age 的是 Binding 的
+        # （metrics.go:163 取 rd.b.Namespace/Name），certificate_ready 的是
+        # AliyunCertificate 的（metrics.go:187 取 ac.Namespace/Name）。仓库自带样例就是
+        # Certificate `timehorse-api` 配 Binding `timehorse-api-fc3`——`on` 匹配不上，
+        # 整条表达式恒为空，这条 spec §10.1 点名必配的告警会静默失效。
+        #
+        # 去掉守卫是安全的，它本来就是冗余而非承重：appliedLag
+        # （binding_status.go:137-141）在证书 status.current 为 nil 或 fingerprint 为空时
+        # 直接返回 0，未签发的证书产生不了非零 lag。
+        #
+        # 更完备的做法是给 bindingAppliedAge 加一个 certificate label，再用
+        # `group_left` 关联回 certificate_ready；那要改 internal/controller/metrics.go，
+        # 超出本任务范围。**别看到「少了个守卫」就把 on (namespace, name) 加回来**——
+        # 那会让这条告警重新变成恒空。
         - alert: AliyunCertificateBindingStale
-          expr: |
-            aliyuncert_binding_applied_age_seconds > 86400
-              and on (namespace, name) aliyuncert_certificate_ready == 1
+          expr: aliyuncert_binding_applied_age_seconds > 86400
           for: 1h
           labels:
             severity: critical

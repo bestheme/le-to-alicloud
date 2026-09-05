@@ -1,12 +1,52 @@
-# This kustomization.yaml is not intended to be run by itself,
-# since it depends on service name and namespace that are out of this kustomize package.
-# It should be run by config/default
+# 这个目录是一个**独立可 build 的 kustomize 根**，由 Argo CD 的 CRD Application 单独
+# 拥有（deploy/argocd/application-crds.yaml 直接指向 config/crd）。
+#
+# 脚手架原本在这里写着「not intended to be run by itself / should be run by
+# config/default」——那句话在 config/operator 拆分之后已经不成立了，所以删掉了：
+# 独立 build 现在是本目录的正常用法，不是误用。
+#
+#   ./bin/kustomize build config/crd
+#
+# 它刻意**不被 config/operator 引用**：Argo CD 下 CRD 与 operator 分属两个 Application，
+# 两边的资源集合必须不相交，否则 Argo 会把它们报成 shared resource 并在两边反复 sync。
+# config/default 仍然把 ../crd 与 ../operator 聚合在一起，供 make deploy 这条非 Argo 的
+# 路径使用。
 resources:
 - bases/certs.bestheme.ac.cn_aliyuncertificates.yaml
 - bases/certs.bestheme.ac.cn_aliyuncertificatebindings.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
+# 给两个 CRD 打上 argocd.argoproj.io/sync-options: Delete=false。
+#
+# 堵的是一条真实的数据丢失路径，而不是洁癖：`argocd app delete` 的 --cascade **默认为
+# true**，CLI 会在删除前把 resources-finalizer.argocd.argoproj.io **patch 进 Application
+# 对象**；Argo UI 的删除对话框同样默认级联。所以 Task 11 在 application-crds.yaml 里写的
+# `finalizers: []` 只挡得住 `oc delete application`，挡不住 CLI 和 UI——git 里怎么写都会被
+# 那次 patch 覆盖。
+#
+# 一旦级联生效：CRD 被删 → apiserver 连锁删光所有 AliyunCertificate 与
+# AliyunCertificateBinding → 这些 CR 带 finalizer，而 operator 属于**另一个** Application、
+# 此刻仍然活着 → operator 会真的去删阿里云 CAS 上的证书、解绑 FC3 自定义域名。
+# 这是所有删除路径里唯一没被堵住的一条。
+#
+# Delete=false 打在**资源**上，Argo 级联删除时会跳过带此注解的资源，是唯一能挡住 CLI
+# 强制 patch 的机制。代价：将来真要删 CRD 时必须先手工摘掉这个注解——这道摩擦是有意的。
+#
+# 走 kustomize patch 而不是直接改 config/crd/bases/*.yaml：那两个文件是 controller-gen
+# 的生成物，手改会在下一次 `make manifests` 时被冲掉。
+# 用 kind 选择器而不是逐个点名，是为了让日后新增的 CRD 自动同样受保护。
+# 离线核对：./bin/kustomize build config/crd | grep -c "argocd.argoproj.io/sync-options"
+- target:
+    kind: CustomResourceDefinition
+  patch: |
+    apiVersion: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    metadata:
+      # 有 target 选择器时 kustomize 不用这里的 name 做匹配，但 SMP 要求它存在。
+      name: unused-by-target-selector
+      annotations:
+        argocd.argoproj.io/sync-options: Delete=false
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix.
 # patches here are for enabling the conversion webhook for each CRD
 # +kubebuilder:scaffold:crdkustomizewebhookpatch

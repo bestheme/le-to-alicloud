@@ -21,13 +21,14 @@ patches:
     kind: Deployment
 
 # 下面两段被注释掉的 patch 条目原本在 config/default/kustomization.yaml 的 patches:
-# 段里。拆分时 config/default 的 patches: 键已无条目而被整键删除（kustomize 不接受
-# 空的 patches: 键，build 会直接报错），所以把它们连同 Uncomment 指引搬到这里——
-# 它们打的都是 Deployment 的 patch，本来就属于 operator 基座，不属于「CRD + operator」
-# 的聚合层。这里的 patches: 键有条目，指引继续成立。
+# 段里。它们打的都是 Deployment 的 patch，本来就属于 operator 基座，不属于
+# 「CRD + operator」的聚合层，所以连同 Uncomment 指引一起搬到了这里——这边的
+# patches: 键有实际条目，指引照着做就能生效。config/default 那边唯一的条目
+# （manager_metrics_patch.yaml）也搬走了，剩下一个空键没有意义，一并删掉了。
 #
-# 注意：cert_metrics_manager_patch.yaml 仍然放在 config/default/ 下，从这里引用要写成
-# ../default/cert_metrics_manager_patch.yaml。
+# cert_metrics_manager_patch.yaml 也一并搬了过来，就放在本目录下——kustomize 的 load
+# restrictor 不允许 patch 路径越出 kustomization root，留在 config/default 的话下面这条
+# 指引一 uncomment 就会 build 失败（"file ... is not in or below .../config/operator"）。
 
 # Uncomment the patches line if you enable Metrics and CertManager
 # [METRICS-WITH-CERTS] To enable metrics protected with certManager, uncomment the following line.
