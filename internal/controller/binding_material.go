@@ -18,13 +18,9 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -53,19 +49,11 @@ func loadBindingMaterial(
 ) (provider.CertMaterial, *materialError) {
 	var m provider.CertMaterial
 
-	s := &corev1.Secret{}
-	name := secretNameFor(ac)
-	err := reader.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: name}, s)
-	if apierrors.IsNotFound(err) {
-		return m, &materialError{certsv1alpha1.ReasonSecretNotFound, fmt.Sprintf("Secret %q 不存在", name)}
-	}
-	if err != nil {
-		return m, &materialError{certsv1alpha1.ReasonSecretInvalid, "读取 Secret 失败: " + err.Error()}
-	}
-	b, perr := pki.ParseBundle(s.Data[corev1.TLSCertKey], s.Data[corev1.TLSPrivateKeyKey])
-	if perr != nil {
-		// pki 的错误只描述格式问题，不含密钥内容，可安全写进 condition。
-		return m, &materialError{certsv1alpha1.ReasonSecretInvalid, perr.Error()}
+	// 读 Secret 与解析这一段与证书 controller 共用，见 loadBundle：两边对同一个故障
+	// 必须给出同一组 reason / message，而零凭证泄漏的护栏也只该有一处。
+	b, me := loadBundle(ctx, reader, ac)
+	if me != nil {
+		return m, me
 	}
 	keyPEM, kerr := b.KeyPEM()
 	if kerr != nil {

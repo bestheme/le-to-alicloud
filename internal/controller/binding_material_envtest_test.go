@@ -57,8 +57,10 @@ var _ = Describe("绑定 controller：证书材料", func() {
 		// 推错证书 = 全站 TLS 报错（spec D17）。宁可停下也绝不写。
 		Expect(currentFC3().UpdateCalls()).To(BeZero())
 		// 不碰 Applied：目标上原来那张证书（如果有）还在服役，域名不覆盖说明不了它有毛病。
+		// 断言 condition **根本不存在**（零值状态）而不是「不为 True」：后者在有人开始往
+		// 这条路径写 Applied=False 时照样通过，而那正是这里要拦的事。
 		Expect(bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied).Status).
-			NotTo(Equal(metav1.ConditionTrue))
+			To(BeEmpty())
 	})
 
 	// Secret 消失后的最终态是 CertificateNotReady，**不是** SecretNotFound。

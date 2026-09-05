@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/pem"
 	"strings"
 	"testing"
 	"time"
@@ -130,17 +131,42 @@ func TestLoadBindingMaterial_SecretNotFound(t *testing.T) {
 }
 
 // TestLoadBindingMaterial_SecretInvalid 钉住两件事：坏材料不放行，且 message 不含材料。
+//
+// 两个子用例走的是不同的失败点。第一个在证书解析处就停下，返回的是固定 sentinel，
+// 没有任何插值——它证明不了脱敏。第二个才是真正的护栏：私钥 PEM 类型不认识时，
+// pki 会把 **PEM 块头里的类型串** 插进错误里，那是 Secret 派生文本唯一一处进入 message
+// 的地方。类型串本身不是秘密（"RSA PRIVATE KEY" 之类），但一旦有人把插值范围扩大到
+// 块内容，这个用例会红。
 func TestLoadBindingMaterial_SecretInvalid(t *testing.T) {
 	const junk = "not a pem block at all"
-	ac := materialCertificate(nil)
-	r := materialReader(t, tlsSecret("c1-tls", []byte(junk), []byte(junk)))
-	_, me := loadBindingMaterial(context.Background(), r, ac)
-	if me == nil || me.Reason != certsv1alpha1.ReasonSecretInvalid {
-		t.Fatalf("应报 SecretInvalid: %+v", me)
+	const secretBody = "U0VDUkVUS0VZQllURVM"
+
+	ca := testutil.NewCA(t)
+	certPEM, _ := testutil.IssueLeaf(t, ca, "api.example.com")
+	// 一个格式合法、但类型不被接受的私钥块：解析走到 parsePrivateKey 才失败。
+	weirdKey := pem.EncodeToMemory(&pem.Block{Type: "DSA PRIVATE KEY", Bytes: []byte(secretBody)})
+
+	cases := []struct {
+		name    string
+		certPEM []byte
+		keyPEM  []byte
+		leak    string
+	}{
+		{"证书就不是 PEM", []byte(junk), []byte(junk), junk},
+		{"私钥 PEM 类型不认识", certPEM, weirdKey, secretBody},
 	}
-	// 零凭证泄漏：错误只描述形状，绝不回显 Secret 里的任何字节。
-	if strings.Contains(me.Message, junk) {
-		t.Errorf("message 回显了 Secret 内容: %q", me.Message)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := materialReader(t, tlsSecret("c1-tls", c.certPEM, c.keyPEM))
+			_, me := loadBindingMaterial(context.Background(), r, materialCertificate(nil))
+			if me == nil || me.Reason != certsv1alpha1.ReasonSecretInvalid {
+				t.Fatalf("应报 SecretInvalid: %+v", me)
+			}
+			// 零凭证泄漏：错误只描述形状，绝不回显 Secret 里的任何字节。
+			if strings.Contains(me.Message, c.leak) {
+				t.Errorf("message 回显了 Secret 内容: %q", me.Message)
+			}
+		})
 	}
 }
 
@@ -252,6 +278,9 @@ func TestAppliedLag(t *testing.T) {
 		{"指纹为空", gen("", uploaded), "", 0},
 		{"已经跟上", gen(fp, uploaded), fp, 0},
 		{"时钟回拨", gen(fp, future), "old", 0},
+		// 刚建出来的 Binding：appliedFingerprint 还是空，而证书已经有一代了。
+		// 这是生产里最常见的非零取值，也是 spec §10.3 的告警第一天会打在的形态。
+		{"从未 applied 过", gen(fp, uploaded), "", 90 * time.Second},
 		{"落后 90 秒", gen(fp, uploaded), "old", 90 * time.Second},
 	}
 	for _, c := range cases {
