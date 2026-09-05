@@ -6,7 +6,7 @@
 
 **Architecture:** 与证书 controller 同一二进制、同一 manager。`pkg/provider` 定义 provider 无关的 `Target` / `CertMaterial` / `ObservedState` / `Provider` 接口与注册表；`pkg/provider/fc3` 是第一个实现，只做 read-modify-write 与协议判断；`pkg/aliyun` 追加窄接口 `FC3Client`（与 `CASClient` 同包，复用 `Classify` / `Limiters` / `OnCall` 三套既有机制），私钥在这一层被剔除，绝不向上传递。`internal/controller` 的绑定 controller 负责仲裁、SANs 覆盖、账号 fencing、drift 判定、status 与指标——即 spec §7 职责边界表里归「通用层」的全部内容。
 
-**Tech Stack:** 沿用 Plan 1 的工具链（Go 1.26 / controller-runtime v0.24.1 / envtest + Ginkgo v2 / cert-manager v1.21.1 类型）。新增 `github.com/alibabacloud-go/fc-20230330/v4 v4.8.2`（依赖 `darabonba-openapi/v2 v2.2.4` 与 `tea v1.5.2`，与现有 go.mod 一致，不会触发升级）。
+**Tech Stack:** 沿用 Plan 1 的工具链（Go 1.26 / controller-runtime v0.24.1 / envtest + Ginkgo v2 / cert-manager v1.21.1 类型）。新增 `github.com/alibabacloud-go/fc-20230330/v4 v4.8.2`（依赖 `darabonba-openapi/v2 v2.2.4`；FC SDK 要求 `tea >= v1.5.2`，本仓库现为 `v1.5.3`，不触发升级）。
 
 **Spec:** `docs/superpowers/specs/2026-09-04-le-to-alicloud-operator-design.md`
 
@@ -60,8 +60,9 @@
 | `internal/controller/indexes.go`（改） | 追加 `TargetKey` 索引（空键跳过） |
 | `internal/controller/metrics.go`（改） | binding 侧指标；`OnCall` 钩子按 service 参数化 |
 | `internal/controller/cas_factory.go`（改） | 适配泛型 `ClientCache` |
-| `internal/controller/suite_test.go`（改） | 启动绑定 reconciler、注入 fake FC3 |
-| `internal/controller/binding_*_test.go` | 每个任务对应的单元与 Ginkgo 测试（`binding_basic` / `binding_conflict` / `binding_material` / `binding_observe` / `binding_apply` / `binding_deletion`） |
+| `internal/controller/suite_test.go`（改） | 只在 `BeforeSuite` 里接线绑定 reconciler（并补该接线需要的 import），不放任何 FC3 helper |
+| `internal/controller/suite_fc3_test.go` | FC3 fake 的全局变量与全部 binding 测试 helper：`resetFC3` / `currentFC3` / `setFC3FactoryErr` / `createBinding` / `createCertificate` / `bindingCond` / `getBinding`（Task 7 创建） |
+| `internal/controller/binding_*_test.go` | 每个任务对应的单元与 Ginkgo 测试（`binding_basic` / `binding_conflict` / `binding_conflict_envtest` / `binding_material` / `binding_observe` / `binding_apply` / `binding_deletion`）；`binding_conflict_envtest_test.go` 由 Task 12 创建（Task 8 只交付纯函数单测） |
 | `api/v1alpha1/aliyuncertificatebinding_types.go`（改） | `IndexBindingByTarget` 常量；`status.cleanupStartedAt` |
 | `cmd/main.go`（改） | 接线绑定 reconciler，消费 `--drift-check-interval` |
 | `docs/ram/binding-fc3-policy.json` | spec §8.3 的 FC3 资源级 ARN 策略样例 |
@@ -228,7 +229,7 @@ git commit -m "chore: pin fc-20230330/v4 and lock the SDK field contract"
   - `provider.Client any`
   - `provider.DeletionPolicy string`，常量 `provider.DeletionPolicyOrphan = "Orphan"`、`provider.DeletionPolicyUnbind = "Unbind"`
   - `provider.Provider` 接口：`Name() string`、`Capabilities() Capabilities`、`Observe(ctx, Target, Client) (ObservedState, error)`、`Apply(ctx, Target, Client, CertMaterial, ApplyOptions) error`、`Cleanup(ctx, Target, Client, DeletionPolicy) error`
-  - `provider.ProviderError{Code string; Retryable bool; Reason string; Err error}`，方法 `Error() string`、`Unwrap() error`；构造 `provider.Errorf(code string, retryable bool, reason string, err error) *ProviderError`
+  - `provider.ProviderError{Code string; Retryable bool; Reason string; Err error}`，方法 `Error() string`（**只回显 Code / Retryable / Reason，不回显被包住的 `Err`**）、`Unwrap() error`；构造 `provider.Errorf(code string, retryable bool, reason string, err error) *ProviderError`
   - 错误码常量：`CodeTargetNotFound`、`CodeAuth`、`CodeThrottled`、`CodeRetryable`、`CodePermanent`、`CodeInvalidClient`、`CodeInvalidTarget`
   - `provider.ErrorOf(err error) *ProviderError`（非本类型返回 nil）
   - `provider.Register(p Provider)`、`provider.Get(typeName string) (Provider, bool)`、`provider.Names() []string`
@@ -273,13 +274,24 @@ func TestErrorOf_PlainError(t *testing.T) {
 	}
 }
 
+// 消息是唯一会被原样写进日志的字段（condition 的 message 是固定文案）。这里把一段
+// 「响应体形状」的敏感片段注入被包住的 err，断言它不会经由 Error() 泄漏出来——只有
+// Code / Retryable / Reason 这三个取值有界的字段允许出现。
 func TestProviderError_MessageHasNoPayload(t *testing.T) {
-	pe := provider.Errorf(provider.CodeAuth, false, "CredentialsInvalid", errors.New("sdk error code=Forbidden status=403"))
+	const payload = "-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEA-----END RSA PRIVATE KEY-----"
+	pe := provider.Errorf(provider.CodeAuth, false, "CredentialsInvalid", errors.New("upstream: "+payload))
 	msg := pe.Error()
-	for _, want := range []string{provider.CodeAuth, "Forbidden"} {
+	if contains(msg, payload) || contains(msg, "BEGIN RSA PRIVATE KEY") {
+		t.Fatalf("被包住的错误内容泄漏进了消息: %s", msg)
+	}
+	for _, want := range []string{provider.CodeAuth, "CredentialsInvalid"} {
 		if !contains(msg, want) {
 			t.Errorf("消息里应含 %q: %s", want, msg)
 		}
+	}
+	// 内容本身没有丢，只是不进消息：需要完整上下文的地方走 Unwrap。
+	if !contains(pe.Unwrap().Error(), payload) {
+		t.Error("Unwrap 应保留原始错误")
 	}
 }
 
@@ -496,8 +508,13 @@ type ProviderError struct {
 	Err       error
 }
 
+// Error 只回显取值有界的三个字段。
+//
+// 被包住的 err 进 Unwrap 链、不进消息：它的文本由 SDK / 云侧决定，长度与内容都不
+// 受我们控制，而这条消息会被原样写进日志（Global Constraints 的「私钥内容绝不出现在
+// 日志、event、status、error message 中」）。需要完整上下文时用 errors.Unwrap。
 func (e *ProviderError) Error() string {
-	return fmt.Sprintf("provider error %s (retryable=%t): %v", e.Code, e.Retryable, e.Err)
+	return fmt.Sprintf("provider error %s (retryable=%t, reason=%s)", e.Code, e.Retryable, e.Reason)
 }
 
 func (e *ProviderError) Unwrap() error { return e.Err }
@@ -619,6 +636,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 )
@@ -694,15 +712,31 @@ func TestClientCache_TypedPerService(t *testing.T) {
 	}
 }
 
+// 独立通道的判据不是「两个常量都存在」，而是「耗尽 FC3 的桶不会拖慢 CAS 写」。
+// 只调一次 Wait 的写法在两个 kind 共用一个桶时同样会通过，等于没测。
 func TestLimitFC3_HasOwnBucket(t *testing.T) {
 	l := aliyun.NewLimiters()
 	ctx := t.Context()
-	// 只验证它是一个独立通道：先把 FC3 通道的 burst 用掉，CAS 写通道仍应立刻放行。
+	// FC3 是 5 QPS / burst 1：把 burst 里那一个令牌取走，桶就空了。
 	if err := l.Wait(ctx, "ak", aliyun.LimitFC3); err != nil {
 		t.Fatal(err)
 	}
+	// 桶空之后再取一个必须等满一个补充周期（1/5 s = 200ms）。判据放宽到 150ms，
+	// 给 CI 上的调度抖动留余量。
+	start := time.Now()
+	if err := l.Wait(ctx, "ak", aliyun.LimitFC3); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d < 150*time.Millisecond {
+		t.Errorf("FC3 桶耗尽后应等待约 200ms，实际 %v——限流通道没有独立的 rate/burst", d)
+	}
+	// 同一个 key 的 CAS 写通道（50 QPS / burst 10）必须完全不受影响。
+	start = time.Now()
 	if err := l.Wait(ctx, "ak", aliyun.LimitCASWrite); err != nil {
 		t.Fatal(err)
+	}
+	if d := time.Since(start); d >= 50*time.Millisecond {
+		t.Errorf("CAS 写通道应立即放行，实际等了 %v——两个 kind 共用了同一个桶", d)
 	}
 }
 ```
@@ -1300,7 +1334,7 @@ git commit -m "feat: implement the real FC3 client with rate limiting and privat
 - Create: `pkg/aliyun/fake/fc3_test.go`
 
 **Interfaces:**
-- Consumes：`aliyun.FC3Client` / `CustomDomain` / `UpdateCustomDomainInput` / `CertConfig` / `DomainEcho` / `Error` / `ClassNotFound`（Task 3）。
+- Consumes：`aliyun.FC3Client` / `CustomDomain` / `UpdateCustomDomainInput` / `CertConfig` / `DomainEcho` / `Error` / `ClassNotFound`（Task 3）；`aliyun.ActionGetCustomDomain` / `aliyun.ActionUpdateCustomDomain` / `aliyun.ClassPermanent`（Task 4，在 `fc3_sdk.go` 里产出——本 Task 必须排在 Task 4 之后）。
 - Produces（Task 6 的 provider 单测与 Task 7–13 的 envtest 都用它）：
   - `fake.FC3`，构造 `fake.NewFC3() *FC3`
   - `fake.Domain{DomainName, Protocol, CertName string; CertPEM, KeyPEM []byte; Echo any}`（服务端侧快照，**含私钥**，因为它扮演的就是云）
@@ -1476,6 +1510,11 @@ import (
 )
 
 // ErrDomainNotFound 模拟 FC3 对不存在域名的 404。
+//
+// spec §12.3：未实测（FC3 对不存在的自定义域名返回的真实错误码与 HTTP 状态码未核实，
+// 这里的 `DomainNameNotFound` 是猜的；若真实码既不含 `NotFound` 也不是 404，
+// `aliyun.classifyCode` 会把它归成 `ClassPermanent`，`CodeTargetNotFound` 分支就永远走不到），
+// 实测结论见 test/integration/RESULTS.md
 var ErrDomainNotFound = &aliyun.Error{
 	Class: aliyun.ClassNotFound, Op: aliyun.ActionGetCustomDomain,
 	Code: "DomainNameNotFound", Err: errors.New("custom domain not found"),
@@ -1659,7 +1698,7 @@ git commit -m "test: add an in-memory FC3 fake with fault injection"
   - `pki.LeafFingerprint(certPEM []byte) (string, error)`
   - `fc3.Provider`（零值可用），`(*fc3.Provider) Name/Capabilities/Observe/Apply/Cleanup`；`init()` 中 `provider.Register(&Provider{})`
   - 包内：`protocolHasHTTPS(p string) bool`、`isHTTPSOnly(p string) bool`、常量 `protocolHTTP = "HTTP"`、`protocolBoth = "HTTP,HTTPS"`
-  - 包内：`toProviderError(op string, err error, applyPhase bool) error`
+  - 包内：`toProviderError(op string, err error, failReason string) error`（`failReason` 是「说不出更具体的话时」写进 condition 的 reason，Observe 与 Apply 传不同的值，bool 表达不了；`op` 作为错误消息前缀被真正用掉，见 Step 4）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2055,33 +2094,51 @@ import (
 //
 // failReason 是「说不出更具体的话时」写进 condition 的 reason：Observe 传
 // ReasonApplyFailed 没有意义，所以由调用方给。
+//
+// op 作为错误消息前缀（`op + ": " + …`）：一个 ProviderError 只说「Permanent」时
+// 分不清是 Get 还是 Update 挂了，加上前缀才有诊断价值——顺带让 unparam 不再把它
+// 报成未使用形参。消息里只有 op 与已分类的错误，绝不含任何 SDK 响应体：pkg/aliyun
+// 的 fromSDKError 早已只保留 code / status，ProviderError.Error() 也不回显被包住的 err。
+//
+// 分类完全交给 aliyun.classifyCode，不在这里按错误码字面量做推测式兜底：
+// 「Code 含 DomainName 且 Permanent 就当 TargetNotFound」之类的规则会把
+// InvalidDomainName 这种真·永久错误误判成「域名还没建」，然后每 5 分钟空转一次。
+// 若后续的集成测试发现「不存在的自定义域名」得到的 aliyun.ClassOf(err) != ClassNotFound，
+// 那时回去修 aliyun.classifyCode（错误码归类的唯一落点），而不是在本文件加分支。
 func toProviderError(op string, err error, failReason string) error {
 	if err == nil {
 		return nil
 	}
+	// withOp 只做前缀，不追加任何新内容；%w 保住 Unwrap 链，errors.As 仍能取到 *aliyun.Error。
+	withOp := func(e error) error { return fmt.Errorf("%s: %w", op, e) }
 	switch aliyun.ClassOf(err) {
 	case aliyun.ClassNotFound:
 		// 域名不存在不是瞬时故障：可能是 Terraform 还没建。Retryable=false，
 		// 让通用层用固定 5m 的长 requeue 而不是指数退避（spec §6.2 步骤 5）。
-		return provider.Errorf(provider.CodeTargetNotFound, false, certsv1alpha1.ReasonTargetNotFound, err)
+		return withOp(provider.Errorf(provider.CodeTargetNotFound, false, certsv1alpha1.ReasonTargetNotFound, err))
 	case aliyun.ClassAuth:
-		return provider.Errorf(provider.CodeAuth, false, certsv1alpha1.ReasonCredentialsInvalid, err)
+		return withOp(provider.Errorf(provider.CodeAuth, false, certsv1alpha1.ReasonCredentialsInvalid, err))
 	case aliyun.ClassRetryable:
 		if ae := asAliyunError(err); ae != nil && isThrottling(ae.Code) {
-			return provider.Errorf(provider.CodeThrottled, true, certsv1alpha1.ReasonThrottled, err)
+			return withOp(provider.Errorf(provider.CodeThrottled, true, certsv1alpha1.ReasonThrottled, err))
 		}
-		return provider.Errorf(provider.CodeRetryable, true, failReason, err)
+		return withOp(provider.Errorf(provider.CodeRetryable, true, failReason, err))
 	default:
-		return provider.Errorf(provider.CodePermanent, false, failReason, err)
+		return withOp(provider.Errorf(provider.CodePermanent, false, failReason, err))
 	}
 }
 ```
+
+`fmt` 要进本文件的 import（下面那个 import 块一并给出）。返回值仍是 `error` 而不是
+`*provider.ProviderError`——外面统一用 `provider.ErrorOf(err)` 取，`fmt.Errorf` 的
+`%w` 包装不影响 `errors.As`。
 
 补上两个小助手（同文件）：
 
 ```go
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -2093,8 +2150,16 @@ func asAliyunError(err error) *aliyun.Error {
 	return nil
 }
 
+// isThrottling 沿用 CAS 的经验：阿里云的限流码都以 Throttling 开头。
+//
+// spec §12.3：未实测（FC3 的限流错误码是否同样以 `Throttling` 开头未核实；若不是，
+// 被限流会落进 CodeRetryable 走指数退避而不是 CodeThrottled，指标里也看不到 throttled），
+// 实测结论见 test/integration/RESULTS.md
 func isThrottling(code string) bool { return strings.HasPrefix(code, "Throttling") }
 ```
+
+**这两个 import 块最终要合并成一个**（`goimports` 会替你做，但计划里分成两段只是为了
+就近展示）：`errors.go` 的最终 import 是 `errors` / `fmt` / `strings` 加三个内部包。
 
 `pkg/provider/fc3/provider.go`：
 
@@ -2300,8 +2365,10 @@ git commit -m "feat: implement the FC3 custom domain provider with read-modify-w
 - Modify: `internal/controller/cas_factory.go`
 - Create: `internal/controller/binding_status.go`
 - Create: `internal/controller/aliyuncertificatebinding_controller.go`
-- Modify: `internal/controller/suite_test.go`
+- Modify: `internal/controller/suite_test.go`（只加 `BeforeSuite` 里的绑定 reconciler 接线与该接线需要的 import）
+- Create: `internal/controller/suite_fc3_test.go`（FC3 fake 全局变量与全部 binding 测试 helper）
 - Create: `internal/controller/binding_basic_test.go`
+- Modify: `config/rbac/role.yaml`（Step 9 的 `make manifests` 生成，Step 10 一并提交）
 
 **Interfaces:**
 - Consumes：`provider.Provider` / `provider.Client` / `provider.Target`（Task 2）；`certsv1alpha1.AliyunCertificateBinding` / `TargetKey()` / `IndexBindingByCertificate` / `ConditionApplied` / `ConditionConflict` / `ConditionReady` / `Reason*` / `FinalizerName`（已存在）；`condTrue` 与 `setCondition` 是证书专用的（参数类型是 `*AliyunCertificate`），Binding 需要自己的一套。
@@ -2312,7 +2379,7 @@ git commit -m "feat: implement the FC3 custom domain provider with read-modify-w
   - `controller.bindingRound{b, orig *v1alpha1.AliyunCertificateBinding; provider string; lag time.Duration}`；`newBindingRound(b) *bindingRound`
   - `binding_status.go`：`setBindingCondition(b, condType string, status metav1.ConditionStatus, reason, message string)`、`bindingCondTrue(b, condType) bool`、`bindingCondReason(b, condType) string`、`(r) patchBinding(ctx, rd *bindingRound) error`、`aggregateBindingReady(b)`、`setBindingReadyFalse(b, reason, message string)`、`targetIdentifier(b) string`、`targetRegion(b) string`（两者 nil-safe，供日志与 label 使用）
   - `metrics.go`：`bindingReadyGauge`、`bindingConflictGauge`、`bindingAppliedAge`、`bindingApplyTotal`、`bindingDriftTotal`；`recordBindingMetrics(rd *bindingRound)`、`clearBindingMetrics(namespace, name, providerName string)`；`aliyunAPICallRecorder(service string) func(action, code string, d time.Duration)`；常量 `serviceFC3 = "fc"`
-  - 测试 suite 全局：`bindingReconciler *AliyunCertificateBindingReconciler`、`fakeFC3 *fake.FC3`、helper `currentFC3() *fake.FC3`、`resetFC3() *fake.FC3`、`setFC3FactoryErr(err error)`、`createBinding(ctx, ns, name, certName, domain string, mutate func(*v1alpha1.AliyunCertificateBinding)) *v1alpha1.AliyunCertificateBinding`、`bindingCond(ctx, ns, name, condType string) metav1.Condition`
+  - 测试 suite 全局（**全部落在新文件 `internal/controller/suite_fc3_test.go`**，`suite_test.go` 里只留 `BeforeSuite` 的接线）：`bindingReconciler *AliyunCertificateBindingReconciler`、`fakeFC3 *fake.FC3`、helper `currentFC3() *fake.FC3`、`resetFC3()`（**无返回值**）、`setFC3FactoryErr(err error)`、`createBinding(ctx, ns, name, certName, domain string, mutate func(*v1alpha1.AliyunCertificateBinding)) *v1alpha1.AliyunCertificateBinding`（domain 由调用方显式给，见 Step 8 的域名约定）、`createCertificate(ctx, ns, name string, dnsNames ...string)`、`bindingCond(ctx, ns, name, condType string) metav1.Condition`、`getBinding(ctx, ns, name) *v1alpha1.AliyunCertificateBinding`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2323,6 +2390,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	. "github.com/onsi/ginkgo/v2"
@@ -2344,7 +2412,7 @@ var _ = Describe("绑定 controller：骨架", func() {
 
 	It("证书不存在时 Ready=False/CertificateNotFound，且不碰云", func() {
 		ns := newNamespace(ctx)
-		createBinding(ctx, ns, "b1", "no-such-cert", "api.example.com", nil)
+		createBinding(ctx, ns, "b1", "no-such-cert", fmt.Sprintf("b1.%s.example.com", ns), nil)
 
 		eventually(func() bool {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady)
@@ -2355,7 +2423,7 @@ var _ = Describe("绑定 controller：骨架", func() {
 
 	It("加 finalizer 并写 observedGeneration", func() {
 		ns := newNamespace(ctx)
-		createBinding(ctx, ns, "b2", "no-such-cert", "api.example.com", nil)
+		createBinding(ctx, ns, "b2", "no-such-cert", fmt.Sprintf("b2.%s.example.com", ns), nil)
 
 		b := &certsv1alpha1.AliyunCertificateBinding{}
 		eventually(func() bool {
@@ -2371,9 +2439,10 @@ var _ = Describe("绑定 controller：骨架", func() {
 		ns := newNamespace(ctx)
 		// 只建 AliyunCertificate，不让它走到 Issued：不写 Secret，证书 controller 会
 		// 停在 Issued=False/SecretNotFound。
-		createCertificate(ctx, ns, "c1", "api.example.com")
+		domain := fmt.Sprintf("b3.%s.example.com", ns)
+		createCertificate(ctx, ns, "c1", domain)
 		setCertificateStatus(ctx, ns, "c1", 1, cmmeta.ConditionFalse)
-		createBinding(ctx, ns, "b3", "c1", "api.example.com", nil)
+		createBinding(ctx, ns, "b3", "c1", domain, nil)
 
 		eventually(func() bool {
 			c := bindingCond(ctx, ns, "b3", certsv1alpha1.ConditionReady)
@@ -2461,13 +2530,18 @@ func RegisterIndexes(mgr ctrl.Manager) error {
 
 `internal/controller/metrics.go`：在 `var (...)` 块内追加五个指标，并把 `recordAliyunAPICall` 换成工厂函数。
 
+两个新 gauge 的 label 用 `crLabels`（`var (` 之前那个 `[]string{"namespace", "name"}` 常量，
+Plan 3 的第一个任务引入；本任务开工时 main 上已经有它，见 cross-plan 协调文件 §1）。
+写字面量会让 `goconst` 复现，也破坏「label 顺序与 `WithLabelValues(ns, n)` 一致」这条保证。
+`bindingAppliedAge` 多一个 `provider` label，与 `crLabels` 不同型，三个 label 保留字面量。
+
 ```go
 	bindingReadyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "aliyuncert_binding_ready", Help: "1 if the binding Ready condition is True",
-	}, []string{"namespace", "name"})
+	}, crLabels)
 	bindingConflictGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "aliyuncert_binding_conflict", Help: "1 if the binding Conflict condition is True",
-	}, []string{"namespace", "name"})
+	}, crLabels)
 	// aliyuncert_binding_applied_age_seconds 是 spec §10.1 点名「必须告警」的那一个：
 	// 独有的失败模式是「证书续期成功了，但没推到线上」。
 	//
@@ -2744,7 +2818,8 @@ func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req 
 		if err := r.Update(ctx, b); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		// Update 会触发本对象的 watch 事件，不需要显式 requeue
+		return ctrl.Result{}, nil
 	}
 
 	b.Status.ObservedGeneration = b.Generation
@@ -2829,42 +2904,66 @@ func (r *AliyunCertificateBindingReconciler) SetupWithManager(mgr ctrl.Manager) 
 
 `certIssued` 用到 `meta`，记得 import `"k8s.io/apimachinery/pkg/api/meta"`；`metav1` 暂时未用则删掉该 import（Task 8 会加回来）。
 
-- [ ] **Step 7: 接线 envtest suite**
+- [ ] **Step 7: 新建 `suite_fc3_test.go`，并在 `suite_test.go` 里只加接线**
 
-`internal/controller/suite_test.go`：全局变量区追加
+FC3 的全局变量与**全部** binding 测试 helper 都进一个新文件
+`internal/controller/suite_fc3_test.go`，`suite_test.go` 只留 `BeforeSuite` 里的接线。
+这样做是为了把与 Plan 3 的合并冲突压到最小：Plan 3 的第一个任务会改 `suite_test.go`
+里 `resetCAS()` 那一带，而那正是这些 helper 原本要插进去的位置；分文件之后两边不再
+相邻，唯一预期会真报冲突的 hunk 就消失了。同包内共用 `fakeMu` / `k8sClient` 不受影响。
+
+`internal/controller/suite_fc3_test.go`（新文件）：
 
 ```go
+package controller
+
+import (
+	"context"
+
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
+)
+
+// 与 currentCAS / resetCAS 同构，共用 suite_test.go 里的 fakeMu。
+var (
 	bindingReconciler *AliyunCertificateBindingReconciler
 	fakeFC3           *fake.FC3
 	fc3FactoryErr     error
-```
+)
 
-并追加 helper（与 `currentCAS` / `resetCAS` 同构，共用 `fakeMu`）：
+// testAccountID 是 fake FC3 默认回报的账号，用于账号 fencing 用例。
+const testAccountID = "1234567890"
 
-```go
 // currentFC3 让每个测试可以替换 fakeFC3 而 manager 无需重启。
 func currentFC3() *fake.FC3 { fakeMu.Lock(); defer fakeMu.Unlock(); return fakeFC3 }
 
 // resetFC3 换上一个全新的 fake，并清掉上一轮注入的工厂错误。
-func resetFC3() *fake.FC3 {
+//
+// 无返回值：没有任何调用点用得上它，留着会被 unparam 报出来（与 resetCAS 一致）。
+// 需要拿到 fake 的地方一律用 currentFC3()。
+func resetFC3() {
 	fakeMu.Lock()
 	defer fakeMu.Unlock()
 	fakeFC3 = fake.NewFC3()
 	fakeFC3.SetAccountID(testAccountID)
 	fc3FactoryErr = nil
-	return fakeFC3
 }
 
 // setFC3FactoryErr 让 ProviderFactory 直接失败，用来测凭证分支。
 func setFC3FactoryErr(err error) { fakeMu.Lock(); fc3FactoryErr = err; fakeMu.Unlock() }
 
 func currentFC3FactoryErr() error { fakeMu.Lock(); defer fakeMu.Unlock(); return fc3FactoryErr }
-
-// testAccountID 是 fake FC3 默认回报的账号，用于账号 fencing 用例。
-const testAccountID = "1234567890"
 ```
 
-在 `BeforeSuite` 里 `reconciler.SetupWithManager` 之后追加：
+Step 8 的四个 helper（`createCertificate` / `createBinding` / `bindingCond` / `getBinding`）
+也进这个文件，见下。
+
+`internal/controller/suite_test.go` 里**只**在 `BeforeSuite` 的 `reconciler.SetupWithManager`
+之后追加下面这一段（外加它需要的 import），不要在这个文件里加任何 helper 或全局变量：
 
 ```go
 	resetFC3()
@@ -2886,11 +2985,14 @@ const testAccountID = "1234567890"
 	Expect(bindingReconciler.SetupWithManager(k8sManager)).To(Succeed())
 ```
 
-import 追加 `"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"` 与 `"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/fc3"`。
+`suite_test.go` 的 import 追加 `"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"`
+与 `"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/fc3"`（`context` / `time` 已有）。
 
 - [ ] **Step 8: 写共用的测试 helper**
 
-追加到 `internal/controller/binding_basic_test.go` 末尾（后续任务的用例都用它们）：
+追加到 `internal/controller/suite_fc3_test.go` 末尾（**不要**放进 `binding_basic_test.go`：
+后续 6 个测试文件都用它们，跟着 fake 的全局变量放在一起最省心，也让每个 binding 测试
+文件都只剩用例、不再重复定义 helper，避开 `dupl`）：
 
 ```go
 // createCertificate 建一个最小可用的 AliyunCertificate。
@@ -2910,6 +3012,12 @@ func createCertificate(ctx context.Context, ns, name string, dnsNames ...string)
 }
 
 // createBinding 建一个指向 FC3 自定义域名的 Binding。mutate 可为 nil。
+//
+// domain 一律由调用方显式传入，且必须带上 namespace：
+// `fmt.Sprintf("%s.%s.example.com", bindingName, ns)`。仲裁是**跨 namespace** 按
+// TargetKey() 检索的（spec §6.2），而 TargetKey() 只含 type/region/domainName，不含
+// namespace——两个测试文件用同一个字面量域名，先建的那个 Binding 会一直把后建的判成
+// Conflict，Applied 永远不为 True。helper 不给默认域名，就是为了逼调用方写出这一点。
 func createBinding(ctx context.Context, ns, name, certName, domain string, mutate func(*certsv1alpha1.AliyunCertificateBinding)) *certsv1alpha1.AliyunCertificateBinding {
 	b := &certsv1alpha1.AliyunCertificateBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -2954,6 +3062,14 @@ func getBinding(ctx context.Context, ns, name string) *certsv1alpha1.AliyunCerti
 
 **注意命名冲突**：`retention_test.go` 里已有一个纯函数 helper 叫 `binding(gen, observed, applied)`。上面全部用 `createBinding` / `getBinding`，不要复用那个名字。
 
+**envtest 域名约定（Task 7–13 全部用例都必须遵守）**：每个 Binding 的目标域名写成
+`fmt.Sprintf("%s.%s.example.com", bindingName, ns)`（`newNamespace` 每个用例生成一个新
+namespace，因此域名天然互不相交）。同一用例里 `createCertificate` 的 SAN、
+`currentFC3().AddDomain` 的 `DomainName` 与 `createBinding` 的 domain 必须是同一个值——
+先算进一个局部变量 `domain` 再三处引用，别抄三遍字面量。故意要验证「两个 Binding 抢同
+一个目标」时（Task 8/12 的仲裁用例）才让两个 Binding 共用一个域名，那时也用胜者那一
+方的名字来构造。
+
 - [ ] **Step 9: 运行，确认通过**
 
 ```bash
@@ -2976,9 +3092,11 @@ git commit -m "feat: add the binding controller skeleton with target index and b
 
 **Files:**
 - Create: `internal/controller/binding_conflict.go`
-- Create: `internal/controller/binding_conflict_test.go`
-- Create: `internal/controller/binding_conflict_envtest_test.go`
+- Create: `internal/controller/binding_conflict_test.go`（纯函数单测，不含 envtest）
 - Modify: `internal/controller/aliyuncertificatebinding_controller.go`
+
+`internal/controller/binding_conflict_envtest_test.go` **不在本任务**：三个 envtest 用例要断言
+`Applied=True`，Apply 到 Task 12 才落地，因此整个文件由 Task 12 创建。
 
 **Interfaces:**
 - Consumes：`bindingRound`、`setBindingCondition`、`aggregateBindingReady`、`patchBinding`（Task 7）；`certsv1alpha1.IndexBindingByTarget`、`TargetKey()`、`ConditionConflict`、`ReasonConflictingBinding`。
@@ -3072,121 +3190,11 @@ func TestPickWinner_AllDeleting(t *testing.T) {
 }
 ```
 
-`internal/controller/binding_conflict_envtest_test.go`：
-
-```go
-package controller
-
-import (
-	"context"
-
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
-	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
-	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki/testutil"
-)
-
-var _ = Describe("绑定 controller：冲突仲裁", func() {
-	ctx := context.Background()
-
-	BeforeEach(func() {
-		resetCAS()
-		resetFC3()
-	})
-
-	It("同目标的第二个 Binding 被判 Conflict 且不写云", func() {
-		ns := newNamespace(ctx)
-		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "api.example.com", Protocol: "HTTP", Echo: "routes"})
-
-		createCertificate(ctx, ns, "c1", "api.example.com")
-		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		eventually(func() bool {
-			return condStatusOf(ctx, ns, "c1", certsv1alpha1.ConditionIssued) == metav1.ConditionTrue
-		})
-
-		createBinding(ctx, ns, "first", "c1", "api.example.com", nil)
-		eventually(func() bool {
-			return bindingCond(ctx, ns, "first", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
-		})
-		writesAfterFirst := currentFC3().UpdateCalls()
-
-		createBinding(ctx, ns, "second", "c1", "api.example.com", nil)
-		eventually(func() bool {
-			c := bindingCond(ctx, ns, "second", certsv1alpha1.ConditionConflict)
-			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonConflictingBinding
-		})
-		Expect(bindingCond(ctx, ns, "second", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionFalse))
-		// 输家一次云写入都不该发出——两个 Binding 轮流写同一个域名比不写更危险。
-		Expect(currentFC3().UpdateCalls()).To(Equal(writesAfterFirst))
-	})
-
-	It("胜者被删掉后输家接管", func() {
-		ns := newNamespace(ctx)
-		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "takeover.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "takeover.example.com", Protocol: "HTTP"})
-
-		createCertificate(ctx, ns, "c1", "takeover.example.com")
-		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "first", "c1", "takeover.example.com", nil)
-		createBinding(ctx, ns, "second", "c1", "takeover.example.com", nil)
-		eventually(func() bool {
-			return bindingCond(ctx, ns, "second", certsv1alpha1.ConditionConflict).Status == metav1.ConditionTrue
-		})
-
-		Expect(k8sClient.Delete(ctx, getBinding(ctx, ns, "first"))).To(Succeed())
-		eventually(func() bool {
-			c := bindingCond(ctx, ns, "second", certsv1alpha1.ConditionConflict)
-			return c.Status == metav1.ConditionFalse
-		})
-		eventually(func() bool {
-			return bindingCond(ctx, ns, "second", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
-		})
-	})
-
-	It("不同域名互不冲突", func() {
-		ns := newNamespace(ctx)
-		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "a.example.com", "b.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "a.example.com", Protocol: "HTTP"})
-		currentFC3().AddDomain(fake.Domain{DomainName: "b.example.com", Protocol: "HTTP"})
-
-		createCertificate(ctx, ns, "c1", "a.example.com", "b.example.com")
-		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "ba", "c1", "a.example.com", nil)
-		createBinding(ctx, ns, "bb", "c1", "b.example.com", nil)
-
-		eventually(func() bool {
-			return bindingCond(ctx, ns, "ba", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue &&
-				bindingCond(ctx, ns, "bb", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
-		})
-	})
-})
-
-// condStatusOf 读 AliyunCertificate 的 condition 状态。
-func condStatusOf(ctx context.Context, ns, name, condType string) metav1.ConditionStatus {
-	ac := &certsv1alpha1.AliyunCertificate{}
-	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, ac); err != nil {
-		return metav1.ConditionUnknown
-	}
-	for _, c := range ac.Status.Conditions {
-		if c.Type == condType {
-			return c.Status
-		}
-	}
-	return metav1.ConditionUnknown
-}
-```
-
-（import 里补 `"sigs.k8s.io/controller-runtime/pkg/client"`；`cmmeta` 若最终没用到就删掉。）
-
-**这三个 envtest 用例依赖 Task 9–12 才会真正 Apply。** 执行顺序上，把 `binding_conflict_envtest_test.go` 里断言 `ConditionApplied` 的部分先写成 `Skip("等 Task 12 的 Apply 落地")`，在 Task 12 结束时解除跳过——或者干脆把这三个用例整体放到 Task 12 再启用。选后者时，本任务只交付单元测试 + 仲裁逻辑，并在 ledger 里记一笔。
+**本任务不写 envtest。** 仲裁的 envtest 用例（`binding_conflict_envtest_test.go`）整体推迟
+到 Task 12 创建：它们要断言 `Applied=True`，而 Apply 到 Task 12 才落地。写成
+`Skip("等 Task 12")` 再回来解除的方案已被否决——计划里已经有四个跨任务红灯用例要跟踪，
+少一个待办就少一次遗漏，而仲裁逻辑本身被上面四个纯函数单测完全覆盖。本任务交付的
+只有 `binding_conflict.go` + `binding_conflict_test.go`。
 
 - [ ] **Step 2: 运行，确认失败**
 
@@ -3250,6 +3258,10 @@ func pickWinner(items []certsv1alpha1.AliyunCertificateBinding) *certsv1alpha1.A
 //
 // 跨 namespace 一起比：同一个 FC3 域名在云上只有一份，两个 namespace 的 Binding 指向
 // 它就是真冲突，不该因为 namespace 不同而被判成两件事。
+//
+// 已知限制：`--watch-namespaces` 生效时 cache 只覆盖被 watch 的 namespace，跨 namespace
+// 仲裁随之退化为跨已 watch namespace 仲裁——cache 里看不见的 Binding 不会成为候选者。
+// 代码上无法修（cache 就是那么大），只能在文档的「已知限制」里写明。
 func (r *AliyunCertificateBindingReconciler) arbitrate(ctx context.Context, b *certsv1alpha1.AliyunCertificateBinding) (*certsv1alpha1.AliyunCertificateBinding, error) {
 	key := b.TargetKey()
 	if key == "" {
@@ -3290,6 +3302,10 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 			fmt.Sprintf("同目标已由 %s/%s 绑定", winner.Namespace, winner.Name))
 		aggregateBindingReady(b)
 		// 云侧一个字节都不写。胜者消失会经 watch 唤醒我们，drift 周期是兜底。
+		// 注意这里是一次早退，而 patchBinding → recordBindingMetrics 会用 rd.lag 刷
+		// applied_age。Task 9 会把 rd.lag = r.appliedLag(b, ac) 提到 Reconcile 里取完
+		// 证书之后、进本函数之前，所以这条路径上的 lag 是真值而不是 0；本任务里
+		// appliedLag 还不存在，rd.lag 暂为 0，Task 9 落地后自动补齐。
 		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 	}
 	setBindingCondition(b, certsv1alpha1.ConditionConflict, metav1.ConditionFalse,
@@ -3326,6 +3342,7 @@ git commit -m "feat: arbitrate conflicting bindings deterministically by (creati
 - Create: `internal/controller/binding_material.go`
 - Create: `internal/controller/binding_material_test.go`
 - Create: `internal/controller/binding_material_envtest_test.go`
+- Modify: `internal/controller/binding_status.go`（Step 4 往里加 `appliedLag`）
 - Modify: `internal/controller/aliyuncertificatebinding_controller.go`
 
 **Interfaces:**
@@ -3430,12 +3447,14 @@ var _ = Describe("绑定 controller：证书材料", func() {
 	It("证书不覆盖目标域名时硬失败，不写云", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "other.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "api.example.com", Protocol: "HTTP"})
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		// 故意签一张不覆盖 domain 的证书。
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "other."+ns+".example.com")
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
 
-		createCertificate(ctx, ns, "c1", "other.example.com")
+		createCertificate(ctx, ns, "c1", "other."+ns+".example.com")
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "api.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 
 		eventually(func() bool {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady)
@@ -3448,12 +3467,13 @@ var _ = Describe("绑定 controller：证书材料", func() {
 	It("Secret 不见了时 Ready=False/SecretNotFound", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "gone.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "gone.example.com", Protocol: "HTTP"})
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
 
-		createCertificate(ctx, ns, "c1", "gone.example.com")
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "gone.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 		eventually(func() bool {
 			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady).Reason != ""
 		})
@@ -3474,11 +3494,12 @@ var _ = Describe("绑定 controller：证书材料", func() {
 	It("Secret 已换但证书 CR 未推进代次时不写 FC3", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		gen1Cert, gen1Key := testutil.IssueLeaf(GinkgoT(), ca, "gate.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "gate.example.com", Protocol: "HTTP"})
-		createCertificate(ctx, ns, "c1", "gate.example.com")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		gen1Cert, gen1Key := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, gen1Cert, gen1Key)
-		createBinding(ctx, ns, "b1", "c1", "gate.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 		eventually(func() bool {
 			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
 		})
@@ -3493,7 +3514,7 @@ var _ = Describe("绑定 controller：证书材料", func() {
 				Err: errors.New("injected"),
 			})
 		}
-		gen2Cert, gen2Key := testutil.IssueLeaf(GinkgoT(), ca, "gate.example.com")
+		gen2Cert, gen2Key := testutil.IssueLeaf(GinkgoT(), ca, domain)
 		simulateIssuance(ctx, ns, "c1", 2, gen2Cert, gen2Key)
 
 		eventually(func() bool {
@@ -3506,7 +3527,7 @@ var _ = Describe("绑定 controller：证书材料", func() {
 })
 ```
 
-（import 补 `corev1 "k8s.io/api/core/v1"`、`"errors"`、`"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"`。前两个用例中的「不写云」断言在 Task 12 之前也成立——那之前根本没有 Apply；**第三个用例断言 `Applied=True`，与 Task 8/11 的情形相同，要到 Task 12 才会转绿**，在 ledger 里记一笔。）
+（import 补 `"fmt"`、`corev1 "k8s.io/api/core/v1"`、`"errors"`、`"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"`。前两个用例中的「不写云」断言在 Task 12 之前也成立——那之前根本没有 Apply；**第三个用例断言 `Applied=True`，与 Task 8/11 的情形相同，要到 Task 12 才会转绿**，在 ledger 里记一笔。）
 
 - [ ] **Step 2: 运行，确认失败**
 
@@ -3527,6 +3548,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -3573,6 +3595,11 @@ func loadBindingMaterial(ctx context.Context, reader client.Reader, ac *certsv1a
 		return m, &materialError{certsv1alpha1.ReasonSecretInvalid, kerr.Error()}
 	}
 
+	// spec §12.3：未实测（FC3 对私钥编码与证书链形状的接受面未核实——CertPEM 是
+	// leaf + intermediates、无根、无空行的 LE 链，KeyPEM 是 PKCS#1/SEC1；FC3 是否要求
+	// PKCS#8、是否要求带根、是否对顺序敏感都没有实测过。猜错的失效方式是静默的：
+	// UpdateCustomDomain 直接返回一个参数类错误，被归成 Permanent），
+	// 实测结论见 test/integration/RESULTS.md
 	m = provider.CertMaterial{
 		Fingerprint: b.Fingerprint,
 		CertPEM:     b.CertPEM(),
@@ -3634,9 +3661,53 @@ func certificateGate(m provider.CertMaterial, ac *certsv1alpha1.AliyunCertificat
 }
 ```
 
-- [ ] **Step 4: 接进 Reconcile**
+- [ ] **Step 4: 接进 Reconcile，并把 `rd.lag` 提到所有早退之前**
 
-在 `reconcileBindingReady` 的仲裁之后、`aggregateBindingReady` 之前插入步骤 3：
+**先改 `Reconcile` 里取证书的那一段**：`rd.lag` 必须在任何早退之前算好。
+
+理由是 `aliyuncert_binding_applied_age_seconds` 是 spec §10.1 唯一点名「必须告警」的绑定侧
+指标，而 `recordBindingMetrics` 每次 patch 都会用 `rd.lag` 刷它。原来的写法把
+`rd.lag = r.appliedLag(b, ac)` 排在材料装载与覆盖校验的早退**之后**，Task 8 的冲突分支
+更在它之前就 return——于是「判定冲突 / Secret 丢了 / 证书不覆盖域名」这三种最该告警的
+状态下 gauge 反而被刷成 0，spec §10.3 的 `AliyunCertificateBindingStale` 永远不触发。
+
+改后的调用顺序固定为：Get binding → Get ac（NotFound 也继续走到算 lag）→
+`rd.lag = r.appliedLag(b, ac)` → 仲裁 → 装载材料 → 覆盖校验 → `certificateGate` →
+provider 工厂 → Observe → Apply。（`certificateGate` 必须排在装载材料之后：它比的是
+`m.Fingerprint`，没有材料就没有指纹可比。）
+
+```go
+	// 1. 取证书。NotFound 不在这里 return——先把 lag 算了。
+	ac := &certsv1alpha1.AliyunCertificate{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.CertificateRef.Name}, ac)
+	switch {
+	case apierrors.IsNotFound(err):
+		ac = nil
+	case err != nil:
+		return ctrl.Result{}, err
+	}
+
+	// 1b. 滞后时长在任何早退之前算好（见上面的理由）。ac 不存在、或 status.current
+	// 为空时无从判断滞后，取 0——那两种状态由 aliyuncert_binding_ready=0 覆盖告警。
+	rd.lag = r.appliedLag(b, ac)
+
+	if ac == nil {
+		// 不碰 Applied：目标上那张证书还在正常服役，证书 CR 不见了说明不了它有问题
+		// （典型场景是 Argo CD 正在换名字重建）。只降 Ready，靠 watch 唤醒。
+		setBindingReadyFalse(b, certsv1alpha1.ReasonCertificateNotFound,
+			fmt.Sprintf("AliyunCertificate %q 不存在", b.Spec.CertificateRef.Name))
+		return ctrl.Result{}, r.patchBinding(ctx, rd)
+	}
+	if !certIssued(ac) {
+		setBindingReadyFalse(b, certsv1alpha1.ReasonCertificateNotReady, "证书尚未通过校验")
+		return ctrl.Result{}, r.patchBinding(ctx, rd)
+	}
+
+	return r.reconcileBindingReady(ctx, rd, ac)
+```
+
+**再在 `reconcileBindingReady` 的仲裁之后、`aggregateBindingReady` 之前插入步骤 3**
+（此处不再算 lag，它已经在上面算过了）：
 
 ```go
 	// 3. 装载材料并校验域名覆盖（spec §6.2 步骤 3）
@@ -3647,10 +3718,10 @@ func certificateGate(m provider.CertMaterial, ac *certsv1alpha1.AliyunCertificat
 	if me != nil {
 		// 不碰 Applied：目标上那张证书还在服役，Secret 出问题说明不了它有毛病
 		// （与证书 controller 不清空 status.current 是同一条原则）。
+		// rd.lag 早已算好，这次早退不会把 applied_age 刷成 0。
 		setBindingReadyFalse(b, me.Reason, me.Message)
 		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 	}
-	rd.lag = r.appliedLag(b, ac)
 
 	// 3b. 证书 CR 必须已经认下 Secret 里的这一代，否则不写云（见 certificateGate）。
 	if !certificateGate(m, ac) {
@@ -3671,9 +3742,14 @@ func certificateGate(m provider.CertMaterial, ac *certsv1alpha1.AliyunCertificat
 // 这就是 aliyuncert_binding_applied_age_seconds 的取值来源。用「滞后多久」而不是
 // 「生效证书有多老」：后者在一切正常时也会一路涨到证书有效期那么长，会让 spec §10.3
 // 的告警式子对每一张健康证书误报。语义已由 team lead 裁决（2026-09-05）。
+//
+// ac 允许为 nil（证书 CR 不存在）：调用点在取证书之后、任何早退之前，那里 ac 可能没取到。
 func (r *AliyunCertificateBindingReconciler) appliedLag(
 	b *certsv1alpha1.AliyunCertificateBinding, ac *certsv1alpha1.AliyunCertificate,
 ) time.Duration {
+	if ac == nil {
+		return 0
+	}
 	cur := ac.Status.Current
 	if cur == nil || cur.Fingerprint == "" || b.Status.AppliedFingerprint == cur.Fingerprint {
 		return 0
@@ -3958,6 +4034,9 @@ func (r *AliyunCertificateBindingReconciler) handleFactoryError(ctx context.Cont
 }
 ```
 
+`aliyuncertificatebinding_controller.go` 的 import 追加 `"errors"`（`handleFactoryError` 用
+`errors.As`）。这一步不能推到 Task 11——本任务收尾就要跑 `make build`，少了它编译不过。
+
 - [ ] **Step 5: 运行，确认通过**
 
 ```bash
@@ -3979,17 +4058,32 @@ git commit -m "feat: resolve provider clients with credential inheritance and pe
 ### Task 11: `Observe` — 幂等短路、账号 fencing、drift 检测
 
 **Files:**
+- Modify: `api/v1alpha1/conditions.go`（Binding reasons 块新增 `ReasonObserveFailed`）
 - Modify: `internal/controller/aliyuncertificatebinding_controller.go`
 - Create: `internal/controller/binding_observe_test.go`
 
 **Interfaces:**
-- Consumes：`provider.Provider.Observe`、`provider.ObservedState`、`provider.ErrorOf`、`provider.Code*`（Task 2、6）；`bindingRound`、`setBindingCondition`、`aggregateBindingReady`（Task 7）。
+- Consumes：`provider.Provider.Observe`、`provider.ObservedState`、`provider.ErrorOf`、`provider.Code*`（Task 2、6）；`bindingRound`、`setBindingCondition`、`aggregateBindingReady`、`bindingCondReason`（Task 7）。
 - Produces：
+  - `certsv1alpha1.ReasonObserveFailed = "ObserveFailed"`（放进 `api/v1alpha1/conditions.go` 的「AliyunCertificateBinding reasons」块，紧跟 `ReasonApplyFailed`）
   - `(r) handleObserveError(ctx, rd *bindingRound, err error) (ctrl.Result, error)`
   - `(r) fenceAccount(rd *bindingRound, obs provider.ObservedState) bool`（true 表示被拦下）
   - `(r) noteDrift(ctx, rd *bindingRound, obs provider.ObservedState, m provider.CertMaterial)`
-  - 常量 `eventReasonObserveFailed = "ObserveFailed"`、`observeFailedMessage`、`driftCorrectedMessage`、`appliedMessage`、`applyFailedMessage`
+  - `(r) eventOnReasonChange(rd *bindingRound, condType, reason, eventType, eventReason, message string)`（Task 12 的 `handleApplyError` 复用）
+  - `noteObserveFailed(b *v1alpha1.AliyunCertificateBinding)`
+  - 常量 `observeFailedMessage`、`driftCorrectedMessage`、`appliedMessage`、`applyFailedMessage`
   - `protocolSatisfied(obs provider.ObservedState, want bool) bool`
+
+**先改 `api/v1alpha1/conditions.go`**：在「AliyunCertificateBinding reasons」的 `const` 块里，
+`ReasonApplyFailed` 之后加一行
+
+```go
+	ReasonObserveFailed       = "ObserveFailed"
+```
+
+理由：这个 reason 会出现在 Warning 事件上，事件 reason 的取值集合必须仍然可枚举——
+放在 controller 包内当私有常量，spec §10.2 的事件全表与 README 就收录不到它。
+（Plan 3 的 spec 对齐任务会把它写进事件表，已记进 cross-plan 协调文件。）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -4001,6 +4095,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -4013,6 +4108,10 @@ import (
 )
 
 // issueAndBind 建证书 + 域名 + Binding，并等到 Applied=True。后续用例的公共前置。
+//
+// domain 由调用方给，一律写成 fmt.Sprintf("%s.%s.example.com", bindingName, ns)：
+// 仲裁是跨 namespace 的，域名撞车会让后建的 Binding 一直停在 Conflict（见 Task 7 Step 8）。
+// Task 13 的删除用例也用这个 helper（跨文件依赖，同包）。
 func issueAndBind(ctx context.Context, ns, certName, bindingName, domain, protocol string) {
 	ca := testutil.NewCA(GinkgoT())
 	certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
@@ -4036,10 +4135,12 @@ var _ = Describe("绑定 controller：Observe", func() {
 	It("域名不存在时 Ready=False/TargetNotFound", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "later.example.com")
-		createCertificate(ctx, ns, "c1", "later.example.com")
+		// 故意不 AddDomain：目标域名在云上还不存在。
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "later.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 
 		eventually(func() bool {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady)
@@ -4050,7 +4151,7 @@ var _ = Describe("绑定 controller：Observe", func() {
 
 	It("指纹一致时短路：不写云，但仍然 Observe", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "idem.example.com", "HTTP")
+		issueAndBind(ctx, ns, "c1", "b1", fmt.Sprintf("b1.%s.example.com", ns), "HTTP")
 
 		writes := currentFC3().UpdateCalls()
 		getsBefore := currentFC3().GetCalls()
@@ -4069,13 +4170,14 @@ var _ = Describe("绑定 controller：Observe", func() {
 
 	It("账号变了就 fencing：Conflict=True/AccountMismatch 且不写", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "fence.example.com", "HTTP")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c1", "b1", domain, "HTTP")
 		Expect(getBinding(ctx, ns, "b1").Status.BoundAccountID).To(Equal(testAccountID))
 
 		writes := currentFC3().UpdateCalls()
 		// 同一个域名在另一个账号下：AK 被换成了别人的，再写就是在写别人的资源。
 		currentFC3().SetAccountID("9999999999")
-		currentFC3().AddDomain(fake.Domain{DomainName: "fence.example.com", Protocol: "HTTP"})
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
 
 		b := getBinding(ctx, ns, "b1")
 		b.Annotations = map[string]string{"poke": "1"}
@@ -4091,13 +4193,14 @@ var _ = Describe("绑定 controller：Observe", func() {
 
 	It("云侧被人换了证书时判定为 drift 并纠正", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "drift.example.com", "HTTP")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c1", "b1", domain, "HTTP")
 		writes := currentFC3().UpdateCalls()
 
 		// 有人手工把证书换成了另一张。指纹既不是 appliedFingerprint 也不是 current。
 		otherCA := testutil.NewCA(GinkgoT())
-		otherPEM, _ := testutil.IssueLeaf(GinkgoT(), otherCA, "drift.example.com")
-		d, _ := currentFC3().Domain("drift.example.com")
+		otherPEM, _ := testutil.IssueLeaf(GinkgoT(), otherCA, domain)
+		d, _ := currentFC3().Domain(domain)
 		d.CertName = "someone-elses"
 		d.CertPEM = otherPEM
 		currentFC3().AddDomain(d)
@@ -4110,12 +4213,16 @@ var _ = Describe("绑定 controller：Observe", func() {
 		eventually(func() bool {
 			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
 		})
-		Expect(d.Echo).To(Equal("routes"))
+		// 必须重新读回来再断言：d 是写入之前抓的本地副本，对它断言恒真，测不到
+		// read-modify-write 有没有把 routeConfig 之类的旁路字段原样回填。
+		d2, _ := currentFC3().Domain(domain)
+		Expect(d2.Echo).To(Equal("routes"))
+		Expect(d2.CertName).NotTo(Equal("someone-elses"))
 	})
 
 	It("Observe 未知失败属于旁路：不降级 Applied", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "bypass.example.com", "HTTP")
+		issueAndBind(ctx, ns, "c1", "b1", fmt.Sprintf("b1.%s.example.com", ns), "HTTP")
 
 		// 一个说不出「目标有没有问题」的错误。若因此把 Applied 打成 False，
 		// Ready 也会掉，运维会以为线上 HTTPS 坏了——而它好好的。
@@ -4150,8 +4257,6 @@ Expected: 新增用例 FAIL（`Applied` 从不变成 True，因为还没有 Obse
 // 事件文案。spec §10.2 要求 Message 不含变量——K8s 只聚合 Reason+Message 完全相同的
 // 事件，带上域名或指纹就等于每个对象各刷一条，很快把 etcd 里的事件淹掉。变量只进日志。
 const (
-	eventReasonObserveFailed = "ObserveFailed"
-
 	observeFailedMessage  = "failed to observe the binding target; the applied state is unchanged"
 	driftCorrectedMessage = "target certificate was changed outside the operator; re-applying"
 	appliedMessage        = "certificate applied to the binding target"
@@ -4197,8 +4302,14 @@ func (r *AliyunCertificateBindingReconciler) handleObserveError(ctx context.Cont
 		return ctrl.Result{RequeueAfter: credentialsRequeue}, r.patchBinding(ctx, rd)
 	}
 	log.Error(err, "Observe 失败", "domain", targetIdentifier(rd.b))
-	r.Recorder.Event(rd.b, corev1.EventTypeWarning, eventReasonObserveFailed, observeFailedMessage)
-	// 一个 condition 都不碰：aggregate 只读 Applied / Conflict，判定与成功时完全一致。
+	// 只在 reason 相对上一轮变化时发事件（spec §10.2「只在状态跃迁时发」）：旁路失败
+	// 每一轮都会重来，每轮发一条 Warning 就是在刷事件表。
+	r.eventOnReasonChange(rd, certsv1alpha1.ConditionApplied, certsv1alpha1.ReasonObserveFailed,
+		corev1.EventTypeWarning, certsv1alpha1.ReasonObserveFailed, observeFailedMessage)
+	// Applied 的 status 一个字节都不改——那才是「旁路失败不降级」的含义。只把 reason
+	// 换成 ObserveFailed：kubectl describe 因此看得出「证书还生效着，但上一轮观测失败」，
+	// 上面那个跃迁判断也才有可比较的痕迹。
+	noteObserveFailed(rd.b)
 	aggregateBindingReady(rd.b)
 	if perr := r.patchBinding(ctx, rd); perr != nil {
 		return ctrl.Result{}, perr
@@ -4207,6 +4318,36 @@ func (r *AliyunCertificateBindingReconciler) handleObserveError(ctx context.Cont
 		return ctrl.Result{}, err // 交给 controller-runtime 指数退避
 	}
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, nil
+}
+
+// eventOnReasonChange 实现 spec §10.2 的「只在状态跃迁时发」。
+//
+// 判据是 rd.orig——本轮开始前从 API server 读到的那一份，也就是「上一轮」的结论。
+// 同一个 condition 的 reason 没变就不发：失败会一轮一轮地重来，每轮一条事件不但没有
+// 新信息，还会把这个对象上真正的跃迁淹掉。
+func (r *AliyunCertificateBindingReconciler) eventOnReasonChange(
+	rd *bindingRound, condType, reason, eventType, eventReason, message string,
+) {
+	if bindingCondReason(rd.orig, condType) == reason {
+		return
+	}
+	r.Recorder.Event(rd.b, eventType, eventReason, message)
+}
+
+// noteObserveFailed 把 Applied 的 reason 改成 ObserveFailed，status 不动。
+//
+// 只在 condition 已经存在时改：从没 Applied 过的对象上凭空造一个 Applied=False，
+// 就把旁路失败变成了真降级，正是这条路径要避免的事。status 不变，
+// metav1.SetStatusCondition 的 lastTransitionTime 语义也不受影响（这里直接改字段，
+// 不走 SetStatusCondition，免得它按「新 condition」处理）。
+func noteObserveFailed(b *certsv1alpha1.AliyunCertificateBinding) {
+	for i := range b.Status.Conditions {
+		if b.Status.Conditions[i].Type == certsv1alpha1.ConditionApplied {
+			b.Status.Conditions[i].Reason = certsv1alpha1.ReasonObserveFailed
+			b.Status.Conditions[i].Message = "上一轮观测失败，保留既有判定"
+			return
+		}
+	}
 }
 
 // fenceAccount 实现账号 fencing（spec §6.2 步骤 5）：status.boundAccountId 一旦固化，
@@ -4241,7 +4382,7 @@ func (r *AliyunCertificateBindingReconciler) noteDrift(ctx context.Context, rd *
 }
 ```
 
-（import 追加 `"strings"`、`corev1 "k8s.io/api/core/v1"`、`logf "sigs.k8s.io/controller-runtime/pkg/log"`、`"errors"`。）
+（import 追加 `"strings"`、`corev1 "k8s.io/api/core/v1"`、`logf "sigs.k8s.io/controller-runtime/pkg/log"`。`"errors"` 已在 Task 10 Step 4 加过，不要重复。）
 
 - [ ] **Step 4: 接进 Reconcile**
 
@@ -4306,7 +4447,7 @@ Expected: 「域名不存在」与「Observe 未知失败不降级」两个用�
 - [ ] **Step 6: 提交**
 
 ```bash
-git add internal/controller/aliyuncertificatebinding_controller.go internal/controller/binding_observe_test.go
+git add api/v1alpha1/conditions.go internal/controller/aliyuncertificatebinding_controller.go internal/controller/binding_observe_test.go
 git commit -m "feat: observe binding targets with account fencing, idempotent short-circuit and drift detection"
 ```
 
@@ -4317,10 +4458,10 @@ git commit -m "feat: observe binding targets with account fencing, idempotent sh
 **Files:**
 - Modify: `internal/controller/aliyuncertificatebinding_controller.go`
 - Create: `internal/controller/binding_apply_test.go`
-- Modify: `internal/controller/binding_conflict_envtest_test.go`（解除 Task 8 的跳过）
+- Create: `internal/controller/binding_conflict_envtest_test.go`（Task 8 的仲裁 envtest 用例整体推迟到这里；Task 8 只交付纯函数单测）
 
 **Interfaces:**
-- Consumes：`provider.Provider.Apply`、`provider.ApplyOptions`、`provider.ErrorOf`（Task 2、6）；`setApplied`、`handleObserveError`、`noteDrift`（Task 11）；`bindingApplyTotal`、`bindingDriftTotal`（Task 7）。
+- Consumes：`provider.Provider.Apply`、`provider.ApplyOptions`、`provider.ErrorOf`（Task 2、6）；`setApplied`、`handleObserveError`、`noteDrift`、`eventOnReasonChange`（Task 11）；`arbitrate` / `pickWinner`（Task 8）；`bindingApplyTotal`、`bindingDriftTotal`（Task 7）。
 - Produces：
   - `(r) handleApplyError(ctx, rd *bindingRound, err error) (ctrl.Result, error)`
   - `bindingApplyResult(err error) string`（`success` / `throttled` / `error`，复用 `resultSuccess` 等常量）
@@ -4335,6 +4476,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -4358,13 +4500,14 @@ var _ = Describe("绑定 controller：Apply", func() {
 	It("首次绑定写入证书并固化 status", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "apply.example.com")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
 		b0, _ := pki.ParseBundle(certPEM, keyPEM)
-		currentFC3().AddDomain(fake.Domain{DomainName: "apply.example.com", Protocol: "HTTP", Echo: "routes"})
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP", Echo: "routes"})
 
-		createCertificate(ctx, ns, "c1", "apply.example.com")
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "apply.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 
 		eventually(func() bool {
 			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
@@ -4375,7 +4518,7 @@ var _ = Describe("绑定 controller：Apply", func() {
 		Expect(b.Status.LastAppliedTime).NotTo(BeNil())
 		Expect(bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionTrue))
 
-		d, _ := currentFC3().Domain("apply.example.com")
+		d, _ := currentFC3().Domain(domain)
 		Expect(d.CertPEM).To(Equal(b0.CertPEM()))
 		Expect(d.Echo).To(Equal("routes"), "read-modify-write 必须原样保住 routeConfig")
 		Expect(d.Protocol).To(Equal("HTTP"), "ensureHTTPSProtocol 默认 false，不许动 protocol")
@@ -4384,17 +4527,18 @@ var _ = Describe("绑定 controller：Apply", func() {
 	It("ensureHTTPSProtocol=true 时把 HTTP 升为 HTTP,HTTPS", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "https.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "https.example.com", Protocol: "HTTP"})
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
 
-		createCertificate(ctx, ns, "c1", "https.example.com")
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "https.example.com", func(b *certsv1alpha1.AliyunCertificateBinding) {
+		createBinding(ctx, ns, "b1", "c1", domain, func(b *certsv1alpha1.AliyunCertificateBinding) {
 			b.Spec.Target.FC3CustomDomain.EnsureHTTPSProtocol = true
 		})
 
 		eventually(func() bool {
-			d, ok := currentFC3().Domain("https.example.com")
+			d, ok := currentFC3().Domain(domain)
 			return ok && d.Protocol == "HTTP,HTTPS"
 		})
 	})
@@ -4402,16 +4546,17 @@ var _ = Describe("绑定 controller：Apply", func() {
 	It("证书轮换后把新代次推上去", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		gen1Cert, gen1Key := testutil.IssueLeaf(GinkgoT(), ca, "rotate.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "rotate.example.com", Protocol: "HTTP"})
-		createCertificate(ctx, ns, "c1", "rotate.example.com")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		gen1Cert, gen1Key := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, gen1Cert, gen1Key)
-		createBinding(ctx, ns, "b1", "c1", "rotate.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 		eventually(func() bool {
 			return bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
 		})
 
-		gen2Cert, gen2Key := testutil.IssueLeaf(GinkgoT(), ca, "rotate.example.com")
+		gen2Cert, gen2Key := testutil.IssueLeaf(GinkgoT(), ca, domain)
 		g2, _ := pki.ParseBundle(gen2Cert, gen2Key)
 		simulateIssuance(ctx, ns, "c1", 2, gen2Cert, gen2Key)
 
@@ -4419,23 +4564,24 @@ var _ = Describe("绑定 controller：Apply", func() {
 		eventually(func() bool {
 			return getBinding(ctx, ns, "b1").Status.AppliedFingerprint == g2.Fingerprint
 		})
-		d, _ := currentFC3().Domain("rotate.example.com")
+		d, _ := currentFC3().Domain(domain)
 		Expect(d.CertPEM).To(Equal(g2.CertPEM()))
 	})
 
 	It("Apply 被限流时 Applied=False/Throttled 并重试", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "throttle.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "throttle.example.com", Protocol: "HTTP"})
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
 		currentFC3().QueueUpdateErr(&aliyun.Error{
 			Class: aliyun.ClassRetryable, Op: aliyun.ActionUpdateCustomDomain,
 			Code: "Throttling.User", Err: errors.New("slow down"),
 		})
 
-		createCertificate(ctx, ns, "c1", "throttle.example.com")
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "throttle.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 
 		eventually(func() bool {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionApplied)
@@ -4450,36 +4596,38 @@ var _ = Describe("绑定 controller：Apply", func() {
 	It("Update 提交后响应丢失：重试写同样内容，不留半成品", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "lost.example.com")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
 		b0, _ := pki.ParseBundle(certPEM, keyPEM)
-		currentFC3().AddDomain(fake.Domain{DomainName: "lost.example.com", Protocol: "HTTP", Echo: "routes"})
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP", Echo: "routes"})
 		currentFC3().FailNextUpdateAfterCommit(&aliyun.Error{
 			Class: aliyun.ClassRetryable, Op: aliyun.ActionUpdateCustomDomain,
 			Code: "Timeout", Err: errors.New("response lost"),
 		})
 
-		createCertificate(ctx, ns, "c1", "lost.example.com")
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "lost.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 
 		// 服务端其实已经写成功了；下一轮 Observe 会看到指纹已经对上，直接短路。
 		eventually(func() bool {
 			return getBinding(ctx, ns, "b1").Status.AppliedFingerprint == b0.Fingerprint
 		})
-		d, _ := currentFC3().Domain("lost.example.com")
+		d, _ := currentFC3().Domain(domain)
 		Expect(d.Echo).To(Equal("routes"))
 	})
 
 	It("凭证 Secret 不存在时 Ready=False/CredentialsSecretNotFound", func() {
 		ns := newNamespace(ctx)
 		ca := testutil.NewCA(GinkgoT())
-		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, "cred.example.com")
-		currentFC3().AddDomain(fake.Domain{DomainName: "cred.example.com", Protocol: "HTTP"})
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
 		setFC3FactoryErr(&credentialsError{certsv1alpha1.ReasonCredentialsNotFound, errors.New("凭证 Secret 不存在")})
 
-		createCertificate(ctx, ns, "c1", "cred.example.com")
+		createCertificate(ctx, ns, "c1", domain)
 		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
-		createBinding(ctx, ns, "b1", "c1", "cred.example.com", nil)
+		createBinding(ctx, ns, "b1", "c1", domain, nil)
 
 		eventually(func() bool {
 			c := bindingCond(ctx, ns, "b1", certsv1alpha1.ConditionReady)
@@ -4487,6 +4635,128 @@ var _ = Describe("绑定 controller：Apply", func() {
 		})
 	})
 })
+```
+
+同时新建 `internal/controller/binding_conflict_envtest_test.go`——这是 Task 8 的仲裁 envtest
+用例，因为要断言 `Applied=True` 而整体推迟到了本任务：
+
+```go
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki/testutil"
+)
+
+var _ = Describe("绑定 controller：冲突仲裁", func() {
+	ctx := context.Background()
+
+	BeforeEach(func() {
+		resetCAS()
+		resetFC3()
+	})
+
+	It("同目标的第二个 Binding 被判 Conflict 且不写云", func() {
+		ns := newNamespace(ctx)
+		ca := testutil.NewCA(GinkgoT())
+		// 这个用例要的就是「两个 Binding 抢同一个目标」，所以两边共用一个域名；
+		// 域名本身仍带 namespace，免得跨文件撞上别的用例（仲裁是跨 namespace 的）。
+		domain := fmt.Sprintf("first.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP", Echo: "routes"})
+
+		createCertificate(ctx, ns, "c1", domain)
+		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
+		eventually(func() bool {
+			return condStatusOf(ctx, ns, "c1", certsv1alpha1.ConditionIssued) == metav1.ConditionTrue
+		})
+
+		createBinding(ctx, ns, "first", "c1", domain, nil)
+		eventually(func() bool {
+			return bindingCond(ctx, ns, "first", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
+		})
+		writesAfterFirst := currentFC3().UpdateCalls()
+
+		createBinding(ctx, ns, "second", "c1", domain, nil)
+		eventually(func() bool {
+			c := bindingCond(ctx, ns, "second", certsv1alpha1.ConditionConflict)
+			return c.Status == metav1.ConditionTrue && c.Reason == certsv1alpha1.ReasonConflictingBinding
+		})
+		Expect(bindingCond(ctx, ns, "second", certsv1alpha1.ConditionReady).Status).To(Equal(metav1.ConditionFalse))
+		// 输家一次云写入都不该发出——两个 Binding 轮流写同一个域名比不写更危险。
+		Expect(currentFC3().UpdateCalls()).To(Equal(writesAfterFirst))
+	})
+
+	It("胜者被删掉后输家接管", func() {
+		ns := newNamespace(ctx)
+		ca := testutil.NewCA(GinkgoT())
+		domain := fmt.Sprintf("first.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		currentFC3().AddDomain(fake.Domain{DomainName: domain, Protocol: "HTTP"})
+
+		createCertificate(ctx, ns, "c1", domain)
+		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
+		createBinding(ctx, ns, "first", "c1", domain, nil)
+		createBinding(ctx, ns, "second", "c1", domain, nil)
+		eventually(func() bool {
+			return bindingCond(ctx, ns, "second", certsv1alpha1.ConditionConflict).Status == metav1.ConditionTrue
+		})
+
+		Expect(k8sClient.Delete(ctx, getBinding(ctx, ns, "first"))).To(Succeed())
+		eventually(func() bool {
+			c := bindingCond(ctx, ns, "second", certsv1alpha1.ConditionConflict)
+			return c.Status == metav1.ConditionFalse
+		})
+		eventually(func() bool {
+			return bindingCond(ctx, ns, "second", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
+		})
+	})
+
+	It("不同域名互不冲突", func() {
+		ns := newNamespace(ctx)
+		ca := testutil.NewCA(GinkgoT())
+		domainA := fmt.Sprintf("ba.%s.example.com", ns)
+		domainB := fmt.Sprintf("bb.%s.example.com", ns)
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domainA, domainB)
+		currentFC3().AddDomain(fake.Domain{DomainName: domainA, Protocol: "HTTP"})
+		currentFC3().AddDomain(fake.Domain{DomainName: domainB, Protocol: "HTTP"})
+
+		createCertificate(ctx, ns, "c1", domainA, domainB)
+		simulateIssuance(ctx, ns, "c1", 1, certPEM, keyPEM)
+		createBinding(ctx, ns, "ba", "c1", domainA, nil)
+		createBinding(ctx, ns, "bb", "c1", domainB, nil)
+
+		eventually(func() bool {
+			return bindingCond(ctx, ns, "ba", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue &&
+				bindingCond(ctx, ns, "bb", certsv1alpha1.ConditionApplied).Status == metav1.ConditionTrue
+		})
+	})
+})
+
+// condStatusOf 读 AliyunCertificate 的 condition 状态。
+//
+// 与 retention_test.go 里的 condStatus(ac, t) 只是名字相近，不冲突。
+func condStatusOf(ctx context.Context, ns, name, condType string) metav1.ConditionStatus {
+	ac := &certsv1alpha1.AliyunCertificate{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, ac); err != nil {
+		return metav1.ConditionUnknown
+	}
+	for _, c := range ac.Status.Conditions {
+		if c.Type == condType {
+			return c.Status
+		}
+	}
+	return metav1.ConditionUnknown
+}
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -4530,8 +4800,12 @@ func (r *AliyunCertificateBindingReconciler) handleApplyError(ctx context.Contex
 	}
 	// 错误原文只进日志：事件是广播给用户的对象，云错误里可能夹带 request id。
 	log.Error(err, "写入目标失败", "domain", targetIdentifier(rd.b))
+	// 事件先于 setBindingCondition 发：eventOnReasonChange 比的是 rd.orig 上一轮的
+	// reason，而 rd.b 马上就要被改成本轮的 reason（spec §10.2「只在状态跃迁时发」——
+	// 一次限流会连着失败很多轮，每轮一条 Warning 只是噪声）。
+	r.eventOnReasonChange(rd, certsv1alpha1.ConditionApplied, reason,
+		corev1.EventTypeWarning, certsv1alpha1.ReasonApplyFailed, applyFailedMessage)
 	setBindingCondition(rd.b, certsv1alpha1.ConditionApplied, metav1.ConditionFalse, reason, "写入目标失败")
-	r.Recorder.Event(rd.b, corev1.EventTypeWarning, certsv1alpha1.ReasonApplyFailed, applyFailedMessage)
 	aggregateBindingReady(rd.b)
 	if perr := r.patchBinding(ctx, rd); perr != nil {
 		return ctrl.Result{}, perr
@@ -4576,9 +4850,11 @@ func (r *AliyunCertificateBindingReconciler) handleApplyError(ctx context.Contex
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 ```
 
-- [ ] **Step 4: 解除 Task 8 的跳过**
+- [ ] **Step 4: 确认仲裁 envtest 已纳入运行**
 
-把 `binding_conflict_envtest_test.go` 里三个用例的 `Skip(...)` 删掉（若 Task 8 采用的是「整体推迟」方案，则此时把该文件补齐并纳入运行）。
+Step 1 新建的 `binding_conflict_envtest_test.go` 就是 Task 8 推迟过来的那三个用例，不存在
+「解除 `Skip`」这回事——Task 8 从头就没写过这个文件，也没写过任何 `Skip`。这里只需确认
+三个用例都在跑且全绿（`go test ./internal/controller/ -run TestControllers -v | grep 冲突仲裁`）。
 
 - [ ] **Step 5: 运行，确认全绿**
 
@@ -4606,7 +4882,7 @@ git commit -m "feat: apply certificate material to binding targets and record ap
 - Modify: `internal/controller/aliyuncertificatebinding_controller.go`（删掉 Task 7 的存根）
 
 **Interfaces:**
-- Consumes：`provider.Provider.Observe/Cleanup`、`provider.DeletionPolicy*`（Task 2、6）；`CleanupPolicyAbandon` / `CleanupPolicyBlock`（`aliyuncertificate_controller.go`，已存在）；`cleanupAbandonedTotal`（`metrics.go`，已存在）。
+- Consumes：`provider.Provider.Observe/Cleanup`、`provider.DeletionPolicy*`（Task 2、6）；`CleanupPolicyAbandon` / `CleanupPolicyBlock`（`aliyuncertificate_controller.go`，已存在）；`cleanupAbandonedTotal`（`metrics.go`，已存在）；`issueAndBind`（**Task 11 在 `binding_observe_test.go` 里定义的测试 helper**，同包跨文件——单独重跑本 Task 前必须先有 Task 11）；`clearBindingMetrics` / `targetRegion`（Task 7）；`bindingReconciler.SetNow`（Task 7）。
 - Produces：
   - `AliyunCertificateBindingStatus.CleanupStartedAt *metav1.Time`（新字段，需 `make generate manifests`）
   - `(r) reconcileBindingDelete(ctx, rd *bindingRound) (ctrl.Result, error)`（替换存根）
@@ -4624,17 +4900,17 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
-	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki/testutil"
 )
 
@@ -4653,21 +4929,23 @@ var _ = Describe("绑定 controller：删除", func() {
 
 	It("Orphan（默认）：摘 finalizer，云侧一动不动", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "orphan.example.com", "HTTPS")
-		before, _ := currentFC3().Domain("orphan.example.com")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c1", "b1", domain, "HTTPS")
+		before, _ := currentFC3().Domain(domain)
 		writes := currentFC3().UpdateCalls()
 
 		Expect(k8sClient.Delete(ctx, getBinding(ctx, ns, "b1"))).To(Succeed())
 		eventually(func() bool { return bindingGone(ctx, ns, "b1") })
 
-		after, _ := currentFC3().Domain("orphan.example.com")
+		after, _ := currentFC3().Domain(domain)
 		Expect(after.CertName).To(Equal(before.CertName))
 		Expect(currentFC3().UpdateCalls()).To(Equal(writes), "一个 kubectl delete 不该打穿生产 HTTPS")
 	})
 
 	It("Unbind：清空自己的证书，纯 HTTPS 域名降为 HTTP", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "unbind.example.com", "HTTPS")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c1", "b1", domain, "HTTPS")
 
 		b := getBinding(ctx, ns, "b1")
 		b.Spec.DeletionPolicy = certsv1alpha1.DeletionPolicyUnbind
@@ -4679,7 +4957,7 @@ var _ = Describe("绑定 controller：删除", func() {
 		Expect(k8sClient.Delete(ctx, getBinding(ctx, ns, "b1"))).To(Succeed())
 		eventually(func() bool { return bindingGone(ctx, ns, "b1") })
 
-		d, _ := currentFC3().Domain("unbind.example.com")
+		d, _ := currentFC3().Domain(domain)
 		Expect(d.CertName).To(BeEmpty())
 		Expect(d.Protocol).To(Equal("HTTP"), "纯 HTTPS 域名拿掉证书后必须降为 HTTP，否则彻底不可用")
 		Expect(d.Echo).To(Equal("routes"))
@@ -4687,7 +4965,8 @@ var _ = Describe("绑定 controller：删除", func() {
 
 	It("Unbind：目标上是别人的证书时一动不动", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "notmine.example.com", "HTTP,HTTPS")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c1", "b1", domain, "HTTP,HTTPS")
 
 		b := getBinding(ctx, ns, "b1")
 		b.Spec.DeletionPolicy = certsv1alpha1.DeletionPolicyUnbind
@@ -4698,8 +4977,8 @@ var _ = Describe("绑定 controller：删除", func() {
 
 		// 有人在我们之后把证书换成了别的。解绑只该解自己那一张。
 		otherCA := testutil.NewCA(GinkgoT())
-		otherPEM, _ := testutil.IssueLeaf(GinkgoT(), otherCA, "notmine.example.com")
-		d, _ := currentFC3().Domain("notmine.example.com")
+		otherPEM, _ := testutil.IssueLeaf(GinkgoT(), otherCA, domain)
+		d, _ := currentFC3().Domain(domain)
 		d.CertName = "someone-elses"
 		d.CertPEM = otherPEM
 		currentFC3().AddDomain(d)
@@ -4707,13 +4986,14 @@ var _ = Describe("绑定 controller：删除", func() {
 		Expect(k8sClient.Delete(ctx, getBinding(ctx, ns, "b1"))).To(Succeed())
 		eventually(func() bool { return bindingGone(ctx, ns, "b1") })
 
-		after, _ := currentFC3().Domain("notmine.example.com")
+		after, _ := currentFC3().Domain(domain)
 		Expect(after.CertName).To(Equal("someone-elses"))
 	})
 
 	It("Unbind：目标已经不存在时直接摘 finalizer", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "vanished.example.com", "HTTPS")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c1", "b1", domain, "HTTPS")
 		b := getBinding(ctx, ns, "b1")
 		b.Spec.DeletionPolicy = certsv1alpha1.DeletionPolicyUnbind
 		Expect(k8sClient.Update(ctx, b)).To(Succeed())
@@ -4721,14 +5001,15 @@ var _ = Describe("绑定 controller：删除", func() {
 			return getBinding(ctx, ns, "b1").Spec.DeletionPolicy == certsv1alpha1.DeletionPolicyUnbind
 		})
 
-		currentFC3().RemoveDomain("vanished.example.com")
+		currentFC3().RemoveDomain(domain)
 		Expect(k8sClient.Delete(ctx, getBinding(ctx, ns, "b1"))).To(Succeed())
 		eventually(func() bool { return bindingGone(ctx, ns, "b1") })
 	})
 
 	It("Unbind：清理持续失败，超过宽限期后 Abandon", func() {
 		ns := newNamespace(ctx)
-		issueAndBind(ctx, ns, "c1", "b1", "stuck.example.com", "HTTPS")
+		domain := fmt.Sprintf("b1.%s.example.com", ns)
+		issueAndBind(ctx, ns, "c1", "b1", domain, "HTTPS")
 		b := getBinding(ctx, ns, "b1")
 		b.Spec.DeletionPolicy = certsv1alpha1.DeletionPolicyUnbind
 		Expect(k8sClient.Update(ctx, b)).To(Succeed())
@@ -4749,8 +5030,15 @@ var _ = Describe("绑定 controller：删除", func() {
 			})
 		}
 		Expect(k8sClient.Delete(ctx, getBinding(ctx, ns, "b1"))).To(Succeed())
+		// 这里必须用不硬失败的读法：getBinding 内部是 ExpectWithOffset(...).To(Succeed())，
+		// 对象一旦在轮询窗口里被摘掉 finalizer 删干净，整个用例会以断言失败告终而不是
+		// 继续收敛。直接 Get，err != nil 就返回 false 让 eventually 接着轮询。
 		eventually(func() bool {
-			return getBinding(ctx, ns, "b1").Status.CleanupStartedAt != nil
+			cur := &certsv1alpha1.AliyunCertificateBinding{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "b1"}, cur); err != nil {
+				return false
+			}
+			return cur.Status.CleanupStartedAt != nil
 		})
 
 		mu.Lock()
@@ -4759,13 +5047,13 @@ var _ = Describe("绑定 controller：删除", func() {
 
 		eventually(func() bool { return bindingGone(ctx, ns, "b1") })
 		// 证书还留在云上——这正是 Abandon 的含义，有事件与计数器可查。
-		d, _ := currentFC3().Domain("stuck.example.com")
+		d, _ := currentFC3().Domain(domain)
 		Expect(d.CertName).NotTo(BeEmpty())
 	})
 })
 ```
 
-（import 补 `"sync"`；`fake` 与 `metav1` 若未用到就删。）
+（本文件用不到 `fake` 与 `metav1`，import 里就不要写它们。）
 
 - [ ] **Step 2: 运行，确认失败**
 
@@ -4922,6 +5210,12 @@ func (r *AliyunCertificateBindingReconciler) finishBindingDeletion(ctx context.C
 }
 
 // providerErrClass 给 cleanup_abandoned_total 的 reason label 一个有界取值。
+//
+// 注意 `cleanup_abandoned_total{reason}` 这一个 label 上跑着**两套词表**：证书 controller
+// 传的是 `aliyun.ErrClass` 的字符串（Permanent / Retryable / Auth / NotFound），绑定
+// controller 传的是 `provider.Code*`（TargetNotFound / Auth / Throttled / Retryable /
+// Permanent / InvalidClient / InvalidTarget）。两边取值都有界，不会造成基数爆炸，但看板
+// 与告警的作者必须知道同一个 label 里会同时出现两种词表——这一条要进 README 的已知限制。
 func providerErrClass(err error) string {
 	if pe := provider.ErrorOf(err); pe != nil {
 		return pe.Code
@@ -5081,7 +5375,7 @@ git commit -m "feat: wire the binding controller into the operator binary"
 | §12.1 单元：冲突仲裁排序 | 8 |
 | §12.1 单元：SANs 覆盖（RFC 6125） | 9（复用 Plan 1 的 `pki.Covers` 并新增绑定侧用例） |
 | §12.1 单元：错误分类（provider 侧） | 6 |
-| §12.2 envtest：证书未 Ready / 目标不存在 / 冲突仲裁 / 域名不覆盖 / 幂等短路 / drift 纠正 / accountId 不匹配 / `Unbind` 只解绑自己的 | 7、8、9、11、12、13 |
+| §12.2 envtest：证书未 Ready / 目标不存在 / 冲突仲裁 / 域名不覆盖 / 幂等短路 / drift 纠正 / accountId 不匹配 / `Unbind` 只解绑自己的 | 7、9、11、12（含推迟过来的冲突仲裁 envtest）、13 |
 | §12.2 故障注入（TargetNotFound / Auth / Throttling / Update 提交后响应丢失） | 5（fake 能力）、11、12 |
 | §12.2 窄接口 `FC3Client`（不 mock SDK struct） | 3、4、5 |
 | §15 provider 演进预留（`ReferencesCertByID` / `RequiresCASUpload` / registry） | 2、6 |
@@ -5104,7 +5398,7 @@ git commit -m "feat: wire the binding controller into the operator binary"
 | 3 | `UpdateCustomDomain` 是全量替换还是部分合并（spec §12.3 #2） | Task 4 `updateInputToSDK` 的 `ClearCert` 分支（显式三个空串）；Task 6 的 read-modify-write 在两种语义下都正确，但**解绑只在其中一种语义下真的生效**——若实测为「合并且空串被忽略」，Unbind 需要改用别的手段（如先 `DeleteCustomDomain` 再重建，代价大得多，届时需重新决策） |
 | 4 | FC3 对 PKCS#1 / SEC1 私钥的接受情况（spec §12.3 #1） | Task 9 `loadBindingMaterial` 直接用 `pki.Bundle.KeyPEM()`（RSA → PKCS#1、ECDSA → SEC1）。若 FC3 只收 PKCS#8，`pki.Bundle` 需要增加第二种输出 |
 | 5 | LE 链（leaf + intermediate、无根）FC3 是否接受、顺序是否敏感（spec §12.3 #5） | Task 9 的 `m.CertPEM = b.CertPEM()`（leaf 在前、中间证书紧随、无空行、无根） |
-| 6 | FC3 对不存在域名返回的真实错误码 | Task 5 的 `ErrDomainNotFound` 用 `DomainNameNotFound`，Task 6 依赖 `aliyun.classifyCode` 把它归入 `ClassNotFound`（靠 `Contains(code,"NotFound")` 或 404）。若真实码既不含 `NotFound` 也不是 404，`TargetNotFound` 分支永远走不到，`Ready` 会停在旁路的 Warning 上 |
+| 6 | FC3 对不存在域名返回的真实错误码 | Task 5 的 `ErrDomainNotFound` 用 `DomainNameNotFound`，Task 6 依赖 `aliyun.classifyCode` 把它归入 `ClassNotFound`（靠 `Contains(code,"NotFound")` 或 404）。若真实码既不含 `NotFound` 也不是 404，`TargetNotFound` 分支永远走不到，`Ready` 会停在旁路的 Warning 上。**不做推测式兜底**（「Code 含 `DomainName` 且 Permanent → TargetNotFound」会把 `InvalidDomainName` 这类真·永久错误误归）：等集成测试量出真实错误码后回去修 `aliyun.classifyCode`，那是错误码归类的唯一落点 |
 | 7 | 同一账号下 FC3 的 `accountId` 是否总是非空 | Task 11 `fenceAccount` 在 `obs.AccountID == ""` 时放行（无从判断则不拦）。若该字段常为空，fencing 形同虚设 |
 
 ### 4. 自查中发现并已修正的问题
@@ -5113,7 +5407,9 @@ git commit -m "feat: wire the binding controller into the operator binary"
 2. **错误处置路径上的 nil 解引用。** `handleObserveError` / `handleApplyError` / `reconcileBindingDelete` 原本直接写 `b.Spec.Target.FC3CustomDomain.DomainName` 取日志字段，而这些路径恰恰会被「`target.type` 不认识 / 内嵌块缺失」触发——那正是该指针为 nil 的时候。已改为 nil-safe 的 `targetIdentifier(b)` / `targetRegion(b)`（Task 7）。
 3. **`ClientCache` 只能装 `CASClient`。** 原本要么把它改成存 `any` 再到处断言，要么复制一份。已在 Task 3 改成泛型 `ClientCache[T]`，并把 `cache_test.go` / `cas_factory.go` / `main.go` 三处调用点的更新写成明确的 `sed` 步骤（不是「相应调整」这种占位）。
 4. **测试 helper 重名。** `retention_test.go` 里已有一个纯函数 `binding(gen, observed, applied)`。新 helper 若也叫 `binding` 会在同一个包里冲突。已统一用 `createBinding` / `getBinding` / `createCertificate`，并在 Task 7 Step 8 写了显式提醒。
-5. **跨任务的红灯窗口。** Task 8 与 Task 11 的部分 envtest 用例在 Apply 落地（Task 12）之前必然失败。已在两处写明「哪些用例本任务应通过、哪些留到 Task 12」，并要求在 ledger 里记录，避免执行者误以为自己写错了。
+5. **跨任务的红灯窗口。** Task 11 的部分 envtest 用例、以及 Task 9 的第三个用例，在 Apply 落地（Task 12）之前必然失败。已在各处写明「哪些用例本任务应通过、哪些留到 Task 12」，并要求在 ledger 里记录，避免执行者误以为自己写错了。Task 8 原本也有三个这样的用例，pre-flight 裁决后整体推迟到 Task 12 创建，红灯窗口因此少了一个。
+6. **envtest 目标域名跨文件撞车。** 仲裁刻意跨 namespace 按 `TargetKey()`（只含 type/region/domainName）检索，而多个测试文件原本都用 `api.example.com` 之类的字面量——先建的 Binding 会把后建的一直判成 Conflict，`Applied` 永远不为 True。已统一为 `fmt.Sprintf("%s.%s.example.com", bindingName, ns)`（pre-flight 裁决），并写进 Task 7 Step 8 的域名约定。
+7. **`aliyuncert_binding_applied_age_seconds` 在早退路径被清零。** `rd.lag` 原本算在材料装载之后，而冲突分支更在它之前就 return——「判定冲突 / Secret 丢了 / 域名不覆盖」这三种最该告警的状态反而把 gauge 刷成 0。已把它提到取完证书之后、仲裁之前（Task 9 Step 4，pre-flight 裁决）。
 
 ### 5. 裁决记录（team lead，2026-09-05）
 
