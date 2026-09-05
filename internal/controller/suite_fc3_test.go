@@ -124,8 +124,6 @@ func bindingCond(ctx context.Context, ns, name, condType string) metav1.Conditio
 }
 
 // getBinding 读回整个对象。
-//
-//nolint:unused // Task 8 起的用例要读 appliedFingerprint / boundAccountId 这些非 condition 字段。
 func getBinding(ctx context.Context, ns, name string) *certsv1alpha1.AliyunCertificateBinding {
 	b := &certsv1alpha1.AliyunCertificateBinding{}
 	ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, b)).To(Succeed())
