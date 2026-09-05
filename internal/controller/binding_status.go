@@ -115,6 +115,30 @@ func aggregateBindingReady(b *certsv1alpha1.AliyunCertificateBinding) {
 	setBindingCondition(b, certsv1alpha1.ConditionReady, metav1.ConditionFalse, reason, "")
 }
 
+// appliedLag 返回目标滞后于证书当前代次的时长；已同步或无从判断时为 0。
+//
+// 这就是 aliyuncert_binding_applied_age_seconds 的取值来源。用「滞后多久」而不是
+// 「生效证书有多老」：后者在一切正常时也会一路涨到证书有效期那么长，会让 spec §10.3
+// 的告警式子对每一张健康证书误报。语义已由 team lead 裁决（2026-09-05）。
+//
+// ac 允许为 nil（证书 CR 不存在）：调用点在取证书之后、任何早退之前，那里 ac 可能没取到。
+func (r *AliyunCertificateBindingReconciler) appliedLag(
+	b *certsv1alpha1.AliyunCertificateBinding, ac *certsv1alpha1.AliyunCertificate,
+) time.Duration {
+	if ac == nil {
+		return 0
+	}
+	cur := ac.Status.Current
+	if cur == nil || cur.Fingerprint == "" || b.Status.AppliedFingerprint == cur.Fingerprint {
+		return 0
+	}
+	lag := r.now().Sub(cur.UploadedAt.Time)
+	if lag < 0 {
+		return 0
+	}
+	return lag
+}
+
 // patchBinding 用 MergeFrom 提交 status，并在同一处刷新 gauge。
 func (r *AliyunCertificateBindingReconciler) patchBinding(ctx context.Context, rd *bindingRound) error {
 	recordBindingMetrics(rd)

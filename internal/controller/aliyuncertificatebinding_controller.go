@@ -82,10 +82,8 @@ func (r *AliyunCertificateBindingReconciler) SetNow(fn func() time.Time) {
 	r.Now = fn
 }
 
-// now 与 SetNow 成对：只留 SetNow 会让时钟注入点只写不读。读取点在 Task 9 的漂移判定
-// 与 Task 11 的 lastAppliedTime 里。
-//
-//nolint:unused // 调用点由 Task 9 / Task 11 补上。
+// now 与 SetNow 成对：只留 SetNow 会让时钟注入点只写不读。读取点是 appliedLag
+// （binding_status.go），Task 11 的 lastAppliedTime 会再加一个。
 func (r *AliyunCertificateBindingReconciler) now() time.Time {
 	r.mu.RLock()
 	fn := r.Now
@@ -127,18 +125,30 @@ func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req 
 
 	b.Status.ObservedGeneration = b.Generation
 
-	// 1. 取证书
+	// 1. 取证书。NotFound 不在这里 return——先把 lag 算了。
 	ac := &certsv1alpha1.AliyunCertificate{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.CertificateRef.Name}, ac)
 	switch {
 	case apierrors.IsNotFound(err):
+		ac = nil
+	case err != nil:
+		return ctrl.Result{}, err
+	}
+
+	// 1b. 滞后时长在任何早退之前算好。aliyuncert_binding_applied_age_seconds 是 spec §10.1
+	// 唯一点名「必须告警」的绑定侧指标，而 patchBinding → recordBindingMetrics 每次都会用
+	// rd.lag 刷它；算晚了，「冲突 / Secret 丢了 / 域名不覆盖」这三种最该告警的状态反而
+	// 被刷成 0，spec §10.3 的 AliyunCertificateBindingStale 永远不触发。
+	// ac 不存在、或 status.current 为空时无从判断滞后，取 0——那两种状态由
+	// aliyuncert_binding_ready=0 覆盖告警。
+	rd.lag = r.appliedLag(b, ac)
+
+	if ac == nil {
 		// 不碰 Applied：目标上那张证书还在正常服役，证书 CR 不见了说明不了它有问题
 		// （典型场景是 Argo CD 正在换名字重建）。只降 Ready，靠 watch 唤醒。
 		setBindingReadyFalse(b, certsv1alpha1.ReasonCertificateNotFound,
 			fmt.Sprintf("AliyunCertificate %q 不存在", b.Spec.CertificateRef.Name))
 		return ctrl.Result{}, r.patchBinding(ctx, rd)
-	case err != nil:
-		return ctrl.Result{}, err
 	}
 	if !certIssued(ac) {
 		setBindingReadyFalse(b, certsv1alpha1.ReasonCertificateNotReady, "证书尚未通过校验")
@@ -148,12 +158,7 @@ func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req 
 	return r.reconcileBindingReady(ctx, rd, ac)
 }
 
-// reconcileBindingReady 处理证书可用之后的步骤 2–8。Task 9–12 逐步填充剩下的步骤。
-//
-// ac 是步骤 3 起的输入（证书材料、代次闸门、凭证继承），本任务的仲裁还用不上它；现在
-// 删掉这个参数，下一个任务就要连同全部调用点一起改回来。
-//
-//nolint:unparam // 见上：参数由 Task 9 的 loadBindingMaterial / certificateGate 使用。
+// reconcileBindingReady 处理证书可用之后的步骤 2–8。Task 10–12 逐步填充剩下的步骤。
 func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 	ctx context.Context, rd *bindingRound, ac *certsv1alpha1.AliyunCertificate,
 ) (ctrl.Result, error) {
@@ -171,14 +176,33 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 		aggregateBindingReady(b)
 		// 云侧一个字节都不写。胜者变化或消失会经 SetupWithManager 里的同目标 watch
 		// 唤醒我们（For 只入队变化的对象本身，唤不醒输者），drift 周期是兜底。
-		// 注意这里是一次早退，而 patchBinding → recordBindingMetrics 会用 rd.lag 刷
-		// applied_age。Task 9 会把 rd.lag = r.appliedLag(b, ac) 提到 Reconcile 里取完
-		// 证书之后、进本函数之前，所以这条路径上的 lag 是真值而不是 0；本任务里
-		// appliedLag 还不存在，rd.lag 暂为 0，Task 9 落地后自动补齐。
+		// 这是一次早退，但 rd.lag 已在 Reconcile 里取完证书之后算好，
+		// patchBinding → recordBindingMetrics 刷出的 applied_age 是真值而不是 0。
 		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 	}
 	setBindingCondition(b, certsv1alpha1.ConditionConflict, metav1.ConditionFalse,
 		certsv1alpha1.ReasonNoConflict, "")
+
+	// 3. 装载材料并校验域名覆盖（spec §6.2 步骤 3）
+	m, me := loadBindingMaterial(ctx, r.Client, ac)
+	if me == nil {
+		me = checkDomainCoverage(m, b)
+	}
+	if me != nil {
+		// 不碰 Applied：目标上那张证书还在服役，Secret 出问题说明不了它有毛病
+		// （与证书 controller 不清空 status.current 是同一条原则）。
+		// rd.lag 早已算好，这次早退不会把 applied_age 刷成 0。
+		setBindingReadyFalse(b, me.Reason, me.Message)
+		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
+	}
+
+	// 3b. 证书 CR 必须已经认下 Secret 里的这一代，否则不写云（见 certificateGate）。
+	if !certificateGate(m, ac) {
+		setBindingCondition(b, certsv1alpha1.ConditionApplied, metav1.ConditionFalse,
+			certsv1alpha1.ReasonCertificateNotReady, "证书 CR 尚未认下 Secret 中的这一代")
+		aggregateBindingReady(b)
+		return ctrl.Result{RequeueAfter: certificateGateRequeue}, r.patchBinding(ctx, rd)
+	}
 
 	aggregateBindingReady(b)
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)

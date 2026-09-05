@@ -60,7 +60,10 @@ func setFC3FactoryErr(err error) { fakeMu.Lock(); fc3FactoryErr = err; fakeMu.Un
 func currentFC3FactoryErr() error { fakeMu.Lock(); defer fakeMu.Unlock(); return fc3FactoryErr }
 
 // createCertificate 建一个最小可用的 AliyunCertificate。
-func createCertificate(ctx context.Context, ns, name string, dnsNames ...string) *certsv1alpha1.AliyunCertificate {
+//
+// 无返回值：没有任何调用点用得上它（与 resetFC3 同理），留着会被 unparam 报出来。
+// 需要读回对象的地方用 getAC()。
+func createCertificate(ctx context.Context, ns, name string, dnsNames ...string) {
 	ac := &certsv1alpha1.AliyunCertificate{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: certsv1alpha1.AliyunCertificateSpec{
@@ -72,7 +75,6 @@ func createCertificate(ctx context.Context, ns, name string, dnsNames ...string)
 		},
 	}
 	ExpectWithOffset(1, k8sClient.Create(ctx, ac)).To(Succeed())
-	return ac
 }
 
 // createBinding 建一个指向 FC3 自定义域名的 Binding。mutate 可为 nil。
