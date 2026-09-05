@@ -57,6 +57,9 @@ type ProviderFactory func(ctx context.Context, b *certsv1alpha1.AliyunCertificat
 // AliyunCertificateBindingReconciler 实现 spec §6 的绑定 controller。
 type AliyunCertificateBindingReconciler struct {
 	client.Client
+	// APIReader 是绕过 informer cache 的直读口子。目前**没有调用点**：留着是给已被推迟的
+	// 「删除分支改用直读」那一步用的（见 binding_deletion_test.go 里关于删除会多跑一轮的
+	// 实测记录），接线两处都已就位，改动落地时不必再动 main.go。
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Recorder  record.EventRecorder
@@ -140,16 +143,20 @@ func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req 
 	// aliyuncert_binding_ready=0 覆盖告警。
 	rd.lag = r.appliedLag(b, ac)
 
+	// 这两条早退都返回 drift 周期（spec §6.1：每一次成功的 reconcile 都返回漂移检查间隔），
+	// 与其余每一条终态路径一致。证书的 watch 已经能唤醒它们，所以这不是为了「别卡住」，
+	// 而是为了让 aliyuncert_binding_ready / _applied_age 在这两种状态下仍按周期刷新——
+	// 只靠 watch 的话，证书对象一直不变时这两个 gauge 就一直停在最后一次观测值上。
 	if ac == nil {
 		// 不碰 Applied：目标上那张证书还在正常服役，证书 CR 不见了说明不了它有问题
 		// （典型场景是 Argo CD 正在换名字重建）。只降 Ready，靠 watch 唤醒。
 		setBindingReadyFalse(b, certsv1alpha1.ReasonCertificateNotFound,
 			fmt.Sprintf("AliyunCertificate %q 不存在", b.Spec.CertificateRef.Name))
-		return ctrl.Result{}, r.patchBinding(ctx, rd)
+		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 	}
 	if !certIssued(ac) {
 		setBindingReadyFalse(b, certsv1alpha1.ReasonCertificateNotReady, "证书尚未通过校验")
-		return ctrl.Result{}, r.patchBinding(ctx, rd)
+		return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
 	}
 
 	return r.reconcileBindingReady(ctx, rd, ac)
@@ -222,7 +229,7 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 	if oerr != nil {
 		return r.handleObserveError(ctx, rd, oerr)
 	}
-	b.Status.LastObservedTime = &metav1.Time{Time: r.now()}
+	r.noteObserved(rd)
 
 	if r.fenceAccount(rd, obs) {
 		aggregateBindingReady(b)

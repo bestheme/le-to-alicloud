@@ -141,6 +141,10 @@ func (r *AliyunCertificateBindingReconciler) freezeApplied(
 ) {
 	b := rd.b
 	b.Status.AppliedFingerprint = m.Fingerprint
+	// 漂移已经被这一轮解决（写完了，或短路核实了云上装的就是这一张），痕迹必须抹掉，
+	// 否则同一张证书日后再次漂移会被 noteDrift 误判成「还是上一轮那次」而不发事件。
+	// 短路路径压根不经过 noteDrift，这里是它唯一的清空点。
+	b.Status.DriftedFingerprint = ""
 	if wrote {
 		b.Status.LastAppliedTime = &metav1.Time{Time: r.now()}
 	}

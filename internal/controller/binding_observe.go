@@ -25,6 +25,7 @@ package controller
 import (
 	"context"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -54,10 +55,16 @@ func protocolSatisfied(obs provider.ObservedState, ensureHTTPS bool) bool {
 
 // handleObserveError 处置 Observe 的失败。
 //
-// 分两档，是「旁路失败不降级」这条原则的落点：
-//   - TargetNotFound / Auth：这两件事直接说明「写不进去」——域名不存在、AK 被吊销。
-//     照常把 Applied 与 Ready 打成 False，并用固定长 requeue（域名可能由 Terraform
-//     稍后创建；AK 等人来换），不做指数退避。
+// 分三档，是「旁路失败不降级」这条原则的落点：
+//   - TargetNotFound：域名根本不存在，这直接证明了「我们那张证书不在目标上」——它连
+//     目标都没有。Applied 与 Ready 一起打成 False 是对事实的陈述，是一次真降级。
+//     固定长 requeue（域名可能由 Terraform 稍后创建），不做指数退避。
+//   - Auth：**只降 Ready，一个字节都不碰 Applied**，与 handleFactoryError 逐字同一条
+//     规矩。「AK 被云端拒绝」和「凭证 Secret 被删了」是同一个运维错误的两种到达方式，
+//     reason 甚至都是同一个（CredentialsInvalid / CredentialsSecretNotFound），没有理由
+//     一个降 Applied、另一个不降。更要紧的是它会断言一件假事：一次**读**被拒绝说不出
+//     目标上那张证书还在不在服役，而那正是本分支的旁路规则所禁止的。requeue 仍取
+//     credentialsRequeue：等人换 AK 或补授权，重试再快也没用。
 //   - 其余：一次 InternalError 或网络抖动说明不了目标上那张证书有任何问题。碰
 //     condition 就是用一个无害的失败换来一场真实的告警（控制器裁决 R21/R24/R25）。
 //     只发 Warning 事件、保留既有判定，Retryable 的交给 controller-runtime 退避。
@@ -72,8 +79,11 @@ func (r *AliyunCertificateBindingReconciler) handleObserveError(
 		aggregateBindingReady(rd.b)
 		return ctrl.Result{RequeueAfter: targetNotFoundRequeue}, r.patchBinding(ctx, rd)
 	case pe != nil && pe.Code == provider.CodeAuth:
-		setBindingCondition(rd.b, certsv1alpha1.ConditionApplied, metav1.ConditionFalse, pe.Reason, "凭证被拒绝")
-		aggregateBindingReady(rd.b)
+		// message 取 err.Error()，与 handleFactoryError 的 ce.Error() 同一形状。零凭证
+		// 泄漏由 provider 契约担保、而不是这里自证：ProviderError.Error() 只回显有界的
+		// Code/Retryable/Reason，被包住的 SDK 错误进 Unwrap 链、不进消息，fc3 加的
+		// `op[code]` 前缀里的 code 也已由 pkg/aliyun 脱敏过（见 fc3/errors.go）。
+		setBindingReadyFalse(rd.b, pe.Reason, err.Error())
 		return ctrl.Result{RequeueAfter: credentialsRequeue}, r.patchBinding(ctx, rd)
 	}
 	log.Error(err, "Observe 失败", "domain", targetIdentifier(rd.b))
@@ -102,6 +112,24 @@ func (r *AliyunCertificateBindingReconciler) handleObserveError(
 		return ctrl.Result{}, err // 交给 controller-runtime 指数退避
 	}
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, nil
+}
+
+// noteObserved 记下本轮的观测时刻，但**只在秒级取值真的会变时**才写。
+//
+// status.lastObservedTime 是 metav1.Time，序列化到整秒。同一秒内的两轮之间无条件重写，
+// 写进去的是一个在 API server 上完全等价的值；而这个字段是每一轮成功观测都会碰的唯一
+// 一处 status，一旦让 patch 变成非空，就会触发本 controller 自己的 watch，多跑一轮
+// reconcile、多打一次云读——而 FC3 这条通道被刻意限到 5 QPS。不是死循环（跨秒之后
+// 下一轮就收敛），但在一个刻意收紧的配额上没必要白花。
+//
+// 判据取 rd.orig（本轮开始前 API server 上的那一份），与 eventOnReasonChange 同一套写法。
+func (r *AliyunCertificateBindingReconciler) noteObserved(rd *bindingRound) {
+	now := r.now()
+	if prev := rd.orig.Status.LastObservedTime; prev != nil &&
+		prev.Time.Truncate(time.Second).Equal(now.Truncate(time.Second)) {
+		return
+	}
+	rd.b.Status.LastObservedTime = &metav1.Time{Time: now}
 }
 
 // eventOnReasonChange 实现 spec §10.2 的「只在状态跃迁时发」。
@@ -195,11 +223,31 @@ func setFencedConflict(rd *bindingRound) {
 //
 // 判定要求 obs.CurrentFingerprint 非空：空证书是「还没绑过」，不是漂移。
 // 等于 appliedFingerprint 是正常轮换（我们写的那张还在，只是证书续期了）。
+//
+// **事件与计数器都只在跃迁时记一次**（spec §10.2）。无条件记只在「紧接着的 Apply 成功」
+// 时才是对的：Apply 一旦持续失败，漂移下一轮还在，于是永久错误每小时、凭证错误每 5 分钟、
+// 而 Retryable 错误（它把 error 交回 controller-runtime 退避）以毫秒级重来一轮各发一条。
+// 计数器也跟着虚高：对一次改不动的漂移做 rate 查询，读出来的是「每次 requeue 一次检测」
+// 而不是「一次漂移」。
+//
+// 跃迁判据是 status.driftedFingerprint——上一轮落盘的那个漂移指纹。这里同时是它唯一的
+// 写入点：观测到漂移就记下，观测到已收敛就抹掉（另一处清空在 freezeApplied，短路路径
+// 根本走不到本函数）。抹掉这一步不能省：留着一个陈旧的指纹，日后同一张证书再次漂移
+// 就会被误判成「还是上一轮那次」而不发事件。
 func (r *AliyunCertificateBindingReconciler) noteDrift(
 	ctx context.Context, rd *bindingRound, obs provider.ObservedState, m provider.CertMaterial,
 ) {
 	cur := obs.CurrentFingerprint
 	if cur == "" || cur == rd.b.Status.AppliedFingerprint || cur == m.Fingerprint {
+		rd.b.Status.DriftedFingerprint = ""
+		return
+	}
+	rd.b.Status.DriftedFingerprint = cur
+	// 判据取 rd.orig（本轮开始前 API server 上的那一份，也就是「上一轮」的结论），
+	// 与 eventOnReasonChange 同一套写法。收敛性：本轮把 cur 写进了 rd.b，而每一条
+	// 走到这里的路径最终都会 patch status（Apply 成功走 freezeApplied，失败走
+	// handleApplyError），所以下一轮的 rd.orig 上一定读得到同一个值。
+	if rd.orig.Status.DriftedFingerprint == cur {
 		return
 	}
 	bindingDriftTotal.WithLabelValues(rd.provider).Inc()

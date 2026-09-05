@@ -28,6 +28,8 @@ import (
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -479,6 +481,52 @@ var _ = Describe("绑定 controller：Observe", func() {
 			return bindingEventCount(ctx, ns, "b9", certsv1alpha1.ReasonDriftCorrected) > 0
 		})
 	})
+
+	It("漂移一直改不掉：事件与计数器都不跟着轮次一起涨", func() {
+		ns := newNamespace(ctx)
+		domain := fmt.Sprintf("b13.%s.example.com", ns)
+		ca := testutil.NewCA(GinkgoT())
+		certPEM, keyPEM := testutil.IssueLeaf(GinkgoT(), ca, domain)
+		otherCA := testutil.NewCA(GinkgoT())
+		otherPEM, otherKey := testutil.IssueLeaf(GinkgoT(), otherCA, domain)
+		// 云上装着别人的证书 = 漂移；而每一次写入都失败 = 漂移永远修不好。
+		currentFC3().AddDomain(fake.Domain{
+			DomainName: domain, Protocol: "HTTP",
+			CertName: "someone-elses", CertPEM: otherPEM, KeyPEM: otherKey, Echo: "routes",
+		})
+		// Retryable：controller-runtime 以 5ms 起步的退避一轮轮重来，制造出真实的
+		// 「漂移仍在、Apply 仍失败」场景。无条件发事件的实现会在这里刷屏。
+		for range 200 {
+			currentFC3().QueueUpdateErr(&aliyun.Error{
+				Class: aliyun.ClassRetryable, Op: aliyun.ActionUpdateCustomDomain,
+				Code: "InternalError", Err: errors.New("boom"),
+			})
+		}
+		before := promtestutil.ToFloat64(
+			bindingDriftTotal.WithLabelValues(certsv1alpha1.TargetTypeFC3CustomDomain))
+
+		createCertificate(ctx, ns, "c13", domain)
+		simulateIssuance(ctx, ns, "c13", 1, certPEM, keyPEM)
+		createBinding(ctx, ns, "b13", "c13", domain, nil)
+
+		// 先确认重试风暴真的发生了，否则下面的上界断言是空断言。
+		eventually(func() bool { return currentFC3().UpdateCallsFor(domain) >= 8 })
+		rounds := currentFC3().UpdateCallsFor(domain)
+
+		// 与 ObserveFailed 那一条同样的读法：跃迁判据取自 informer cache 里的那一份
+		// （rd.orig），缓存滞后时紧邻的一两轮可能仍看着旧值，于是多记一两次——**有界**的
+		// 重复。要钉死的是「有界」：坏掉的实现每一轮都记，数字跟着轮次一起涨。
+		events := bindingEventCount(ctx, ns, "b13", certsv1alpha1.ReasonDriftCorrected)
+		Expect(events).To(BeNumerically(">=", 1), "跃迁那一轮必须发一条")
+		Expect(events).To(BeNumerically("<=", 3),
+			fmt.Sprintf("已失败 %d 轮却发了 %d 条事件——事件数不该跟轮次一起涨", rounds, events))
+		drifts := promtestutil.ToFloat64(
+			bindingDriftTotal.WithLabelValues(certsv1alpha1.TargetTypeFC3CustomDomain)) - before
+		Expect(drifts).To(BeNumerically("<=", 3),
+			fmt.Sprintf("已失败 %d 轮却记了 %v 次漂移——rate 查询会把一次漂移读成每轮一次", rounds, drifts))
+		// 痕迹落了盘，下一轮的比较基准才存在（gate 的收敛性就靠它）。
+		Expect(getBinding(ctx, ns, "b13").Status.DriftedFingerprint).NotTo(BeEmpty())
+	})
 })
 
 // protocolSatisfied 的 ensureHTTPS=true 分支在 envtest 里够不到：所有 fixture 的
@@ -509,6 +557,201 @@ func TestProtocolSatisfied(t *testing.T) {
 		if got != c.want {
 			t.Errorf("protocolSatisfied(%q, %t) = %t, want %t", c.protocol, c.ensureHTTPS, got, c.want)
 		}
+	}
+}
+
+// --- Observe 失败的分档处置 -------------------------------------------------
+
+// handleObserveError 的凭证分支必须与 handleFactoryError 同一条规矩：**只降 Ready**。
+//
+// 「AK 被云端拒绝」与「凭证 Secret 被删了」是同一个运维错误的两种到达方式，此前一个把
+// Applied 打成 False、另一个连碰都不碰。而降 Applied 还断言了一件假事：一次**读**被拒
+// 说不出目标上那张证书还在不在服役——这正是本分支的旁路规则明令禁止的。
+func TestHandleObserveError_AuthOnlyLowersReady(t *testing.T) {
+	r, rd := handleFixture(t)
+	// 先让这个对象处在「已经绑好了」的状态：Applied=True 才检得出「有没有被降级」。
+	setBindingCondition(rd.b, certsv1alpha1.ConditionApplied, metav1.ConditionTrue,
+		certsv1alpha1.ReasonApplied, "")
+
+	// 形状与 fc3.toProviderError 的 ClassAuth 分支一致，并把一段绝不该外泄的内容
+	// 塞进被包住的错误里。
+	authErr := fmt.Errorf("GetCustomDomain[InvalidAccessKeyId.NotFound]: %w",
+		provider.Errorf(provider.CodeAuth, false, certsv1alpha1.ReasonCredentialsInvalid,
+			fmt.Errorf("response body: ak=%s sk=%s", testAKID, testAKSecret)))
+
+	res, err := r.handleObserveError(context.Background(), rd, authErr)
+	if err != nil {
+		t.Fatalf("patch 失败: %v", err)
+	}
+	if res != (ctrl.Result{RequeueAfter: credentialsRequeue}) {
+		t.Errorf("凭证类错误应走固定长 requeue: %+v", res)
+	}
+	// Applied 一个字节都不动。断言它仍然是 True，而不是「不为 False」。
+	if c := condOrZero(rd.b, certsv1alpha1.ConditionApplied); c.Status != metav1.ConditionTrue ||
+		c.Reason != certsv1alpha1.ReasonApplied {
+		t.Errorf("读被拒绝说不出目标上那张证书有问题，Applied 不该被碰: %+v", *c)
+	}
+	ready := condOrZero(rd.b, certsv1alpha1.ConditionReady)
+	if ready.Status != metav1.ConditionFalse || ready.Reason != certsv1alpha1.ReasonCredentialsInvalid {
+		t.Errorf("应只降 Ready，且沿用 provider 给的 reason: %+v", *ready)
+	}
+	// message 取 err.Error()，与 handleFactoryError 同形；零凭证泄漏由 provider 契约担保，
+	// 这条断言就是那份担保的哨兵——它会随 status 写进集群，任何有读权限的人都看得见。
+	assertNoAKLeak(t, ready.Message)
+	if rd.b.Status.AppliedFingerprint != "" {
+		t.Error("旁路路径不该写 appliedFingerprint")
+	}
+}
+
+// 目标不存在是**真降级**：域名都没有，我们那张证书当然不在上面。这一条与上面那条
+// 相反，钉住它才说明「只降 Ready」没有被扩大到整个错误处置。
+func TestHandleObserveError_TargetNotFoundStillLowersApplied(t *testing.T) {
+	r, rd := handleFixture(t)
+	setBindingCondition(rd.b, certsv1alpha1.ConditionApplied, metav1.ConditionTrue,
+		certsv1alpha1.ReasonApplied, "")
+
+	res, err := r.handleObserveError(context.Background(), rd,
+		provider.Errorf(provider.CodeTargetNotFound, false, certsv1alpha1.ReasonTargetNotFound, nil))
+	if err != nil {
+		t.Fatalf("patch 失败: %v", err)
+	}
+	if res != (ctrl.Result{RequeueAfter: targetNotFoundRequeue}) {
+		t.Errorf("域名不存在应走 5m 固定 requeue: %+v", res)
+	}
+	if c := condOrZero(rd.b, certsv1alpha1.ConditionApplied); c.Status != metav1.ConditionFalse ||
+		c.Reason != certsv1alpha1.ReasonTargetNotFound {
+		t.Errorf("域名不存在直接证明证书不在目标上，必须降 Applied: %+v", *c)
+	}
+}
+
+// --- 漂移事件的跃迁 gate ----------------------------------------------------
+
+// driftRound 造一个只够 noteDrift / freezeApplied 使用的 round，provider label 用独有取值，
+// 免得与 envtest 里常驻 reconciler 推动的同一个计数器互相污染。
+func driftRound(prev *certsv1alpha1.AliyunCertificateBinding) *bindingRound {
+	b := prev.DeepCopy()
+	b.Namespace, b.Name = "ns1", "b-drift"
+	b.Spec.Target.Type = "DriftUnitTarget"
+	return newBindingRound(b)
+}
+
+func driftCount() float64 {
+	return promtestutil.ToFloat64(bindingDriftTotal.WithLabelValues("DriftUnitTarget"))
+}
+
+// noteDrift 无条件发事件时，一次改不动的漂移会按重试节奏一轮一轮地重发：永久错误每小时、
+// 凭证错误每 5 分钟、Retryable 更是毫秒级（它把 error 交回 controller-runtime 退避）。
+// 计数器同样虚高——rate 查询读出的是「每次 requeue 一次检测」而不是「一次漂移」。
+func TestNoteDrift_OnlyFiresOnTransition(t *testing.T) {
+	ctx := context.Background()
+	rec := record.NewFakeRecorder(16)
+	r := &AliyunCertificateBindingReconciler{Recorder: rec}
+	obs := provider.ObservedState{CurrentFingerprint: "aaaa"}
+	m := provider.CertMaterial{Fingerprint: "bbbb"}
+
+	// 第一轮：漂移是新的，必须发。
+	before := driftCount()
+	rd := driftRound(&certsv1alpha1.AliyunCertificateBinding{})
+	r.noteDrift(ctx, rd, obs, m)
+	if got := driftCount() - before; got != 1 {
+		t.Fatalf("首次观测到漂移应记一次，得到 %v", got)
+	}
+	if len(rec.Events) != 1 {
+		t.Fatalf("首次观测到漂移应发一条事件，得到 %d 条", len(rec.Events))
+	}
+	if rd.b.Status.DriftedFingerprint != "aaaa" {
+		t.Fatalf("痕迹没写下，下一轮就没有可比较的基准: %q", rd.b.Status.DriftedFingerprint)
+	}
+
+	// 第二轮：Apply 没修好，同一场漂移还在。**一条都不许再发**。
+	<-rec.Events
+	rd2 := driftRound(rd.b)
+	r.noteDrift(ctx, rd2, obs, m)
+	if got := driftCount() - before; got != 1 {
+		t.Errorf("同一场漂移不该重复计数，累计 %v", got)
+	}
+	if len(rec.Events) != 0 {
+		t.Errorf("同一场漂移不该重复发事件，得到 %d 条", len(rec.Events))
+	}
+
+	// 第三轮：换了一张别的证书，是**新的**漂移，必须再发一次。
+	rd3 := driftRound(rd2.b)
+	r.noteDrift(ctx, rd3, obs2("cccc"), m)
+	if got := driftCount() - before; got != 2 {
+		t.Errorf("换了一张证书是新的漂移，应再记一次，累计 %v", got)
+	}
+	if len(rec.Events) != 1 {
+		t.Errorf("新的漂移应发事件，得到 %d 条", len(rec.Events))
+	}
+}
+
+func obs2(fp string) provider.ObservedState { return provider.ObservedState{CurrentFingerprint: fp} }
+
+// 痕迹必须在漂移被解决时抹掉，否则同一张证书日后再次漂移会被误判成「还是上一轮那次」，
+// 事件与计数器就此永久静音。两条清空路径各钉一条：noteDrift 自己（观测到已收敛）与
+// freezeApplied（短路接管压根不经过 noteDrift）。
+func TestNoteDrift_ClearsTheMarkWhenResolved(t *testing.T) {
+	ctx := context.Background()
+	r := &AliyunCertificateBindingReconciler{Recorder: record.NewFakeRecorder(8)}
+	m := provider.CertMaterial{Fingerprint: "bbbb"}
+
+	drifted := &certsv1alpha1.AliyunCertificateBinding{}
+	drifted.Status.DriftedFingerprint = "aaaa"
+
+	rd := driftRound(drifted)
+	r.noteDrift(ctx, rd, obs2("bbbb"), m) // 云上已经是该写的那张
+	if rd.b.Status.DriftedFingerprint != "" {
+		t.Errorf("观测到已收敛就该抹掉痕迹: %q", rd.b.Status.DriftedFingerprint)
+	}
+
+	rd2 := driftRound(drifted)
+	r.freezeApplied(ctx, rd2, obs2("bbbb"), m, false) // 短路接管这条路
+	if rd2.b.Status.DriftedFingerprint != "" {
+		t.Errorf("固化成功状态时也该抹掉痕迹: %q", rd2.b.Status.DriftedFingerprint)
+	}
+}
+
+// --- lastObservedTime 的秒级 gate -------------------------------------------
+
+// status.lastObservedTime 序列化到整秒，是每一轮成功观测唯一会碰的 status 字段。
+// 同一秒内无条件重写写进去的是一个等价值，却会把 patch 变成非空、触发本 controller
+// 自己的 watch，多跑一轮 reconcile 与一次云读——而 FC3 通道被刻意限到 5 QPS。
+func TestNoteObserved_SkipsWithinTheSameSecond(t *testing.T) {
+	base := time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC)
+
+	newRound := func(prev *time.Time) *bindingRound {
+		b := &certsv1alpha1.AliyunCertificateBinding{}
+		if prev != nil {
+			b.Status.LastObservedTime = &metav1.Time{Time: *prev}
+		}
+		return newBindingRound(b)
+	}
+	at := func(now time.Time) *AliyunCertificateBindingReconciler {
+		r := &AliyunCertificateBindingReconciler{}
+		r.SetNow(func() time.Time { return now })
+		return r
+	}
+
+	// 快照里已经有同一秒的取值：一个字节都不写。
+	rd := newRound(&base)
+	at(base.Add(700 * time.Millisecond)).noteObserved(rd)
+	if !rd.b.Status.LastObservedTime.Time.Equal(base) {
+		t.Errorf("同一秒内不该重写: %v", rd.b.Status.LastObservedTime)
+	}
+
+	// 跨了秒：这一次是真的变化，必须写。
+	next := base.Add(1500 * time.Millisecond)
+	rd = newRound(&base)
+	at(next).noteObserved(rd)
+	if !rd.b.Status.LastObservedTime.Time.Equal(next) {
+		t.Errorf("跨秒必须写下新值: %v", rd.b.Status.LastObservedTime)
+	}
+
+	// 从来没观测过：必须写，否则这个字段永远为空。
+	rd = newRound(nil)
+	at(base).noteObserved(rd)
+	if rd.b.Status.LastObservedTime == nil || !rd.b.Status.LastObservedTime.Time.Equal(base) {
+		t.Errorf("首次观测必须写下时间: %v", rd.b.Status.LastObservedTime)
 	}
 }
 

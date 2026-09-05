@@ -105,8 +105,15 @@ func aggregateBindingReady(b *certsv1alpha1.AliyunCertificateBinding) {
 		setBindingCondition(b, certsv1alpha1.ConditionReady, metav1.ConditionTrue, certsv1alpha1.ReasonApplied, "")
 		return
 	}
+	// Applied 压根不存在时的兜底是 ObserveFailed，不是 ApplyFailed。走到这里而 Applied
+	// 缺席只有一种可能：一个从没 Applied 过的 Binding 首次观测就失败，而 noteObserveFailed
+	// 刻意什么都不写（绝不凭空造 Applied=False）。对这种对象说「ApplyFailed」是在报告
+	// 一次从未发生过的写入——ReasonObserveFailed 常量当初被提前引入，为的正是不让一次
+	// 观测失败被说成写入失败，而 Ready 是用户真正会读到的那一处。
+	//
+	// Applied 存在且为 False 时仍沿用它自己的 reason（下面那一支），ApplyFailed 也在其中。
+	reason := certsv1alpha1.ReasonObserveFailed
 	// 冲突比「没写成」更能说明问题：写不进去正是因为不该由我们写。
-	reason := certsv1alpha1.ReasonApplyFailed
 	if conflict {
 		reason = bindingCondReason(b, certsv1alpha1.ConditionConflict)
 	} else if r := bindingCondReason(b, certsv1alpha1.ConditionApplied); r != "" {

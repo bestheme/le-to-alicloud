@@ -84,9 +84,11 @@ var _ = Describe("绑定 controller：凭证失败", func() {
 			c := bindingCond(ctx, ns, "b2", certsv1alpha1.ConditionReady)
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonApplyFailed
 		})
-		// message 必须来自工厂错误本身。ApplyFailed 也是 aggregateBindingReady 在
-		// 「Applied 缺失」时的兜底 reason，而它写的 message 是空串——不断言 message，
-		// 这个用例在 handleFactoryError 被整条删掉之后照样会通过。
+		// message 必须来自工厂错误本身：aggregateBindingReady 在「Applied 缺失」时也会
+		// 写一个 Ready=False，而它写的 message 是空串——不断言 message，这个用例在
+		// handleFactoryError 被整条删掉之后照样会通过。
+		// （那条兜底的 reason 现在是 ObserveFailed，见 aggregateBindingReady；
+		// 此处的 ApplyFailed 因此只可能来自 handleFactoryError 的接线错误分支。）
 		Expect(bindingCond(ctx, ns, "b2", certsv1alpha1.ConditionReady).Message).To(Equal(wiring))
 		Expect(currentFC3().UpdateCallsFor(domain)).To(BeZero())
 	})

@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"testing"
+	"time"
 
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	. "github.com/onsi/ginkgo/v2"
@@ -26,6 +28,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake" // fake 已归 pkg/aliyun/fake
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -115,3 +120,62 @@ var _ = Describe("绑定 controller：骨架", func() {
 		Expect(currentFC3()).To(BeAssignableToTypeOf(&fake.FC3{}))
 	})
 })
+
+// spec §6.1：每一次成功的 reconcile 都返回漂移检查间隔。证书不存在与证书未就绪这两条
+// 终态早退此前返回的是空 Result——证书的 watch 保证了它们不会卡住，但
+// aliyuncert_binding_ready / _applied_age 这两个 gauge 只在证书对象变化时才刷新，
+// 而这两种状态恰恰可能长时间停在那里（Argo CD 正在换名字重建、签发一直不成功）。
+func TestReconcile_CertificateTerminalStatesRequeueOnDriftInterval(t *testing.T) {
+	const drift = 42 * time.Minute
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns1", Name: "b1"}}
+
+	fixture := func(objs ...client.Object) *AliyunCertificateBindingReconciler {
+		b := bindingWithDomain("api.example.com")
+		b.Namespace, b.Name = "ns1", "b1"
+		b.Spec.CertificateRef = certsv1alpha1.LocalObjectReference{Name: "c1"}
+		// finalizer 必须先有，否则 Reconcile 会停在「加 finalizer 再说」那一步。
+		b.Finalizers = []string{certsv1alpha1.FinalizerName}
+		c := crfake.NewClientBuilder().WithScheme(factoryScheme(t)).
+			WithObjects(append([]client.Object{b}, objs...)...).
+			WithStatusSubresource(&certsv1alpha1.AliyunCertificateBinding{}).Build()
+		return &AliyunCertificateBindingReconciler{Client: c, DriftCheckInterval: drift}
+	}
+	readyReason := func(t *testing.T, r *AliyunCertificateBindingReconciler) string {
+		t.Helper()
+		b := &certsv1alpha1.AliyunCertificateBinding{}
+		if err := r.Get(context.Background(), req.NamespacedName, b); err != nil {
+			t.Fatalf("读回对象失败: %v", err)
+		}
+		return bindingCondReason(b, certsv1alpha1.ConditionReady)
+	}
+
+	t.Run("证书 CR 不存在", func(t *testing.T) {
+		r := fixture()
+		res, err := r.Reconcile(context.Background(), req)
+		if err != nil {
+			t.Fatalf("不该报错: %v", err)
+		}
+		if res != (ctrl.Result{RequeueAfter: drift}) {
+			t.Errorf("应返回 drift 周期: %+v", res)
+		}
+		if got := readyReason(t, r); got != certsv1alpha1.ReasonCertificateNotFound {
+			t.Errorf("Ready reason = %q", got)
+		}
+	})
+
+	t.Run("证书尚未 Issued", func(t *testing.T) {
+		r := fixture(&certsv1alpha1.AliyunCertificate{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: "c1"},
+		})
+		res, err := r.Reconcile(context.Background(), req)
+		if err != nil {
+			t.Fatalf("不该报错: %v", err)
+		}
+		if res != (ctrl.Result{RequeueAfter: drift}) {
+			t.Errorf("应返回 drift 周期: %+v", res)
+		}
+		if got := readyReason(t, r); got != certsv1alpha1.ReasonCertificateNotReady {
+			t.Errorf("Ready reason = %q", got)
+		}
+	})
+}
