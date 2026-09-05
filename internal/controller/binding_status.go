@@ -142,5 +142,25 @@ func (r *AliyunCertificateBindingReconciler) appliedLag(
 // patchBinding 用 MergeFrom 提交 status，并在同一处刷新 gauge。
 func (r *AliyunCertificateBindingReconciler) patchBinding(ctx context.Context, rd *bindingRound) error {
 	recordBindingMetrics(rd)
+	return r.patchBindingStatus(ctx, rd)
+}
+
+// patchBindingStatus 只落盘 status，**不碰 gauge**。删除分支专用。
+//
+// 删除分支在 Reconcile 的最前面就 return 了，比 rd.lag = r.appliedLag(...) 那一行还早，
+// 所以它手里的 rd.lag 永远是零值。走 patchBinding 就会把
+// aliyuncert_binding_applied_age_seconds 刷成 0，而删除路径上再也没有一个知道真实
+// lag 的调用点能把它刷回去。于是一个卡在 Terminating 的 Binding 会一直报告 0 秒滞后，
+// spec §10.3 的 AliyunCertificateBindingStale 恰恰对最该告警的那个对象永远不触发；
+// CleanupFailurePolicy=Block 下这个状态是永久的。
+//
+// ready / conflict 不在此列，它们由 recordBindingReadiness 单独刷——那两个 gauge 的
+// 真相来源是 condition，删除分支照样写得出真值。
+//
+// 这正是 Reconcile 里那两条「rd.lag 早已算好」长注释在守的不变量，删除分支是唯一
+// 会破坏它的地方。修法选「不刷」而不是「在删除分支之前算好 lag」：算 lag 需要先把
+// 证书 CR 读出来，那会给每一轮删除都加一次 API 读，而这些 gauge 几个动作之后就会被
+// clearBindingMetrics 整条删掉，刷新它们没有任何消费者。
+func (r *AliyunCertificateBindingReconciler) patchBindingStatus(ctx context.Context, rd *bindingRound) error {
 	return r.Status().Patch(ctx, rd.b, client.MergeFrom(rd.orig))
 }

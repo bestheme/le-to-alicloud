@@ -152,10 +152,20 @@ func b2f(v bool) float64 {
 
 // recordBindingMetrics 在每次 status patch 前刷新 binding 侧 gauge。
 func recordBindingMetrics(rd *bindingRound) {
-	ns, n, p := rd.b.Namespace, rd.b.Name, rd.provider
+	recordBindingReadiness(rd)
+	bindingAppliedAge.WithLabelValues(rd.b.Namespace, rd.b.Name, rd.provider).Set(rd.lag.Seconds())
+}
+
+// recordBindingReadiness 只刷 ready / conflict，**不碰 applied_age**。
+//
+// 删除分支专用：那里 rd.lag 恒为零值（见 patchBindingStatus），刷 applied_age 是在
+// 写一个假值；但 ready 必须跟着走——清理失败时 Ready 已经被打成 False，gauge 还停在 1
+// 的话，一个卡在 Terminating 里的对象在看板上依旧是健康的，而 CleanupFailurePolicy=Block
+// 下这个状态会一直持续到有人来处理。
+func recordBindingReadiness(rd *bindingRound) {
+	ns, n := rd.b.Namespace, rd.b.Name
 	bindingReadyGauge.WithLabelValues(ns, n).Set(b2f(bindingCondTrue(rd.b, certsv1alpha1.ConditionReady)))
 	bindingConflictGauge.WithLabelValues(ns, n).Set(b2f(bindingCondTrue(rd.b, certsv1alpha1.ConditionConflict)))
-	bindingAppliedAge.WithLabelValues(ns, n, p).Set(rd.lag.Seconds())
 }
 
 // clearBindingMetrics 在 Binding 删除后移除 series，否则墓碑会一直告警下去。

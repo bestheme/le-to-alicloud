@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -60,9 +61,12 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingDelete(ctx context.
 	}
 
 	// 宽限期从「真正开始清理」起算，与证书 controller 同一考量。
+	//
+	// 落盘一律走 patchBindingStatus 而不是 patchBinding：删除分支手里的 rd.lag 是零值，
+	// 刷 gauge 会把 applied_age 永久钉在 0 上，理由见 patchBindingStatus 的注释。
 	if b.Status.CleanupStartedAt == nil {
 		b.Status.CleanupStartedAt = &metav1.Time{Time: r.now()}
-		if err := r.patchBinding(ctx, rd); err != nil {
+		if err := r.patchBindingStatus(ctx, rd); err != nil {
 			return ctrl.Result{}, err
 		}
 		rd.orig = b.DeepCopy()
@@ -70,8 +74,19 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingDelete(ctx context.
 
 	if err := r.unbindTarget(ctx, rd); err != nil {
 		elapsed := r.now().Sub(b.Status.CleanupStartedAt.Time)
-		if r.CleanupFailurePolicy == CleanupPolicyBlock || elapsed < r.CleanupGracePeriod {
+		if !shouldAbandonCleanup(r.CleanupFailurePolicy, elapsed, r.CleanupGracePeriod) {
 			log.Error(err, "解绑失败，重试中", "domain", targetIdentifier(b))
+			// 集群里也要留下痕迹，与证书 controller 的清理失败分支同构：只有日志的话，
+			// 一个卡在 Terminating 的 Binding 上 kubectl describe 看到的还是删除前的
+			// 状态——没有 condition、没有事件、（gauge 已按上面的理由不再刷新）没有
+			// 指标变化，运维手里一条线索都没有。
+			setBindingReadyFalse(b, certsv1alpha1.ReasonCleanupFailed, "解绑失败，重试中: "+err.Error())
+			// ready gauge 要跟着 condition 走，否则看板上这个卡死的对象仍然是绿的；
+			// applied_age 不刷，理由见 patchBindingStatus。
+			recordBindingReadiness(rd)
+			if perr := r.patchBindingStatus(ctx, rd); perr != nil {
+				return ctrl.Result{}, perr
+			}
 			return ctrl.Result{}, err // 指数退避
 		}
 		// Abandon：把足以人工兜底的信息留在日志里，然后走完删除。
@@ -126,6 +141,20 @@ func (r *AliyunCertificateBindingReconciler) unbindTarget(ctx context.Context, r
 		}
 		return err
 	}
+	// 账号 fencing 在这条路径上同样成立。只比指纹是不够的：指纹是**叶子证书的哈希**，
+	// 同一张证书部署到两个账号的同名域名上，指纹一模一样。迁移期的现实场景——Binding
+	// 先在账号 A 上 apply 并固化了 boundAccountId，随后凭证被指向账号 B，于是普通
+	// reconcile 全部停在 fenceAccount 上一个字节都不写；此时删除对象，Unbind 观测到的
+	// 是账号 B 里那个同名域名，指纹又恰好相等——闸门形同虚设，我们会把一个从来不属于
+	// 本 Binding 的生产 HTTPS 域名降成 HTTP。
+	//
+	// spec §6.5 只点名了指纹，但同一道闸在 spec §6.2 步骤 5 的写入路径上是强制的；
+	// 删除同样是写入，没有理由在这里放行（controller 裁决，2026-09-05）。
+	if bound := b.Status.BoundAccountID; bound != "" && bound != obs.AccountID {
+		logf.FromContext(ctx).Info("目标所属账号与首次绑定时不一致，跳过解绑",
+			"domain", tg.Identifier)
+		return nil
+	}
 	if obs.CurrentFingerprint != b.Status.AppliedFingerprint {
 		// 目标上不是我们写的那张：可能是别的 Binding 接管了，也可能是人工换过。
 		// 动它等于替别人做主。
@@ -146,6 +175,19 @@ func (r *AliyunCertificateBindingReconciler) finishBindingDeletion(ctx context.C
 	clearBindingMetrics(rd.b.Namespace, rd.b.Name, rd.provider)
 	logf.FromContext(ctx).Info("binding deleted", "name", rd.b.Name)
 	return ctrl.Result{}, nil
+}
+
+// shouldAbandonCleanup 是「还要不要继续重试解绑」这个决定的全部内容。
+//
+// 抽成纯函数是为了能不起 envtest 就把它表死（见 TestShouldAbandonCleanup）：绑定侧的
+// CleanupFailurePolicy 挂在常驻 reconciler 上，用例里翻转它会波及并发跑着的其他用例，
+// 所以这条分支拿不到 envtest 覆盖；而「Block 下永远不放弃」是有界清理的另一半——它决定
+// 一个对象会不会被永远钉在 Terminating 上，不该只靠「证书侧同构」来担保。
+//
+// policy 的取值由 --cleanup-failure-policy 的 flag 校验限死为 Abandon | Block，
+// 因此这里只认 Block，其余一切（含空串）按 Abandon 处理，与证书侧逐字一致。
+func shouldAbandonCleanup(policy string, elapsed, grace time.Duration) bool {
+	return policy != CleanupPolicyBlock && elapsed >= grace
 }
 
 // providerErrClass 给 cleanup_abandoned_total 的 reason label 一个有界取值。
