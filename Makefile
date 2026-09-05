@@ -117,10 +117,9 @@ test-race: manifests generate fmt vet setup-envtest ## Run tests with the race d
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -race $$(go list ./... | grep -v /e2e)
 
 .PHONY: test-integration
-# -timeout is a ceiling, not a wait: the cluster probes alone can take ~18 minutes of
-# wall clock, and go test kills the process on timeout WITHOUT running t.Cleanup, which
-# would leak the probe namespace and the certificates uploaded to CAS. 45m leaves head
-# room over the observed worst case so a slow run finishes and cleans up after itself.
+# -timeout 是上限不是等待：集群探针单独就要约 18 分钟挂钟，而 go test 打满硬超时会直接
+# 杀进程、不执行 t.Cleanup，泄漏探针 namespace 与已上传到 CAS 的证书。45m 相对已观测
+# 的最坏情况留了余量，让跑得慢的那一轮也能跑完并自己收尾。
 test-integration: ## Run the real-cloud integration probes (spec §12.3). Skips without credentials.
 	go test -tags=integration ./test/integration/... -v -count=1 -timeout 45m
 
