@@ -220,8 +220,12 @@ func isDuplicateName(err error) bool {
 	if !errors.As(err, &e) {
 		return false
 	}
-	// 阿里云真实错误码待实测确认；fake 使用 CertNameDuplicated
-	return e.Code == "CertNameDuplicated" || e.Code == "DuplicateCertificateName" || e.Code == "CertNameExisted"
+	// NameRepeat 是 cn-hangzhou 的 CAS UploadUserCertificate 在同名冲突时实测返回的码
+	// （spec §12.3 #13，2026-09-05 实测）。另外三个是 Plan 1 留下的候选：fake 用
+	// CertNameDuplicated，其余两个可能对应别的 region 或 API 版本，一并保留——多认一个
+	// 码只会让认领路径更宽，认不出才会让重传永远失败。
+	return e.Code == "NameRepeat" || e.Code == "CertNameDuplicated" ||
+		e.Code == "DuplicateCertificateName" || e.Code == "CertNameExisted"
 }
 
 // shortFP 截取指纹前 8 位用于日志。status 里的指纹是 API 上可写的字段，被人手工改短
