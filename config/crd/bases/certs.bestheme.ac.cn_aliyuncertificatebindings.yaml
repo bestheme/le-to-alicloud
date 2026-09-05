@@ -129,6 +129,10 @@ spec:
               boundAccountId:
                 description: 首次成功 Apply 时固化，用于账号 fencing。
                 type: string
+              cleanupStartedAt:
+                description: 首次进入删除分支的时间，用于 --cleanup-grace-period 计时。
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

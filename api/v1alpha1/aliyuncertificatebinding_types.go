@@ -95,6 +95,9 @@ type AliyunCertificateBindingStatus struct {
 	// 首次成功 Apply 时固化，用于账号 fencing。
 	// +optional
 	BoundAccountID string `json:"boundAccountId,omitempty"`
+	// 首次进入删除分支的时间，用于 --cleanup-grace-period 计时。
+	// +optional
+	CleanupStartedAt *metav1.Time `json:"cleanupStartedAt,omitempty"`
 	// +optional
 	// +listType=map
 	// +listMapKey=type

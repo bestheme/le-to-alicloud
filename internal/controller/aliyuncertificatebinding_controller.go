@@ -302,21 +302,6 @@ func (r *AliyunCertificateBindingReconciler) handleFactoryError(
 	return ctrl.Result{RequeueAfter: credentialsRequeue}, r.patchBinding(ctx, rd)
 }
 
-// reconcileBindingDelete 是删除分支的存根，Task 13 替换。
-func (r *AliyunCertificateBindingReconciler) reconcileBindingDelete(
-	ctx context.Context, rd *bindingRound,
-) (ctrl.Result, error) {
-	if !controllerutil.ContainsFinalizer(rd.b, certsv1alpha1.FinalizerName) {
-		return ctrl.Result{}, nil
-	}
-	controllerutil.RemoveFinalizer(rd.b, certsv1alpha1.FinalizerName)
-	if err := r.Update(ctx, rd.b); err != nil {
-		return ctrl.Result{}, err
-	}
-	clearBindingMetrics(rd.b.Namespace, rd.b.Name, rd.provider)
-	return ctrl.Result{}, nil
-}
-
 // certIssued 判断证书 CR 是否已经拿到可用的材料。
 //
 // 看 Issued 而不是 Ready：Ready 还包含 Uploaded，而 FC3 内联 PEM，根本不需要 CAS 上传

@@ -87,11 +87,9 @@ func targetIdentifier(b *certsv1alpha1.AliyunCertificateBinding) string {
 
 // targetRegion 同上，供 region label 使用；取不到时返回空串（label 允许空值）。
 //
-// 原抑制理由写的是「同 targetIdentifier（Task 8 起使用）」，是错的：Task 11 消费了
-// targetIdentifier，却用不上 region——绑定侧三个 gauge 的 label 里根本没有 region。
-// 真正的首个调用者是 Task 13 的 cleanupAbandonedTotal.WithLabelValues(targetRegion(b), …)。
-//
-//nolint:unused // 调用点由 Task 13 的 Abandon 分支补上，见上方说明。
+// 唯一调用点是 binding_deletion.go 的 Abandon 分支：
+// cleanupAbandonedTotal.WithLabelValues(targetRegion(b), providerErrClass(err))。
+// 绑定侧三个 gauge 的 label 里都没有 region，所以除它之外没有第二个消费者。
 func targetRegion(b *certsv1alpha1.AliyunCertificateBinding) string {
 	if b.Spec.Target.FC3CustomDomain != nil {
 		return b.Spec.Target.FC3CustomDomain.Region
