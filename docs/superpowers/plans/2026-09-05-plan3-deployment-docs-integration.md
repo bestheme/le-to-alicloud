@@ -2063,6 +2063,15 @@ Reason+Message 完全相同的事件）。下表是证书 controller 实际发�
 
 同时把 #3 那一行的「影响」补上一句：`write-ahead 幂等能否落地；结论见 test/integration/RESULTS.md`。
 
+再修 §10.1 与 §10.3 中 `aliyuncert_binding_applied_age_seconds` 的语义（Plan 2 撰写期裁决：字面「目标上生效证书的年龄」会让 §10.3 的 `> 86400` 告警对每张健康证书在一天后误报）。§10.1 该指标的注释改为：
+
+```
+  # 滞后时长：证书 CR 的 status.current 推进后，Binding 尚未把该代应用到目标的持续秒数；
+  # 已同步时为 0。独有失败模式：续期成功但没推到线上。必须告警。
+```
+
+§10.3 第二条告警保持式子不变（`aliyuncert_binding_applied_age_seconds > 86400 and on(namespace,name) aliyuncert_certificate_ready == 1`），但在其后加一句说明：「按滞后语义，该式子表示『证书已推进超过一天而线上仍是旧代』」。
+
 - [ ] **Step 6: §14 追加两条已知限制**
 
 ```markdown
