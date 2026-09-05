@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"testing"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
@@ -340,3 +341,31 @@ var _ = Describe("证书 controller：上传", func() {
 		})
 	})
 })
+
+// TestIsDuplicateNameNameRepeat 锁住实测出来的重名错误码。NameRepeat 是 cn-hangzhou 的
+// CAS UploadUserCertificate 在同名冲突时真正返回的码（spec §12.3 #13，2026-09-05 实测），
+// 而 Plan 1 只猜了 CertNameDuplicated / DuplicateCertificateName / CertNameExisted 三个。
+// 认不出这个码，upload 的 DuplicateName→findByName 认领路径就会失效：进程在「云侧已成功、
+// 响应还没回来」时崩溃，重传会永远撞在同名冲突上，而不是认领那张已经存在的证书。
+//
+// 这是纯单元测试，不建 CR、不打云——证书侧的 envtest 用例断言的是套件全局的云调用计数。
+func TestIsDuplicateNameNameRepeat(t *testing.T) {
+	for _, tc := range []struct {
+		code string
+		want bool
+	}{
+		{"NameRepeat", true},
+		{"CertNameDuplicated", true},
+		{"DuplicateCertificateName", true},
+		{"CertNameExisted", true},
+		{"InvalidParameter", false},
+	} {
+		err := error(&aliyun.Error{Class: aliyun.ClassPermanent, Op: "UploadUserCertificate", Code: tc.code})
+		if got := isDuplicateName(err); got != tc.want {
+			t.Errorf("isDuplicateName(code=%q) = %v，期望 %v", tc.code, got, tc.want)
+		}
+	}
+	if isDuplicateName(errors.New("不是 SDK 错误")) {
+		t.Error("非 *aliyun.Error 不该被判成重名冲突")
+	}
+}
