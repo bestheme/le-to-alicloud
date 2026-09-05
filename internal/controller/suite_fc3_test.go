@@ -53,8 +53,6 @@ func resetFC3() {
 }
 
 // setFC3FactoryErr 让 ProviderFactory 直接失败，用来测凭证分支。
-//
-//nolint:unused // suite 的接线已经读 fc3FactoryErr，注入点由 Task 10 的凭证用例使用。
 func setFC3FactoryErr(err error) { fakeMu.Lock(); fc3FactoryErr = err; fakeMu.Unlock() }
 
 func currentFC3FactoryErr() error { fakeMu.Lock(); defer fakeMu.Unlock(); return fc3FactoryErr }

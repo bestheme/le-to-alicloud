@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -46,8 +47,6 @@ import (
 const targetNotFoundRequeue = 5 * time.Minute
 
 // credentialsRequeue 是凭证类错误的长 requeue：等人换 AK 或补授权，重试再快也没用。
-//
-//nolint:unused // 同上，由 Task 10 的凭证分支引用。
 const credentialsRequeue = 5 * time.Minute
 
 // ProviderFactory 按 Binding 解析出 provider 与已经构造好的云 client。
@@ -204,8 +203,42 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 		return ctrl.Result{RequeueAfter: certificateGateRequeue}, r.patchBinding(ctx, rd)
 	}
 
+	// 4. 解析凭证并构造 provider client（spec §6.2 步骤 4）
+	p, cl, err := r.ProviderFactory(ctx, b, ac)
+	if err != nil {
+		return r.handleFactoryError(ctx, rd, err)
+	}
+	tg, err := targetOf(b)
+	if err != nil {
+		setBindingReadyFalse(b, certsv1alpha1.ReasonApplyFailed, err.Error())
+		return ctrl.Result{}, r.patchBinding(ctx, rd)
+	}
+	_ = p
+	_ = cl
+	_ = tg
+
 	aggregateBindingReady(b)
 	return ctrl.Result{RequeueAfter: r.DriftCheckInterval}, r.patchBinding(ctx, rd)
+}
+
+// handleFactoryError 处置「连 client 都没造出来」的失败。
+//
+// 凭证类错误不可重试：AK 被吊销、Secret 写错了 key，重试再快也没用，等的是人改配置。
+// 长 requeue 5m 而不是指数退避，退避到几十分钟反而会让「改好了却迟迟不生效」。
+//
+// 只降 Ready、不碰 Applied：造不出 client 说明不了目标上那张证书是错的（与
+// 「Secret 丢了」同一条原则），status.appliedFingerprint 也一个字节都不动。
+func (r *AliyunCertificateBindingReconciler) handleFactoryError(
+	ctx context.Context, rd *bindingRound, err error,
+) (ctrl.Result, error) {
+	var ce *credentialsError
+	if errors.As(err, &ce) {
+		setBindingReadyFalse(rd.b, ce.Reason, ce.Error())
+		return ctrl.Result{RequeueAfter: credentialsRequeue}, r.patchBinding(ctx, rd)
+	}
+	// 剩下的是接线错误（未知 target.type、没注册 provider）：同样等 spec 改动。
+	setBindingReadyFalse(rd.b, certsv1alpha1.ReasonApplyFailed, err.Error())
+	return ctrl.Result{RequeueAfter: credentialsRequeue}, r.patchBinding(ctx, rd)
 }
 
 // reconcileBindingDelete 是删除分支的存根，Task 13 替换。
