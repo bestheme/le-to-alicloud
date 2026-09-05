@@ -40,7 +40,7 @@ spec:
         # 整条表达式恒为空，这条 spec §10.1 点名必配的告警会静默失效。
         #
         # 去掉守卫是安全的，它本来就是冗余而非承重：appliedLag
-        # （binding_status.go:137-141）在证书 status.current 为 nil 或 fingerprint 为空时
+        # （binding_status.go:139-141）在证书 status.current 为 nil 或 fingerprint 为空时
         # 直接返回 0，未签发的证书产生不了非零 lag。
         #
         # 更完备的做法是给 bindingAppliedAge 加一个 certificate label，再用

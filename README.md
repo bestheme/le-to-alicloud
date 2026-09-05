@@ -46,6 +46,7 @@ flowchart LR
 | Kubernetes | ≥ 1.25（CRD 用了 CEL `x-kubernetes-validations`）；OpenShift ≥ 4.12 | `kubectl version -o json \| jq -r .serverVersion.minor` |
 | cert-manager | 已安装并可用。编译期钉在 v1.21.1，运行期建议同版本；更低版本未验证 | `kubectl get pods -n cert-manager` |
 | `Issuer` / `ClusterIssuer` | 由你自己创建，operator 不管它 | `kubectl get clusterissuers` |
+| Go 工具链 | **只有在本机跑 `make` 时才需要**（`go.mod` 要求 ≥ 1.26）：`make kustomize` / `manifests` / `generate` / `build` / `lint` / `test` 都经 `go-install-tool` 按需 `go install` 缺失的工具到 `bin/`，没有 Go 就会失败。纯 Argo CD 或 `kubectl apply -k` 的安装路径不需要它 | `go version` |
 | Prometheus Operator | **使用 openshift overlay 时必需**：该 overlay 含 `ServiceMonitor` 与 `PrometheusRule`。OpenShift 自带 `monitoring.coreos.com` CRD，所以 apply 不会失败，但需要启用 user workload monitoring 才会真的被抓取；其他集群必须先安装 Prometheus Operator，否则 Argo sync 会因为缺 CRD 而失败 | `kubectl get crd prometheusrules.monitoring.coreos.com servicemonitors.monitoring.coreos.com` |
 
 OpenShift 上的等价检查：
@@ -303,7 +304,7 @@ spec:
 
 ### 上手
 
-`config/samples/` 里的三个样本可以直接用。凭证 Secret 的两个 `REPLACE_ME` 必须先改掉——**改完的文件不要提交进任何仓库**，生产环境请用 SealedSecret / ExternalSecret 生成它。
+`config/samples/` 里的三个样本可以直接用：两个是本项目的 CR（`AliyunCertificate` 与 `AliyunCertificateBinding`），第三个 `aliyun-credentials-secret.yaml` 是核心 `Secret`，不是 CR。凭证 Secret 的两个 `REPLACE_ME` 必须先改掉——**改完的文件不要提交进任何仓库**，生产环境请用 SealedSecret / ExternalSecret 生成它。
 
 ```bash
 # oc
@@ -584,7 +585,12 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 
     现有实现传的就是 `*.example.com`（`casDomainHint` 取 `dnsNames[0]`），**正常路径没有问题**，不存在「探测持续误判、每 12 小时重传一次」这种情况。要咬人的是反方向，而且只有**一条**路径会咬：**CAS 存在性探测**。
 
-    机制是这样的。走 Keyword 的地方一共三处，另外两处都不受影响——保留策略回收（`retention.go`）与 finalizer 主清理路径（`deletion.go`）都是拿 `status` 里记着的 `certId` **直删**，压根不查 Keyword；唯一另一处用 Keyword 的 `cleanupPendingUpload` 只在 `status.pendingUpload != nil` 时才跑，而那时 `casFindHint` 第一优先返回的正是 `pendingUpload.domainHint` 这个快照。剩下的探测则不同：它传给 `FindUploaded` 的域名取自**当前叶子证书的 SAN**。所以把 `spec.dnsNames` 从 `*.example.com` 改成 `probe.example.com`（或任何不是它子串的域名）、cert-manager 重签出新叶子之后，如果这一轮恰好轮到 12 小时一次的探测（`status.casProbedAt` 已过期），探测就会拿**新叶子**的域名去找**旧代次**的 certId，必然找不到，于是判定「云上那张没了」：清空 `status.current.certId` 与 `fingerprint`，发一条 `Warning CASCertificateMissing`，紧接着把新证书当作全新一张传上去。旧代次的 certId 就此从 `status` 里消失，CAS 上那张证书被**无痕地孤儿化**。（探测不到期的那些轮次里，换代走的是正常路径：旧代次进 `history`、certId 保留、之后由保留策略按 certId 正常回收，不会漏。**这条附加限定是据代码推导的，未做云上实测**——与本条开头那个子串匹配结论不同，后者有 `RESULTS.md` `#12` 的实测支撑。）
+    机制是这样的。`Keyword` 只有一个入口——`pkg/aliyun` 的 `FindUploaded`——controller 侧一共**三处**调用它，另外两处都不受影响：
+
+    - `cleanupPendingUpload`（`deletion.go`）只在 `status.pendingUpload != nil` 时才跑，而那时 `casFindHint` 第一优先返回的正是 `pendingUpload.domainHint` 这个快照——快照记的就是建那张证书时的域名。
+    - `findByName`（`upload.go`）只在上传撞 `NameRepeat` 之后的认领路径上跑，它的 Keyword 取自**这一次要上传的那个 Bundle** 的首个 SAN，而它要找的正是刚用同一个 Bundle 传上去的那张，自洽。
+
+    保留策略回收（`retention.go`）与 finalizer 的主清理路径（`deletion.go`）压根不走 Keyword——它们拿 `status` 里记着的 `certId` **直删**。剩下的第三处、也是唯一会咬人的一处，是 **CAS 存在性探测**（`probe.go` 的 `probeCAS`）：它传给 `FindUploaded` 的域名取自**当前叶子证书的 SAN**。所以把 `spec.dnsNames` 从 `*.example.com` 改成 `probe.example.com`（或任何不是它子串的域名）、cert-manager 重签出新叶子之后，如果这一轮恰好轮到 12 小时一次的探测（`status.casProbedAt` 已过期），探测就会拿**新叶子**的域名去找**旧代次**的 certId，必然找不到，于是判定「云上那张没了」：清空 `status.current.certId` 与 `fingerprint`，发一条 `Warning CASCertificateMissing`，紧接着把新证书当作全新一张传上去。旧代次的 certId 就此从 `status` 里消失，CAS 上那张证书被**无痕地孤儿化**。（探测不到期的那些轮次里，换代走的是正常路径：旧代次进 `history`、certId 保留、之后由保留策略按 certId 正常回收，不会漏。**这条附加限定是据代码推导的，未做云上实测**——与本条开头那个子串匹配结论不同，后者有 `RESULTS.md` `#12` 的实测支撑。）
 
     怎么发现：改过 `dnsNames` 之后盯 `Warning CASCertificateMissing` 事件，以及 `aliyuncert_cas_upload_total{result="success"}` 意外多涨的那一次——这两个信号比事后去 CAS 控制台翻「有证书但没有 CR 指向它」早得多。处置：去控制台手工删掉旧域名那张。
 
