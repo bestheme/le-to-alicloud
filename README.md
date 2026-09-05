@@ -632,7 +632,7 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 
 2. **`yundun-cert:*` 无法资源级收窄**，见「RAM 权限」。必须用独立子账号。
 
-3. **不缓存 Secret 的盲区。** Secret 被换成一张合法但不同的证书、且 cert-manager 没有 bump `revision` 时，operator 要到下一次周期 resync 才发现，最多延迟一个 `--certificate-resync-interval`（默认 1h）。这一条对应 spec §12.3 的 `#7`，属于集群侧探针。`test/integration/RESULTS.md` 里 `#7` 目前记的是**未实测**（原因：集成环境的那个集群上没有 cert-manager 的 API 类型），所以这个延迟上界还没有真实集群的实测确认。怎么发现：`status.current.fingerprint` 与 Secret 里那张的实际指纹对不上。
+3. **不缓存 Secret 的盲区。** Secret 被换成一张合法但不同的证书、且 cert-manager 没有 bump `revision` 时，operator 要到下一次周期 resync 才发现，最多延迟一个 `--certificate-resync-interval`（默认 1h）。这一条对应 spec §12.3 的 `#7`，属于集群侧探针。实测（`RESULTS.md` `#7`，2026-09-05，cert-manager v1.20.3，SelfSigned Issuer）：Secret 被替换为另一张合法证书时，**cert-manager 会重签并 bump `revision`**，operator watch Certificate 即可发现。所以这个盲区只剩「替换后不 bump `revision`」这一种情形——本轮没有观测到它发生，但也没有证据排除它。怎么发现：`status.current.fingerprint` 与 Secret 里那张的实际指纹对不上。
 
 4. **CAS 的 `ClientToken` 不提供上传幂等。** 实测（`RESULTS.md` `#3` / `#13`）：同 token 重复上传返回 `NameRepeat` 而不是原 certId。write-ahead 的崩溃恢复因此走的是预案里的退化路径——`DuplicateName → findByName`，用 `ListUserCertificateOrder` 分页查询认领既有 certId，而这个接口 QPS 只有 10。名字字符集（`-` 与 `.` 均接受）与跨 region 可见性（**不可见**，两个 endpoint 的证书集合互相隔离）同样在 `RESULTS.md` 里，`#4` 与 `#9`。跨 region 那条的直接后果：`spec.aliyun.casRegion` 改了之后，旧 region 上的证书在新 region 一条都查不到。
 
@@ -842,7 +842,7 @@ make kustomize && ./bin/kustomize build config/default | grep -c "^kind: CustomR
 
 6. **缺凭证时 `make test-integration` 是 skip，不是 fail。** 所以它进 CI 是安全的，但绿灯不等于跑过——判断依据是 `RESULTS.md` 有没有被更新，以及测试输出里有多少 `--- SKIP`。
 
-7. 集群侧那三项（spec §12.3 `#6` / `#7` / `#11`）需要 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 的集群，并且本项目的 CRD 已经装上（`make install`，或 `oc apply -k config/crd` / `kubectl apply -k config/crd`）。它们用 `SelfSigned` Issuer，不消耗任何 ACME 配额。留空（或者 kubeconfig 指的集群上没装 cert-manager）时这三项被跳过，`RESULTS.md` 里会各留一行「未实测」并附上原因——**当前提交的那一份正是这个状态**：三行都在，但都还没有真实集群的结论。补齐它们需要把 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 与本项目 CRD 的集群，再整包跑一次。
+7. 集群侧那三项（spec §12.3 `#6` / `#7` / `#11`）需要 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 的集群，并且本项目的 CRD 已经装上（`make install`，或 `oc apply -k config/crd` / `kubectl apply -k config/crd`）。它们用 `SelfSigned` Issuer，不消耗任何 ACME 配额。留空（或者 kubeconfig 指的集群上没装 cert-manager）时这三项被跳过，`RESULTS.md` 里会各留一行「未实测」并附上原因。**当前提交的那一份不是这个状态**：三项已在真实集群上跑出结论（2026-09-05，cert-manager v1.20.3）。要复现它们，同样需要把 `INTEGRATION_KUBECONFIG` 指向一个装了 cert-manager 与本项目 CRD 的集群，再整包跑一次。
 
 8. **跑完集群探针要复查残留 namespace。** 探针会建一批 `it-certmgr-<随机后缀>` 的临时 namespace 并在结束时删掉：
 

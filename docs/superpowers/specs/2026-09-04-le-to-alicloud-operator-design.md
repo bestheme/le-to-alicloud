@@ -83,7 +83,8 @@
 ### 2.5 未核实项（必测）
 
 见 §12.3。**截至 2026-09-05 的进度**：CAS 侧的 #1 / #3 / #4 / #5 / #9 / #12 / #13 已核实（依据 `test/integration/RESULTS.md`），
-#8 **部分核实**（实测到的只有「当前账号空 `Keyword` 列举返回 0 张」这个计数；列举语义是据 SDK 枚举推导、非实测，配额上限也未测）；cert-manager 侧的 #6 / #7 / #11 与 FC3 侧的 #2 / #10 / #14
+cert-manager 侧的 #6 / #7 / #11 也已核实（同一依据；这三项实测于 2026-09-05，cert-manager v1.20.3，SelfSigned Issuer），
+#8 **部分核实**（实测到的只有「当前账号空 `Keyword` 列举返回 0 张」这个计数；列举语义是据 SDK 枚举推导、非实测，配额上限也未测）；余下 FC3 侧的 #2 / #10 / #14
 （以及 #1 / #5 的 FC3 那一半）**仍未核实**，原因逐条写在 §12.3 对应行——**不要把它们当成已核实**。
 两处例外要单独说明：#1 / #5 的 FC3 一半在 §12.3 只写了「FC3 侧未测」没写原因，原因是
 **未设置 `FC3_TEST_DOMAIN`**（`RESULTS.md` #1 的 FC3 行；本项要真的改写一个 FC3 自定义域名的
@@ -827,12 +828,12 @@ type FC3Client interface {
 | 3 | ~~CAS `ClientToken` 语义（同 token 重复上传返回同 certId？报错？有效期？）~~ **已核实**：`ClientToken` **不做上传幂等**——同 token、同 Name 重传直接报 `NameRepeat`（Permanent），而不是回放首次的 certId | write-ahead 幂等能否落地；结论见 `test/integration/RESULTS.md`。既然不幂等，write-ahead 的崩溃恢复 100% 依赖 `isDuplicateName` → `findByName` 认领既有 certId 这条路径 |
 | 4 | ~~CAS `Name` 是否接受 `-` / `.`~~ **已核实**：两者都**接受**，且**原样保存、不做归一化**（回查云上存的名字与提交值逐字相同） | 命名 sanitize 规则；`findByName` 可以按提交的名字精确比对，无需考虑云侧改名 |
 | 5 | LE 链（leaf + intermediate，无 root）FC3 与 CAS 是否都接受、是否要求带根证书、顺序是否敏感（**未画删除线：只关闭了 CAS 一半**）。**CAS 侧已核实**：leaf + 其签发 CA（两块）**接受**，**仅 leaf 也接受**（故不要求带根）；把 CA 放在 leaf 前面**被拒**（`NotMatch.CertificateAndPrivateKey`，Permanent）——**顺序敏感，leaf 必须在首位**。这两条合起来说明 LE 的「leaf + intermediate、无 root」形状在 CAS 可用。**FC3 侧未测**（由 FC3 探针补测，仍记在本行下） | §5.4 第 7 条 PEM 规范化的输出形状：只需保证 leaf 在首位，不需要补根 |
-| 6 | 给 TLS Secret 追加指向 AliyunCertificate 的 ownerRef，cert-manager 的 SSA 是否保留 | 若保留，可消掉 `secrets: delete` 和 finalizer 顺序难题。**仍未核实**：探针已写好，但集成环境的集群上 cert-manager 已不存在，本轮跳过 |
-| 7 | Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision` | 不缓存 Secret 决定的盲区大小。**仍未核实**：同 #6，集群上无 cert-manager |
+| 6 | ~~给 TLS Secret 追加指向 AliyunCertificate 的 ownerRef，cert-manager 的 SSA 是否保留~~ **已核实**：**保留——重签后 ownerRef 仍在**（实测于 2026-09-05，cert-manager v1.20.3，SelfSigned Issuer，改 `dnsNames` 触发重签并已观测到新 SAN 生效，见 `RESULTS.md` #6） | 若保留，可消掉 `secrets: delete` 和 finalizer 顺序难题。已核实保留；据此简化 RBAC/finalizer 属于后续设计变更，本轮未做 |
+| 7 | ~~Secret 被替换为「符合 spec 的不同合法证书」时 cert-manager 是否重签 / bump `revision`~~ **已核实**：**会重签并 bump `revision`，watch Certificate 即可发现**（实测于 2026-09-05，cert-manager v1.20.3，SelfSigned Issuer，替换前 `revision=1`、基线在 `status.revision` 就绪后才取，见 `RESULTS.md` #7） | 不缓存 Secret 决定的盲区大小。盲区因此收窄为「替换后 cert-manager 不 bump `revision`」这一情形——本轮未观测到它发生 |
 | 8 | CAS 单账号上传证书数量配额（**未画删除线：配额上限这一半没关**）。**部分核实**：空 `Keyword` 列举当前返回 **0 张**已上传证书（附带的两条限定——`Status` 留空的列举不含已过期证书、配了 `ALIYUN_RESOURCE_GROUP_ID` 时仅限该资源组——是**据 SDK 枚举语义推导的，未经实测**：0 张证书的账号里这个排除在构造上就不可观测，见 §2.2）。**配额上限本身未实测**——撞上限会污染账号，需在控制台「数字证书管理服务 → 证书管理 → 上传证书」页核对账号总量与上限 | `cleanup_abandoned_total` 是否必须配告警。列举语义**据 SDK 枚举推导、未经实测**：若推导成立，存在性探测按 Name 客户端过滤时要意识到过期证书不在默认结果里 |
 | 9 | ~~CAS endpoint 是否 region 化~~ **已核实**（Go SDK v4 内置 `EndpointMap`）：全部中国区域及 `eu-west-1` / `us-east-1` / `us-west-1` 映射到同一个 `cas.aliyuncs.com`；`ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `me-central-1` / `ap-south-1` / `me-east-1` 各有独立 endpoint（`cas.<region>.aliyuncs.com`）。结论：CAS **部分 region 化**，`casRegion` 字段保留；实现上把 `casRegion` 作为 SDK `RegionId` 传入，由 SDK 的 `EndpointRule=regional` 自动选 endpoint，`endpointOverride` 非空时直接覆盖。**跨 endpoint 可见性也已核实**：两个 endpoint 的证书集合**互相隔离（双向验证）**——同一份 PEM 在 `cn-hangzhou` 与 `ap-southeast-1` 分别上传得到两个不在同一量级的 certId，各自在对方的列举里都看不见，是**两套独立的 ID 空间**而非复制延迟 | `casRegion` 语义已定。隔离意味着 `casRegion` 一旦改变，`status.current.certId` 在新 endpoint 上必然查不到，存在性探测会重新上传一次——这是预期行为，不是 bug |
 | 10 | FC3 API 账号级频控阈值与 Throttling 错误码，**特别是错误码是否以 `Throttling` 开头**。**仍未核实**：阈值**刻意不测**——触发账号级频控只能对真实云连续打满请求，会波及同账号的其它调用，违反探针「不污染账号」的纪律；且 `pkg/aliyun` 的 `LimitFC3` 是 5 QPS / burst 1 的客户端限流，探针先被自己限住，摸不到云侧阈值。错误码这一半留给只读探针偶遇限流时顺带记录，实测那一轮未偶遇（`RESULTS.md` #10） | drift 1h 在数百 Binding 下是否安全；错误分类表。不以 `Throttling` 开头则 `aliyun.Classify` 会把限流判成不可重试，退避逻辑失效 |
-| 11 | cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在 | `SecretNameConflict` 判定依据。**仍未核实**：同 #6，集群上无 cert-manager |
+| 11 | ~~cert-manager 在 Secret 上打的 `cert-manager.io/certificate-name` 等注解是否稳定存在~~ **已核实**：`certificate-name` / `issuer-name` / `issuer-kind` / `issuer-group` **四个注解全部存在**（实测于 2026-09-05，cert-manager v1.20.3，SelfSigned Issuer，见 `RESULTS.md` #11） | `SecretNameConflict` 判定依据。四个注解齐全，可作为判定依据 |
 | 12 | ~~CAS `Keyword` 对通配符域名（`*.example.com`）的匹配行为~~ **已核实**：`Keyword` 对证书域名字符串做**任意子串匹配**，且**不做 DNS 通配符展开**。SAN 为 `*.it.integration.invalid` 的证书，用 `*.it.integration.invalid`、`it.integration.invalid`、`integration`、甚至非标签边界的 `ntegratio` 都能查到，而通配符本应覆盖的 `probe.it.integration.invalid` **查不到**。这同时排除了 DNS 通配符语义、后缀匹配、前缀匹配、按标签对齐的包含四种候选规则 | 通配符证书的首个 SAN 会被原样当 Keyword 传给 `ListUserCertificateOrder`；匹配不到就会让存在性探测持续误判「证书丢了」并反复重传。结论是安全的：原样传 SAN 一定能命中自己 |
 | 13 | ~~CAS 同名不同 `ClientToken` 上传返回的真实错误码~~ **已核实**：`NameRepeat`（Permanent）。**不在**生产代码原先猜的三个候选码里，已追加进 `internal/controller/upload.go` 的 `isDuplicateName` | 认错则 `DuplicateName → findByName` 的认领路径失效，write-ahead 崩溃恢复会退化成反复失败的上传 |
 | 14 | FC3 `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态。**仍未核实**：探针已写好并带四重守卫；实测那一轮凭证子账号只有 CAS 权限，`GetCustomDomain` 返回 `AccessDenied`（`class=Auth`，HTTP 403；`RESULTS.md` #14），守卫二据此判为「鉴权失败而非域名不存在」并记成未实测，因此 `pkg/aliyun/errors.go` 的 `classifyCode` **未做任何条件性修改**。给子账号授予 `fc:GetCustomDomain`（资源可用 `custom-domains/*`）后重跑本用例即可落结论 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。认不出时需补 `pkg/aliyun/errors.go` 的 `classifyCode` |
@@ -856,7 +857,7 @@ type FC3Client interface {
 
 1. FC3 Get/Update 之间无已确认的乐观锁，last-write-wins（§6.3）。
 2. `yundun-cert:*` 无法资源级收窄（§8.3）。
-3. 不缓存 Secret 的盲区：Secret 被替换为合法但不同的证书且 cert-manager 不 bump revision 时，最多延迟一个 resync 周期（1h）才被发现（§12.3 #7）。
+3. 不缓存 Secret 的盲区：Secret 被替换为合法但不同的证书且 cert-manager 不 bump revision 时，最多延迟一个 resync 周期（1h）才被发现（§12.3 #7）。**已实测收窄**：Secret 被替换为另一张合法证书时 cert-manager **会重签并 bump revision**，watch Certificate 即可发现，所以盲区只剩「替换后不 bump revision」这个理论情形——本轮未观测到它发生，也没有证据排除它。
 4. ~~CAS 命名字符集、ClientToken 语义、region 化均待实测~~ 三项均已实测（§12.3 #3 / #4 / #9）：`ClientToken` **不提供上传幂等**，write-ahead 的崩溃恢复已按预案退化为 `DuplicateName → findByName` 的认领路径（`ListUserCertificateOrder`，QPS 10）。
 5. `Abandon` 清理策略可能在 CAS 留下孤儿证书（有计数器和 event，需人工清理）。
 6. cert-manager 依赖是编译期的：pin module 版本，README 写明最低支持的 cert-manager 版本。
