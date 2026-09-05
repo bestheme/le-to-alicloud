@@ -1,0 +1,42 @@
+# operator 本体：RBAC、ServiceAccount、Service、Deployment，以及 OpenShift overlay
+# 追加的 ServiceMonitor 与 PrometheusRule（Ruling P3-R12：监控资源留在 overlay 内，
+# 不为它们单开 Application）。CRD 由 application-crds.yaml 负责，两边资源集合不相交。
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: le-to-alicloud-operator
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://git.dev.bestheme.ac.cn/infra/le-to-alicloud.git
+    targetRevision: main
+    path: config/overlays/openshift
+    kustomize:
+      images:
+        # 部署前替换成真实镜像；tag 请用不可变 tag 或 digest。
+        - controller=registry.dev.bestheme.ac.cn/infra/le-to-alicloud:v0.1.0
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: le-to-alicloud-system
+  syncPolicy:
+    automated:
+      # 这里可以开 prune：本 Application 只管 operator 自己的部署件，
+      # 删掉它们不会波及 CR，也不会触发任何 finalizer 去动云上的资源。
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - CreateNamespace=true
+  ignoreDifferences:
+    # 两个 CR 的 status 由 operator 写，Argo 不该把它当 drift。
+    - group: certs.bestheme.ac.cn
+      kind: AliyunCertificate
+      jsonPointers:
+        - /status
+    - group: certs.bestheme.ac.cn
+      kind: AliyunCertificateBinding
+      jsonPointers:
+        - /status

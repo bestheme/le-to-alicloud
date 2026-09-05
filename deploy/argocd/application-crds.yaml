@@ -1,0 +1,43 @@
+# CRD 单独一个 Application。理由有三：
+#   1. CRD 与 CR 的生命周期不同——prune 掉 CRD 会连带删掉所有 CR 与云上的证书；
+#   2. wave -2 让它整体先于 operator 落地，operator 起来时 CRD 一定已存在；
+#   3. 与 operator Application 的资源集合不相交，Argo 不会报 shared resource。
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: le-to-alicloud-crds
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  finalizers:
+    # 刻意不加 resources-finalizer：删掉这个 Application 不应该连锁删除 CRD。
+    []
+spec:
+  project: default
+  source:
+    repoURL: https://git.dev.bestheme.ac.cn/infra/le-to-alicloud.git
+    targetRevision: main
+    path: config/crd
+  destination:
+    server: https://kubernetes.default.svc
+    # CRD 是集群级资源，这里的 namespace 只是命名空间级资源的默认落点；
+    # config/crd 里没有命名空间级资源，所以它实际只被 CreateNamespace 用到。
+    namespace: le-to-alicloud-system
+  syncPolicy:
+    automated:
+      selfHeal: true
+      # 刻意不开 prune：CRD 被 prune 会级联删除所有 AliyunCertificate，
+      # finalizer 随即去删云上的证书。要删 CRD 请人工执行。
+      prune: false
+    syncOptions:
+      # SSA 让 Argo 与 apiserver 共享字段所有权，避免 last-applied-configuration 与
+      # CRD 默认值互相打架；CRD 将来增长也不会撞上 262144 字节的注解上限。
+      - ServerSideApply=true
+      - CreateNamespace=true
+  ignoreDifferences:
+    # CRD 的 status 由 apiserver 维护（acceptedNames / conditions / storedVersions），
+    # 不忽略的话 Argo 会永远看到 drift 并无限 sync。
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      jsonPointers:
+        - /status
