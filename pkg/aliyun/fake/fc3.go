@@ -152,7 +152,7 @@ func (f *FC3) UpdateCustomDomain(_ context.Context, domain string, in *aliyun.Up
 		// 何况 operator 的真实路径都不落进这一支：Apply 必定带 CertConfig，Unbind 策略下的
 		// Cleanup 必定带 ClearCert，Orphan 策略下的 Cleanup 压根不调 Update。
 		//
-		// spec §12.3：未实测（FC3 UpdateCustomDomain 是全量替换还是按字段合并语义未核实；
+		// spec §12.3 #2：未实测（FC3 UpdateCustomDomain 是全量替换还是按字段合并语义未核实；
 		// 若为全量替换，省略 certConfig 会清掉云上证书），实测结论见 test/integration/RESULTS.md
 	}
 	// 回填体照单全收：调用方漏带就等于把它清成 nil，测试因此能抓到 read-modify-write
@@ -172,7 +172,7 @@ func (f *FC3) UpdateCustomDomain(_ context.Context, domain string, in *aliyun.Up
 //
 // 空 Protocol 被拒绝，而不是「保持原样」。理由：updateInputToSDK 在 in.Protocol == ""
 // 时压根不往请求体里写 protocol（SDK 结构体的 tag 带 omitempty），而 FC3 的
-// UpdateCustomDomain 是全量替换还是部分合并没有实测（spec §12.3）——合并语义下字段缺席
+// UpdateCustomDomain 是全量替换还是部分合并没有实测（spec §12.3 #2）——合并语义下字段缺席
 // 等于「保持原样」，全量替换语义下等于「把 protocol 清空」。fake 无权在这里替云做决定：
 // 猜「保持原样」会让下游写出只在合并语义下正确的 provider，而这个 bug 直到打到真云上
 // 才会暴露；猜「清空」又是在断言一个同样没实测的语义。于是选第三条：拒绝，把契约钉成

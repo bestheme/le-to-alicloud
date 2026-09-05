@@ -3,11 +3,22 @@ package fake_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
 )
+
+// describe 打印 Domain 的脱敏摘要。
+//
+// fake.Domain 持有 KeyPEM——这是它扮演云所必需的，但「零凭证泄漏」的约束点名包括测试输出，
+// 豁免的是持有私钥的结构体本身，不是把它 %+v 出来。断言失败时想知道的也只是
+// 「证书在不在、有多长」，字节内容从来不是诊断信息。
+func describe(d fake.Domain) string {
+	return fmt.Sprintf("Domain{name=%s, protocol=%s, certName=%s, certBytes=%d, keyBytes=%d, echo=%v}",
+		d.DomainName, d.Protocol, d.CertName, len(d.CertPEM), len(d.KeyPEM), d.Echo)
+}
 
 func newFC3WithDomain() *fake.FC3 {
 	f := fake.NewFC3()
@@ -68,7 +79,7 @@ func TestFakeFC3_UpdateAppliesCertAndKeepsEcho(t *testing.T) {
 		t.Fatal("域名不见了")
 	}
 	if d.Protocol != "HTTP,HTTPS" || d.CertName != "n1" || string(d.KeyPEM) != "SECRET" {
-		t.Fatalf("写入未生效: %+v", d)
+		t.Fatalf("写入未生效: %s", describe(d))
 	}
 	// read-modify-write 的核心断言：调用方必须把回填体原样带回来，否则路由表就没了。
 	if d.Echo != "route-table-marker" {
@@ -92,10 +103,36 @@ func TestFakeFC3_UpdateClearCert(t *testing.T) {
 	}
 	d, _ := f.Domain("tls.example.com")
 	if d.CertName != "" || len(d.CertPEM) != 0 || len(d.KeyPEM) != 0 {
-		t.Fatalf("证书应被清空: %+v", d)
+		t.Fatalf("证书应被清空: %s", describe(d))
 	}
 	if d.Protocol != "HTTP" {
 		t.Errorf("纯 HTTPS 域名解绑后应降为 HTTP: %s", d.Protocol)
+	}
+}
+
+// TestFakeFC3_UpdateWithoutCertLeavesCertAlone 钉住 default 分支的语义：
+// ClearCert 与 CertConfig 都没给时，云侧证书保持原样。
+//
+// 这一半与「Protocol 必须显式」是刻意的不对称：读取路径丢弃私钥，调用方拿不到刚观察到的
+// 证书、无法原样回传，所以在这里要求显式是个不可实现的契约。语义既然是刻意选定的，就得有
+// 断言看着——否则把 default 改成「清空证书」也能全绿。
+func TestFakeFC3_UpdateWithoutCertLeavesCertAlone(t *testing.T) {
+	f := newFC3WithDomain()
+	f.AddDomain(fake.Domain{
+		DomainName: "tls.example.com", Protocol: "HTTPS",
+		CertName: "c1", CertPEM: []byte("PUB"), KeyPEM: []byte("SECRET"),
+	})
+	err := f.UpdateCustomDomain(context.Background(), "tls.example.com",
+		&aliyun.UpdateCustomDomainInput{Protocol: "HTTP,HTTPS"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := f.Domain("tls.example.com")
+	if d.CertName != "c1" || string(d.CertPEM) != "PUB" || string(d.KeyPEM) != "SECRET" {
+		t.Fatalf("证书不应被动过: %s", describe(d))
+	}
+	if d.Protocol != "HTTP,HTTPS" {
+		t.Errorf("Protocol 仍应被写入: %s", d.Protocol)
 	}
 }
 
@@ -139,7 +176,7 @@ func TestFakeFC3_FailNextUpdateAfterCommit(t *testing.T) {
 
 // TestFakeFC3_UpdateRequiresProtocol 锁定「写入体必须显式带 Protocol」这条契约。
 //
-// 真实 FC3 的 UpdateCustomDomain 是全量替换还是部分合并没有实测（spec §12.3），而
+// 真实 FC3 的 UpdateCustomDomain 是全量替换还是部分合并没有实测（spec §12.3 #2），而
 // updateInputToSDK 在 in.Protocol == "" 时根本不往请求体里写 protocol（字段带
 // omitempty）。合并语义下这等于「保持原样」，全量替换语义下这等于「把 protocol 清空」——
 // 两种结果南辕北辙。fake 因此拒绝这种写入体，逼调用方永远显式给出 Protocol：
@@ -154,7 +191,7 @@ func TestFakeFC3_UpdateRequiresProtocol(t *testing.T) {
 	// 拒绝必须发生在写入之前：服务端状态不能被半成品写入体动过。
 	d, _ := f.Domain("api.example.com")
 	if d.Protocol != "HTTP" || d.Echo != "route-table-marker" {
-		t.Fatalf("被拒绝的写入不应改动服务端状态: %+v", d)
+		t.Fatalf("被拒绝的写入不应改动服务端状态: %s", describe(d))
 	}
 }
 
@@ -188,7 +225,7 @@ func TestFakeFC3_UpdateCopiesCertBytes(t *testing.T) {
 	cert[0], key[0] = 'X', 'X'
 	d, _ := f.Domain("api.example.com")
 	if string(d.CertPEM) != "PUB" || string(d.KeyPEM) != "SECRET" {
-		t.Fatalf("fake 与调用方共享了底层数组: %+v", d)
+		t.Fatalf("fake 与调用方共享了底层数组: %s", describe(d))
 	}
 }
 
