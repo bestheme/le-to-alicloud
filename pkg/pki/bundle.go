@@ -228,3 +228,17 @@ func (b *Bundle) KeyPEM() ([]byte, error) {
 		return nil, ErrUnsupportedKey
 	}
 }
+
+// LeafFingerprint 从 PEM 中解析出第一张证书并返回 hex(sha256(DER))。
+//
+// 与 Bundle.Fingerprint 同源：云侧只能拿到公开证书（FC3 的 certConfig.certificate），
+// 而证书侧是从 Secret 连私钥一起解析出来的。两条路径必须给出同一个值，否则「云上这张
+// 是不是我写的」这个判断永远为假，operator 会每小时重写一次同样的内容。
+func LeafFingerprint(certPEM []byte) (string, error) {
+	certs, err := parseCertificates(certPEM)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(certs[0].Raw)
+	return hex.EncodeToString(sum[:]), nil
+}

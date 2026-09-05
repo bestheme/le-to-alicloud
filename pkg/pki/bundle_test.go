@@ -259,3 +259,27 @@ func prefix(s string, n int) string {
 	}
 	return s[:n]
 }
+
+func TestLeafFingerprint_MatchesBundle(t *testing.T) {
+	ca := testutil.NewCA(t)
+	certPEM, keyPEM := testutil.IssueLeaf(t, ca, "api.example.com")
+	b, err := pki.ParseBundle(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pki.LeafFingerprint(certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 两条路径必须给出同一个指纹：一条有私钥（证书侧），一条没有（云侧只能看到公开证书）。
+	// 不相等就意味着 Binding 永远认为云上那张不是自己写的，于是每一轮都重写一次。
+	if got != b.Fingerprint {
+		t.Errorf("指纹不一致: %s != %s", got, b.Fingerprint)
+	}
+}
+
+func TestLeafFingerprint_Garbage(t *testing.T) {
+	if _, err := pki.LeafFingerprint([]byte("not a pem")); err == nil {
+		t.Error("非 PEM 应报错")
+	}
+}

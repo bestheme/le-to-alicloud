@@ -1,0 +1,12 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["fc:GetCustomDomain", "fc:UpdateCustomDomain"],
+      "Resource": [
+        "acs:fc:cn-hangzhou:<accountId>:custom-domains/api.timehorse.bestheme.ac.cn"
+      ]
+    }
+  ]
+}
