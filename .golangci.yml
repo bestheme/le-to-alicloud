@@ -17,6 +17,7 @@ linters:
     - lll
     - misspell
     - nakedret
+    - nolintlint
     - prealloc
     - revive
     - staticcheck
@@ -24,6 +25,9 @@ linters:
     - unparam
     - unused
   settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
     revive:
       rules:
         - name: comment-spacings
@@ -35,7 +39,6 @@ linters:
           - lll
         path: api/*
       - linters:
-          - dupl
           - lll
         path: internal/*
       # 测试与测试辅助包里的重复字面量是被测数据，不是待抽取的常量
@@ -47,8 +50,8 @@ linters:
           - staticcheck
         path: api/v1alpha1/groupversion_info.go
         text: "SA1019"
-      # 迁移到 events.EventRecorder 会改动全部 12 个事件调用点并要求补 action 参数，
-      # 属于行为变更，不在 lint 清理的范围内；见 README「已知限制」
+      # 迁移到 events.EventRecorder 会改动全部 16 个事件调用点（证书侧 12 处 + 绑定侧 4 处）
+      # 并要求为每条补一个 action 参数，属于行为变更，不在 lint 清理的范围内；见 README「已知限制」
       - linters:
           - staticcheck
         text: "SA1019.*GetEventRecorderFor"
@@ -61,13 +64,6 @@ linters:
       # 而合并成表驱动反而让「哪一项失败了」在输出里看不清
       - linters:
           - dupl
-        path: test/integration/
-      # 脚手架期的临时豁免：test/integration/ 的探针 helper（requireCAS / newCAS /
-      # uploadForTest / outcome 等）调用方要到 Task 4–8 才出现，而 unused 做的是从
-      # 测试函数与导出标识符出发的可达性分析，整条链会一起被判死。
-      # Task 14 负责删除这条排除，并验证 `make lint` 仍为 0 issues。
-      - linters:
-          - unused
         path: test/integration/
     paths:
       - third_party$

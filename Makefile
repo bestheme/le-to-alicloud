@@ -117,8 +117,12 @@ test-race: manifests generate fmt vet setup-envtest ## Run tests with the race d
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -race $$(go list ./... | grep -v /e2e)
 
 .PHONY: test-integration
+# -timeout is a ceiling, not a wait: the cluster probes alone can take ~18 minutes of
+# wall clock, and go test kills the process on timeout WITHOUT running t.Cleanup, which
+# would leak the probe namespace and the certificates uploaded to CAS. 45m leaves head
+# room over the observed worst case so a slow run finishes and cleans up after itself.
 test-integration: ## Run the real-cloud integration probes (spec §12.3). Skips without credentials.
-	go test -tags=integration ./test/integration/... -v -count=1 -timeout 30m
+	go test -tags=integration ./test/integration/... -v -count=1 -timeout 45m
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.

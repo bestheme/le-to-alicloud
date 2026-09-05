@@ -24,7 +24,8 @@ import (
 	"os/exec"
 	"strings"
 
-	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
+	//nolint:staticcheck // ginkgo 的 DSL 设计成 dot import，e2e 套件按上游约定照用（ST1001）
+	. "github.com/onsi/ginkgo/v2"
 )
 
 const (
@@ -204,8 +205,7 @@ func GetProjectDir() (string, error) {
 // UncommentCode searches for target in the file and remove the comment prefix
 // of the target content. The target content may span multiple lines.
 func UncommentCode(filename, target, prefix string) error {
-	// false positive
-	// nolint:gosec
+	//nolint:gosec // filename 由 e2e 测试自己拼出，不来自外部输入
 	content, err := os.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("failed to read file %q: %w", filename, err)
@@ -244,8 +244,7 @@ func UncommentCode(filename, target, prefix string) error {
 		return fmt.Errorf("failed to write to output: %w", err)
 	}
 
-	// false positive
-	// nolint:gosec
+	//nolint:gosec // 同上：filename 由测试自己拼出；0644 是脚手架文件的预期权限
 	if err = os.WriteFile(filename, out.Bytes(), 0644); err != nil {
 		return fmt.Errorf("failed to write file %q: %w", filename, err)
 	}
