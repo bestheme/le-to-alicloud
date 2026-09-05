@@ -34,10 +34,11 @@
 | `.github/workflows/test.yml` | `go mod tidy -diff`；新增 `-race` job |
 | `.github/workflows/test-e2e.yml` | `go mod tidy -diff` |
 | `.github/workflows/lint.yml` | golangci-lint 版本与 Makefile 对齐 |
-| `.gitignore` | 追加 `*.env` |
+| `.gitignore` | 追加 `*.env` 与 `/bin` |
 | `test/utils/utils.go` | e2e 的 cert-manager 版本对齐到 v1.21.1 |
 | `test/integration/env.go` | 环境变量契约、skip 逻辑、CAS client 构造、上传与清理辅助 |
-| `test/integration/report.go` | `Record` / `RecordSkip` / `scrub` / `TestMain` → `RESULTS.md` |
+| `test/integration/report.go` | `finding` / `Record` / `RecordSkip` / `scrub` / `writeResults` / `mdCell` |
+| `test/integration/main_test.go` | `TestMain`：跑完全部用例后写 `RESULTS.md`（Go 只在 `_test.go` 里识别 `TestMain`） |
 | `test/integration/certs.go` | 证书链拼装辅助（拆分 / 重排 PEM 块） |
 | `test/integration/cas_pem_test.go` | §12.3 #1、#5（CAS 侧）：私钥编码与证书链形状 |
 | `test/integration/cas_token_test.go` | §12.3 #3、#4：ClientToken 语义、`Name` 字符集、重名错误码 |
@@ -57,6 +58,7 @@
 | `deploy/argocd/application-crds.yaml` | Application：CRD，wave `-2` |
 | `deploy/argocd/application-operator.yaml` | Application：operator，wave `0` |
 | `deploy/argocd/application-credentials.yaml.example` | Application 模板：凭证 Secret 独立所有权 |
+| `docs/ram/certificate-cas-policy.json` | 证书 controller 的 RAM 策略（抄 spec §8.3）；README 只引用不再抄 JSON |
 | `README.md` | 中文全量文档（Task 12 前半 + Task 13 后半） |
 | `docs/superpowers/specs/2026-09-04-le-to-alicloud-operator-design.md` | §5.2、§9、§10.2、§12.3、§14 更新（Task 9）；§2.5 / §12.3 结论回填（Task 14） |
 
@@ -138,7 +140,15 @@ Expected: 失败，末尾是
       - linters:
           - staticcheck
         text: "SA1019.*GetEventRecorderFor"
+      # 集成探针的 Record(t, id, question, result, detail) 天然是长参数列表，
+      # 折行只会让「哪一项在记什么」更难读；Task 3 建的 test/integration/ 整目录豁免 lll
+      - linters:
+          - lll
+        path: test/integration/
 ```
+
+第四条现在指向一个还不存在的目录（`test/integration/` 由 Task 3 创建）。golangci-lint 对
+匹配不到任何文件的 path 规则不报错，先落地是为了让 Task 3 不必回头再改这一段。
 
 验证配置合法并复跑：
 
@@ -227,6 +237,10 @@ const pemTypeCertificate = "CERTIFICATE"
 // 指标的 label 顺序永远一致，recordCertMetrics 里 WithLabelValues(ns, n) 才是对的。
 var crLabels = []string{"namespace", "name"}
 ```
+
+**只替换现有的这 5 处**。Plan 2 的 Task 7 会往同一个 `var (` 块里加两个 binding gauge
+（`aliyuncert_binding_ready` / `aliyuncert_binding_conflict`），它们由 Plan 2 自己用
+`crLabels` 写（Plan 2 ledger P2-R13），Plan 3 不管，也不要在合并后回头去改它们。
 
 - [ ] **Step 9: 修 7 处 `lll`（超过 120 字符）**
 
@@ -385,7 +399,12 @@ Expected: 两处都是 `v1.21.1`。
 ```gitignore
 # 本地凭证（集成测试用），绝不提交
 *.env
+# 并行 worktree 里 bin 是指向主仓库 bin 的软链，不能提交
+/bin
 ```
+
+现有的 `bin/*` 规则只挡目录里的内容，挡不住名为 `bin` 的软链本身（`git status` 会把它
+当成一个未跟踪的普通文件），`/bin` 这一行才是真正生效的那条。
 
 - [ ] **Step 8: 确认门禁全绿并提交**
 
@@ -403,7 +422,8 @@ git commit -m "chore(ci): verify go.mod with tidy -diff, add race job, align cer
 
 **Files:**
 - Create: `test/integration/env.go`
-- Create: `test/integration/report.go`
+- Create: `test/integration/report.go`（`finding` / `Record` / `RecordSkip` / `scrub` / `writeResults` / `mdCell`）
+- Create: `test/integration/main_test.go`（只放 `TestMain`；Go 只在 `_test.go` 里识别 `TestMain`）
 - Create: `test/integration/certs.go`
 - Create: `test/integration/env.example.sh`
 - Create: `test/integration/smoke_test.go`
@@ -424,7 +444,8 @@ git commit -m "chore(ci): verify go.mod with tidy -diff, add race job, align cer
   - `outcome(certID int64, err error) (result, detail string)`
   - `Record(t *testing.T, id, question, result, detail string)`
   - `RecordSkip(t *testing.T, id, question, why string)`
-  - `splitPEM(b []byte) [][]byte`、`joinPEM(blocks ...[]byte) []byte`
+  - `TestMain(m *testing.M)`（在 `main_test.go` 里，不在 `report.go`：Go 只从 `_test.go` 中识别 `TestMain`，写在普通文件里它永远不会被执行、`RESULTS.md` 也就永远不会生成）
+  - `splitPEM(t *testing.T, b []byte) [][]byte`、`joinPEM(blocks ...[]byte) []byte`
   - 环境变量常量 `EnvAccessKeyID` / `EnvAccessKeySecret` / `EnvSecurityToken` / `EnvRegion` / `EnvCASRegionAlt` / `EnvResourceGroupID` / `EnvFC3TestDomain` / `EnvKubeconfig` / `EnvKeepUploaded`
 
 - [ ] **Step 1: 写环境契约 `test/integration/env.go`**
@@ -521,8 +542,9 @@ func newCAS(t *testing.T, cred *aliyun.Credentials, region string) aliyun.CASCli
 	return c
 }
 
-// uploadForTest 上传并登记清理。刻意返回原始 error 而不 Fatal：多数用例要断言的
-// 恰恰是错误的形状（错误码、是否可重试），不是「成功」。
+// uploadForTest 上传并登记清理：成功上传的每一张证书都会经 registerCleanup 注册一个
+// t.Cleanup(func(){ deleteForTest(...) })，用例结束时从真实账号里删掉。刻意返回原始
+// error 而不 Fatal：多数用例要断言的恰恰是错误的形状（错误码、是否可重试），不是「成功」。
 func uploadForTest(
 	t *testing.T, c aliyun.CASClient, name string, certPEM, keyPEM []byte, token string,
 ) (int64, error) {
@@ -536,7 +558,9 @@ func uploadForTest(
 	return certID, err
 }
 
-// deleteForTest 立刻删除一张证书（用于「先删再验证」的用例）。
+// deleteForTest 立刻删除一张证书。它是删除的唯一入口：registerCleanup 的 t.Cleanup
+// 调它，用例也可以显式调它（「先删首张再验证同名可复用」这类路径）。统一走这一个
+// 函数还顺带消掉了 unused——它不会再是一个定义了没人调的死函数。
 func deleteForTest(t *testing.T, c aliyun.CASClient, certID int64) error {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
@@ -544,8 +568,9 @@ func deleteForTest(t *testing.T, c aliyun.CASClient, certID int64) error {
 	return c.Delete(ctx, certID, randToken(t))
 }
 
-// registerCleanup 保证测试结束后云上不留垃圾。删不掉时只记日志不 Fail——测试的
-// 结论已经拿到了，清理失败该由人接手，不该把结论一起抹掉。
+// registerCleanup 保证测试结束后云上不留垃圾：每张探针上传的证书都在用例结束时从
+// 真实账号删除。删不掉时只记日志不 Fail——测试的结论已经拿到了，清理失败该由人接手，
+// 不该把结论一起抹掉。
 func registerCleanup(t *testing.T, c aliyun.CASClient, certID int64) {
 	t.Helper()
 	if env(EnvKeepUploaded) == "1" {
@@ -553,9 +578,7 @@ func registerCleanup(t *testing.T, c aliyun.CASClient, certID int64) {
 		return
 	}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-		defer cancel()
-		if err := c.Delete(ctx, certID, randToken(t)); err != nil {
+		if err := deleteForTest(t, c, certID); err != nil {
 			t.Logf("清理 certId=%d 失败，需人工删除: %v", certID, err)
 		}
 	})
@@ -606,7 +629,14 @@ func outcome(certID int64, err error) (result, detail string) {
 }
 ```
 
-- [ ] **Step 2: 写报告器 `test/integration/report.go`**
+- [ ] **Step 2: 写报告器 `test/integration/report.go` 与入口 `test/integration/main_test.go`**
+
+报告器拆成两个文件：`report.go` 放 `finding` / `Record` / `RecordSkip` / `scrub` /
+`writeResults` / `mdCell`，`TestMain` 单独放 `main_test.go`。**这不是风格问题**：Go 只在
+`_test.go` 文件里识别 `TestMain`，写在普通文件里它不会被 `go test` 调用，`RESULTS.md`
+于是永远不会生成，Task 4–8 的每一条 `Record` 与 Task 14 的整条回填链都会跟着落空。
+
+`test/integration/report.go`：
 
 ```go
 //go:build integration
@@ -671,14 +701,6 @@ func scrub(s string) string {
 	return s
 }
 
-func TestMain(m *testing.M) {
-	code := m.Run()
-	if err := writeResults(); err != nil {
-		fmt.Fprintf(os.Stderr, "写 RESULTS.md 失败: %v\n", err)
-	}
-	os.Exit(code)
-}
-
 // resultsFile 相对 cwd；go test 的 cwd 就是包目录。
 const resultsFile = "RESULTS.md"
 
@@ -721,6 +743,31 @@ func writeResults() error {
 func mdCell(s string) string {
 	s = strings.ReplaceAll(s, "|", `\|`)
 	return strings.ReplaceAll(s, "\n", "<br>")
+}
+```
+
+`test/integration/main_test.go`（**文件名必须以 `_test.go` 结尾**，否则 `TestMain` 不生效）：
+
+```go
+//go:build integration
+
+package integration
+
+import (
+	"fmt"
+	"os"
+	"testing"
+)
+
+// TestMain 是 RESULTS.md 的唯一写入点：跑完包内全部用例后把攒下的 findings 落盘。
+// 它必须待在 _test.go 里——Go 的测试主函数只从测试文件中识别，放进 report.go 之类的
+// 普通文件里既不会报错也不会被调用，报告会静默地永远不生成。
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if err := writeResults(); err != nil {
+		fmt.Fprintf(os.Stderr, "写 RESULTS.md 失败: %v\n", err)
+	}
+	os.Exit(code)
 }
 ```
 
@@ -868,9 +915,9 @@ test-integration: ## Run the real-cloud integration probes (spec §12.3). Skips 
 
 不加这一行，`test/integration/` 就永远不会被 lint 检查。
 
-同时在 `linters.exclusions.rules` 里，把 Task 1 加的那条 goconst 规则扩成两条——探针类
-用例天然长得几乎一样（换个私钥编码、换个链形状），`dupl` 会把它们全报出来，而把它们
-合并成表驱动反而会让「哪一项失败了」在输出里看不清：
+同时在 `linters.exclusions.rules` 里追加一条 dupl 规则——探针类用例天然长得几乎一样
+（换个私钥编码、换个链形状），`dupl` 会把它们全报出来，而把它们合并成表驱动反而会让
+「哪一项失败了」在输出里看不清：
 
 ```yaml
       - linters:
@@ -891,7 +938,7 @@ make lint
 Expected：
 - `lint-config` exit 0。
 - `go vet ./...` 与 `go build ./...` exit 0，输出里**没有** `test/integration`（tag 隔离生效）。
-- `make test-integration` 在无凭证时全部 `--- SKIP`，进程 exit 0，并生成 `test/integration/RESULTS.md`（内容是一片「未实测」，此时还没有已有报告可保护）。
+- `make test-integration` exit 0，两个 harness 用例的结果是：`TestHarnessSplitJoinRoundTrip` **PASS**（它不需要凭证），`TestHarnessScrubRemovesSecrets` **SKIP**（无凭证）。`RESULTS.md` **不生成**——此时整个包里还没有任何 `Record` / `RecordSkip` 调用，`writeResults` 在 `len(findings)==0` 处直接早退。第一份 `RESULTS.md` 由 Task 4 产生。
 - `make lint` exit 0，且它这次确实分析了 integration 包（临时把 `env.go` 里加一行 `var unusedProbe int` 再跑，应报 `unused`；确认后删掉）。
 
 - [ ] **Step 9: 确认 `make test` 未受影响并提交**
@@ -902,7 +949,8 @@ git add test/integration Makefile .golangci.yml
 git commit -m "test: add integration test harness behind the integration build tag"
 ```
 
-注意：这次提交**包含**首次生成的 `RESULTS.md`（全「未实测」），它是后续每次运行的基线。
+注意：这次提交里**没有** `RESULTS.md`——本任务只建骨架，还没有任何 `Record` 调用，
+报告器不会写文件。`RESULTS.md` 的首次生成与提交发生在 Task 4。
 
 ---
 
@@ -1065,6 +1113,10 @@ make test-integration 2>&1 | grep -c -- "--- SKIP"
 
 Expected: `go vet` exit 0；SKIP 计数 ≥ 7。
 
+**`test/integration/RESULTS.md` 在这一步首次生成**：本 Task 的用例是整个包里第一批调用
+`Record` / `RecordSkip` 的，`writeResults` 于是不再走 `len(findings)==0` 的早退分支。无凭证
+时它的内容是一片「未实测」，那也是有效的基线——它记录了清单上哪几项还欠着。
+
 - [ ] **Step 3: 有凭证时真跑一遍（可选，取决于执行环境）**
 
 ```bash
@@ -1084,6 +1136,8 @@ git add test/integration
 git commit -m "test(integration): probe CAS private key encodings and chain shapes"
 ```
 
+这次提交**包含首次生成的 `test/integration/RESULTS.md`**，它是后续每次运行的基线。
+
 ---
 
 ### Task 5: CAS 探针 B——ClientToken 语义、`Name` 字符集与重名错误码（§12.3 #3、#4）
@@ -1092,10 +1146,12 @@ git commit -m "test(integration): probe CAS private key encodings and chain shap
 
 **Files:**
 - Create: `test/integration/cas_token_test.go`
+- Modify（条件修改，仅当 Step 3 测出的重名错误码不在现有候选里）: `internal/controller/upload.go`（`isDuplicateName` 的候选码）
+- Modify（条件修改，同上）: `internal/controller/upload_test.go`（补一个断言该码的用例）
 
 **Interfaces:**
 - Consumes: Task 3 的全套辅助。
-- Produces: RESULTS.md 中 `#3`、`#4` 与 `#3-dup` 三组结论；Task 14 据此收窄 `isDuplicateName` 的候选码并回填 `pkg/naming/naming.go` 的 `sanitize` 注释。
+- Produces: RESULTS.md 中 `#3`、`#4` 与 `#13` 三组结论；Task 14 据此收窄 `isDuplicateName` 的候选码并回填 `pkg/naming/naming.go` 的 `sanitize` 注释。编号 `#13` 与 Task 9 Step 5 给 spec §12.3 新增的第 13 行一致——Task 14 是「按编号逐行回填」，两套编号会让回填无从下手。
 
 - [ ] **Step 1: 写用例文件**
 
@@ -1152,7 +1208,7 @@ func TestCASClientTokenSameContent(t *testing.T) {
 // TestCASDuplicateNameError：不同 token、同名字、同内容。这条路径决定
 // isDuplicateName 该认哪个错误码——认错了，重传就会一直失败而不是认领既有证书。
 func TestCASDuplicateNameError(t *testing.T) {
-	cred, region := requireCAS(t, "#3-dup", "CAS 同名不同 token 上传返回的错误码")
+	cred, region := requireCAS(t, "#13", "CAS 同名不同 token 上传返回的错误码")
 	c := newCAS(t, cred, region)
 	ca := testutil.NewCA(t)
 	certPEM, keyPEM := testutil.IssueLeafRSA(t, ca, testDomain())
@@ -1163,7 +1219,7 @@ func TestCASDuplicateNameError(t *testing.T) {
 	}
 	_, err := uploadForTest(t, c, name, certPEM, keyPEM, randToken(t))
 	if err == nil {
-		Record(t, "#3-dup", "CAS 同名不同 token 上传返回的错误码",
+		Record(t, "#13", "CAS 同名不同 token 上传返回的错误码",
 			"未报错：同名可以共存", "Name 唯一性约束不成立")
 		t.Error("CAS 允许了同名证书，spec §2.2 的「同账号内 Name 唯一」需要修正")
 		return
@@ -1178,7 +1234,7 @@ func TestCASDuplicateNameError(t *testing.T) {
 	if !known {
 		result += "（不在 isDuplicateName 的候选里，必须补进去）"
 	}
-	Record(t, "#3-dup", "CAS 同名不同 token 上传返回的错误码", result,
+	Record(t, "#13", "CAS 同名不同 token 上传返回的错误码", result,
 		"class="+aliyun.ClassOf(err).String())
 	if !known {
 		t.Errorf("upload.go 的 isDuplicateName 认不出 %q，DuplicateName→findByName 的认领路径会失效", code)
@@ -1226,10 +1282,14 @@ Expected: `go vet` exit 0；无凭证时新增的用例全部 SKIP。
 ```bash
 set -a && source local.env && set +a
 make test-integration 2>&1 | grep -A2 "TestCASDuplicateNameError"
-grep "^| #3" test/integration/RESULTS.md
+grep -E "^\| #(3|13) " test/integration/RESULTS.md
 ```
 
-Expected: `#3-dup` 那一行给出一个具体错误码。**如果它不在三个候选里，这个 Task 不算完成**——把真实码补进 `internal/controller/upload.go` 的 `isDuplicateName`，并在 `internal/controller/upload_test.go` 加一个断言该码的用例，再跑 `make test`。
+Expected: `#13` 那一行给出一个具体错误码。**如果它不在三个候选里，这个 Task 不算完成**——把真实码补进 `internal/controller/upload.go` 的 `isDuplicateName`，并在 `internal/controller/upload_test.go` 加一个断言该码的用例，再跑 `make test`。
+
+清理由 `uploadForTest` 的 `t.Cleanup` 统一负责（每张探针证书都会被 `deleteForTest` 删掉）。
+若想在本用例里额外验证「删掉首张之后同名可以复用」，就把首次上传的 certId 接住并显式调用
+`deleteForTest(t, c, first)` 再重传一次——`deleteForTest` 就是为这类路径留的显式入口。
 
 - [ ] **Step 4: 门禁与提交**
 
@@ -1408,7 +1468,7 @@ Expected: `go vet` exit 0；无凭证时 SKIP。
 
 ```bash
 set -a && source local.env && set +a
-make test-integration -- 2>&1 | tail -30
+make test-integration 2>&1 | tail -30
 grep "^| #12" test/integration/RESULTS.md
 ```
 
@@ -1788,6 +1848,13 @@ git commit -m "test(integration): probe cert-manager secret ownerRef, revision a
 
 **Files:**
 - Create: `test/integration/fc3_test.go`
+- Modify（条件修改，仅当 Step 2 测出 `GetCustomDomain` 对不存在域名的错误没被判成 `ClassNotFound`）: `pkg/aliyun/errors.go`（`classifyCode` 补该错误码）
+
+**本 Task 必须探测并 `Record` 的三条 FC3 未实测事实**（Task 9 Step 7 把它们补进 spec §12.3，本 Task 负责给出结论；表里已有等价行时复用其编号）：
+
+1. `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态。**若 `aliyun.ClassOf(err) != aliyun.ClassNotFound`，本 Task 当场修 `pkg/aliyun/errors.go` 的 `classifyCode` 把该码归到 NotFound**——绑定 controller 的 Observe 靠 NotFound 区分「目标不存在」与「调用失败」，分错会让它把一个不存在的域名当成可重试故障无限重试。
+2. FC3 的限流码**是否以 `Throttling` 开头**（`TestFC3ThrottlingThreshold` 覆盖）。
+3. FC3 `CertConfig` 对 **PKCS#1 / EC 私钥**与 **Let's Encrypt 链形状**（leaf+intermediate、仅 leaf）的接受情况（`TestFC3CertConfigEncodings` 覆盖）。
 
 **Interfaces:**
 - Consumes: Plan 2 的 FC3 client。spec §12.2 把接口定为
@@ -1893,6 +1960,8 @@ func TestFC3CertConfigEncodings(t *testing.T) {
 
 	ca := testutil.NewCA(t)
 	certPEM, keyPEM := testutil.IssueLeafRSA(t, ca, domain)
+	// EC 走 SEC1（"EC PRIVATE KEY"）。CAS 与 FC3 是两套独立校验，EC 必须在两边各测一次。
+	ecCertPEM, ecKeyPEM := testutil.IssueLeaf(t, ca, domain)
 
 	for _, tc := range []struct {
 		id, question, label string
@@ -1900,6 +1969,7 @@ func TestFC3CertConfigEncodings(t *testing.T) {
 	}{
 		{"#1", q1fc3, "PKCS#1", certPEM, keyPEM},
 		{"#1", q1fc3, "PKCS#8", certPEM, testutil.ToPKCS8(t, keyPEM)},
+		{"#1", q1fc3, "SEC1 EC", ecCertPEM, ecKeyPEM},
 		{"#5", q5fc3, "leaf+intermediate", certPEM, keyPEM},
 		{"#5", q5fc3, "仅 leaf", splitPEM(t, certPEM)[0], keyPEM},
 	} {
@@ -1942,9 +2012,36 @@ func TestFC3ThrottlingThreshold(t *testing.T) {
 		t.Errorf("FC3 的限流码 %q 不以 Throttling 开头，错误分类会把它判成不可重试", code)
 	}
 }
+
+// TestFC3GetCustomDomainNotFound：绑定 controller 的 Observe 靠 ClassNotFound 区分
+// 「目标域名不存在」与「调用失败」。分错的后果是把一个永远不会出现的域名当成可重试
+// 故障无限重试。这一项探的是不存在域名的真实错误码 / HTTP 状态，以及 classifyCode
+// 认不认它。
+func TestFC3GetCustomDomainNotFound(t *testing.T) {
+	const qnf = "FC3 GetCustomDomain 对不存在域名的错误码与 HTTP 状态"
+	cred, region := requireCAS(t, "#10", qnf)
+	fc := newFC3(t, cred, region)
+	ctx := context.Background()
+
+	absent := "it-absent-" + randHex(t, 6) + ".integration.invalid"
+	_, err := fc.GetCustomDomain(ctx, absent)
+	if err == nil {
+		Record(t, "#10", qnf, "无错误：不存在的域名也返回了对象", "域名="+absent)
+		t.Fatalf("GetCustomDomain 对不存在的域名 %q 没有报错", absent)
+	}
+	class := aliyun.ClassOf(err)
+	Record(t, "#10", qnf, "错误码="+errCode(err)+" class="+class.String(),
+		"域名="+absent+"；原始错误="+err.Error())
+	if class != aliyun.ClassNotFound {
+		t.Errorf("不存在的域名被判成 %s 而不是 NotFound，"+
+			"必须把该码补进 pkg/aliyun/errors.go 的 classifyCode 再重跑", class)
+	}
+}
 ```
 
-- [ ] **Step 3: 按 Plan 2 的真实类型补四个辅助**
+`aliyun` 包需要在 import 里加上（`aliyun.ClassOf` / `aliyun.ClassNotFound`）。
+
+- [ ] **Step 3: 按 Plan 2 的真实类型补六个辅助**
 
 `newFC3`、`hasRouteConfig`、`certOnlyInput`、`mergedInput`、`restoreCustomDomain`、`errCode` 六个辅助的实现完全取决于 Plan 2 的 `CustomDomain` / `UpdateCustomDomainInput` 结构体形状。写在 `fc3_test.go` 末尾，规则是：
 
@@ -1967,7 +2064,7 @@ Expected: `go vet` exit 0；无 `FC3_TEST_DOMAIN` 时全部 SKIP。
 
 ```bash
 make build test lint
-git add test/integration
+git add test/integration pkg/aliyun   # errors.go 仅在 classifyCode 被改时有内容
 git commit -m "test(integration): probe FC3 update semantics, cert encodings and throttling"
 ```
 
@@ -1978,10 +2075,10 @@ git commit -m "test(integration): probe FC3 update semantics, cert encodings and
 这个任务不依赖任何凭证，纯粹是把 spec 与已经合并的代码对齐。它必须排在 README 之前：README 的「故障排查」一节要直接引用这张事件表。
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-09-04-le-to-alicloud-operator-design.md`（§5.2、§9、§10.2、§12.3、§14）
+- Modify: `docs/superpowers/specs/2026-09-04-le-to-alicloud-operator-design.md`（§5.2、§7、§9、§10.2、§12.3、§14）
 
 **Interfaces:**
-- Consumes: `internal/controller/*.go` 里全部 12 处 `Recorder.Event` 调用。
+- Consumes: `internal/controller/*.go` 里全部 12 处 `Recorder.Event` 调用；Plan 2 的 `pkg/provider/provider.go`（Step 7 的 §7 签名以它为准）。
 - Produces: spec §10.2 的完整事件表，Task 13 的 README「故障排查」直接照抄。
 
 - [ ] **Step 1: 核对事件全表**
@@ -2026,8 +2123,9 @@ Reason+Message 完全相同的事件）。下表是证书 controller 实际发�
 `ReclaimFailed`、`IssuanceStalled` 五个是实现期新增的。
 
 **绑定 controller 的事件（`Normal Applied` / `Warning ApplyFailed` /
-`Warning DriftCorrected`）由 Plan 2 交付，reason 常量已在
-`api/v1alpha1/conditions.go` 中定义。**
+`Warning DriftCorrected` / `Warning ObserveFailed`）由 Plan 2 交付，reason 常量已在
+`api/v1alpha1/conditions.go` 中定义。`ObserveFailed` 在 Observe 失败且 reason 相对上
+一轮发生变化时发出——同一个失败原因反复出现不重复发事件。**
 ```
 
 - [ ] **Step 3: 修 §5.2 步骤 4 的措辞**
@@ -2079,7 +2177,39 @@ Reason+Message 完全相同的事件）。下表是证书 controller 实际发�
 8. `record.EventRecorder`（旧 events API）在 controller-runtime v0.24 已弃用。迁移到 `events.EventRecorder` 要改动全部 12 个事件调用点并为每条事件补一个 `action` 参数，属于行为变更，暂以 `.golangci.yml` 的一条排除规则挂起。
 ```
 
-- [ ] **Step 7: 校验引用一致性**
+- [ ] **Step 7: 三处从 Plan 2 移交过来的 spec 修改**
+
+Plan 2 的 pre-flight 把这三条判给了 Plan 3（spec 归 Plan 3 改，见 cross-plan 分工）。三条都只改 spec，不动代码。
+
+**(a) §7 Provider 接口的第三形参改类型。** `Observe` / `Apply` / `Cleanup` 三个方法的第三个参数由 `c Credentials` 改成 `c Client`：
+
+```markdown
+| `Observe(ctx context.Context, b *AliyunCertificateBinding, c Client) (*ObservedState, error)` |
+| `Apply(ctx context.Context, b *AliyunCertificateBinding, c Client, desired *DesiredCert) error` |
+| `Cleanup(ctx context.Context, b *AliyunCertificateBinding, c Client) error` |
+```
+
+理由（抄 Plan 2 `pkg/provider/provider.go` 的原话）：Provider 注册表是异构的——不同 provider 需要的是不同的云 client（FC3 要 `FC3Client`，将来的 CDN / CLB 要各自的），而注册表把它们放在同一个 map 里，**不能给 Provider 加类型参数**。所以接口收的是一个已经构造好的 `Client`（由 provider 自己断言成它要的具体类型），而不是原始 `Credentials`。
+
+**(b) §10.2 事件表的 Binding 侧新增一行：**
+
+```markdown
+| Warning | `ObserveFailed` | 绑定 controller | Observe 失败，且失败 reason 相对上一轮发生了变化 |
+```
+
+「reason 变化时才发」与表头那句「只在状态跃迁时发」是同一条规则：一个持续失败的目标不该每个 `--drift-check-interval` 就刷一条事件。
+
+**(c) §12.3 在 #13 之后追加 FC3 的三条未实测事实：**
+
+```markdown
+| 14 | FC3 `GetCustomDomain` 对不存在域名返回的错误码与 HTTP 状态 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。认不出时需补 `pkg/aliyun/errors.go` 的 `classifyCode` |
+| 15 | FC3 的限流错误码是否以 `Throttling` 开头 | 不以它开头则 `aliyun.Classify` 会把限流判成不可重试，退避逻辑失效 |
+| 16 | FC3 `CertConfig` 对 PKCS#1 / EC 私钥与 Let's Encrypt 链形状（leaf+intermediate、仅 leaf）的接受情况 | CAS 与 FC3 是两套独立校验，operator 输出的 PEM 必须同时满足两边 |
+```
+
+**编号以追加时表的真实长度为准**：如果表里已经有等价的行（比如 #10 已经覆盖了限流码），就复用那一行的编号并把措辞补全，不要新开一行造出两个编号指向同一件事。这三项由 Task 8 探测并 `Record`。
+
+- [ ] **Step 8: 校验引用一致性**
 
 ```bash
 grep -n "DeletionBlockedByBindings" docs/superpowers/specs/2026-09-04-le-to-alicloud-operator-design.md api/v1alpha1/conditions.go
@@ -2088,7 +2218,7 @@ grep -c "^| " docs/superpowers/specs/2026-09-04-le-to-alicloud-operator-design.m
 
 Expected: 第一条命令在两个文件里都命中；spec 里出现的每一个 reason 字符串都能在 `api/v1alpha1/conditions.go` 或 `internal/controller/*.go` 里找到（逐个 `grep` 确认 `CertificateRecreated`、`CASCertificateMissing`、`ProbeFailed`、`ReclaimFailed`、`Reclaimed`、`Uploaded` 六个裸字符串）。
 
-- [ ] **Step 8: 提交**
+- [ ] **Step 9: 提交**
 
 ```bash
 make build test lint
@@ -2128,7 +2258,10 @@ make kustomize
 grep -cE "^kind:" /tmp/before.yaml
 ```
 
-Expected: 输出 18 个 `kind:` 行（9 ClusterRole、2 ClusterRoleBinding、2 CRD、1 Deployment、1 Namespace、1 Role、1 RoleBinding、1 Service、1 ServiceAccount）。
+Expected: 输出 19 个 `kind:` 行（9 ClusterRole、2 ClusterRoleBinding、2 CRD、1 Deployment、1 Namespace、1 Role、1 RoleBinding、1 Service、1 ServiceAccount）。
+
+这个数字只是记账用的基线，**判据是 Step 4 的 `diff` 为空，不是数字相等**：Plan 2 若往
+`config/rbac` 里加了新的 Role，19 就会变，而 `diff` 为空这条断言不受影响。
 
 - [ ] **Step 2: 建 `config/operator`**
 
@@ -2166,11 +2299,13 @@ patches:
 
 - [ ] **Step 3: `config/default` 改为引用它**
 
-`config/default/kustomization.yaml` 做两处最小修改，注释一律保留：
+`config/default/kustomization.yaml` 做三处最小修改，其余注释一律保留：
 
 - `resources:` 下的 `- ../rbac` 与 `- ../manager` 两行合并成一行 `- ../operator`（`- ../crd` 保持在最前）。
 - 删掉 `# [METRICS] Expose the controller manager metrics service.` 与 `- metrics_service.yaml` 两行。
-- 删掉 `patches:` 段里 `- path: manager_metrics_patch.yaml` 及其 `target: {kind: Deployment}` 三行和上方的两行 `# [METRICS]` 注释（整个 `patches:` 键此时已无内容，一并删掉）。
+- 删掉 `patches:` 段里 `- path: manager_metrics_patch.yaml` 及其 `target: {kind: Deployment}` 三行和上方的两行 `# [METRICS]` 注释。**`patches:` 键此时已无条目，必须连键一起删掉**——kustomize 不接受一个空的 `patches:` 键（`build` 会直接报错），所以「保留键、清空条目」不是一个可选项。
+
+`patches:` 键下方还留着 `[METRICS-WITH-CERTS]` / `[WEBHOOK]` / `[CERTMANAGER]` 三段被注释掉的 patch 条目，以及「Uncomment the patches line ... 就能用」的指引。删掉键会让这些指引落在一个不存在的键下面。**把这三段注释连同它们的 Uncomment 指引原样搬进 `config/operator/kustomization.yaml` 的 `patches:` 段末尾**（那里的 `patches:` 键是有条目的，指引继续成立）——它们描述的都是给 Deployment 打的 patch，本来就属于 operator 基座，不属于「CRD + operator」的聚合层。搬完之后 `config/default/kustomization.yaml` 里不应再有任何 `patch` 字样。
 
 - [ ] **Step 4: 验证输出逐字节不变（这一步是本 Task 的核心断言）**
 
@@ -2312,7 +2447,7 @@ grep -c "readOnlyRootFilesystem: true" /tmp/ocp.yaml
 grep -c "RuntimeDefault" /tmp/ocp.yaml
 ```
 
-Expected：`kustomize build` exit 0；`kind:` 共 18 行；CRD 计数 0；`runAsUser` 计数 0；`sync-wave: "1"` 出现 1 次；`alert:` 4 条；`runAsNonRoot` / `readOnlyRootFilesystem` / `RuntimeDefault` 各 1。
+Expected：`kustomize build` exit 0；`kind:` 共 19 行（17 个 operator 资源 + ServiceMonitor + PrometheusRule）；CRD 计数 0；`runAsUser` 计数 0；`sync-wave: "1"` 出现 1 次；`alert:` 4 条；`runAsNonRoot` / `readOnlyRootFilesystem` / `RuntimeDefault` 各 1。
 
 - [ ] **Step 8: 核对告警表达式里的指标名真实存在**
 
@@ -2326,12 +2461,16 @@ for m in aliyuncert_certificate_not_after_timestamp_seconds \
 done
 ```
 
-Expected: 五行里四行 `OK`；`aliyuncert_binding_applied_age_seconds` 会是 `MISS`——它由 **Plan 2** 的绑定 controller 注册。这是预期的：告警规则先就位，指标随 Plan 2 到位。把这件事写进 `prometheusrule.yaml` 顶部的注释：
+Expected: 五行里四行 `OK`；`aliyuncert_binding_applied_age_seconds` 是 `MISS`——本 Task 执行时 Plan 2 尚未合并，该指标由绑定 controller 注册。**这一步的 Expected 就保持 `MISS`**，不要为了让输出好看去改脚本或删指标。
+
+`prometheusrule.yaml` 顶部加一句中性说明即可（**不要写「Plan 2 合并之前永不触发」这类带时序假设的注释**——它会在合并当天变成假话，而 YAML 注释没人会回头改）：
 
 ```yaml
-# 注意：aliyuncert_binding_applied_age_seconds 由 Plan 2 的绑定 controller 注册。
-# Plan 2 合并之前 AliyunCertificateBindingStale 永远不会触发（表达式对空 series 求值为空）。
+# aliyuncert_binding_applied_age_seconds 由绑定 controller 注册；
+# 该指标尚未出现时，AliyunCertificateBindingStale 对空 series 求值为空，不会误报。
 ```
+
+**移交给 Task 14**：Plan 2 合并进本分支之后重跑本 Step 的脚本，五行应当**全部 `OK`**，并把这个结果 `Record` 进 ledger。
 
 - [ ] **Step 9: 可选——用 promtool 校验 PromQL**
 
@@ -2412,7 +2551,8 @@ spec:
       # finalizer 随即去删云上的证书。要删 CRD 请人工执行。
       prune: false
     syncOptions:
-      # CRD 体积大，客户端 apply 会撞 262144 字节的 last-applied-configuration 上限。
+      # SSA 让 Argo 与 apiserver 共享字段所有权，避免 last-applied-configuration 与
+      # CRD 默认值互相打架；CRD 将来增长也不会撞上 262144 字节的注解上限。
       - ServerSideApply=true
       - CreateNamespace=true
   ignoreDifferences:
@@ -2590,7 +2730,9 @@ README 用中文，整份替换脚手架生成的英文占位内容。这个任�
 
 - [ ] **Step 2: 写「概述」与「架构」**
 
-概述要说清三件事，各一段：这个 operator 把「阿里云上的一张 TLS 证书」变成集群里的声明式资源；证书由 cert-manager 签发（operator 只依赖 `Issuer` 抽象，不管 ACME 账号和 DNS-01 solver）；第一版的部署目标只有 FC3 自定义域名，provider 层为 CDN / CLB / ALB 预留。同时点明当前状态：**证书 controller 已可用，绑定 controller（`AliyunCertificateBinding`）由 Plan 2 交付**。
+概述要说清三件事，各一段：这个 operator 把「阿里云上的一张 TLS 证书」变成集群里的声明式资源；证书由 cert-manager 签发（operator 只依赖 `Issuer` 抽象，不管 ACME 账号和 DNS-01 solver）；第一版的部署目标只有 FC3 自定义域名，provider 层为 CDN / CLB / ALB 预留。同时点明当前状态：**证书 controller 与绑定 controller（`AliyunCertificateBinding`）都已交付可用**。
+
+**README 的口径前提：本 Task 执行时 Plan 2 已经合并进本分支**（执行顺序见 ledger 的 P3-R14）。README 里不要出现「由 Plan 2 交付」「尚未交付」「没有消费方」这类措辞——对读 README 的人来说不存在 Plan 2 这个东西，只有「装上就能用的功能」。若执行到这里发现 `internal/controller/aliyuncertificatebinding_controller.go` 还不在树上，**停下来先合并 Plan 2**，不要退回去写「未交付」版本的 README。
 
 架构一节放一张 mermaid 图：
 
@@ -2604,7 +2746,7 @@ flowchart LR
     CC -->|APIReader 直读，不缓存| SEC
     CC -->|UploadUserCertificate<br/>DeleteUserCertificate<br/>ListUserCertificateOrder| CAS[(阿里云 CAS)]
     U -->|创建| AB[AliyunCertificateBinding]
-    AB --> BC[绑定 controller<br/>Plan 2]
+    AB --> BC[绑定 controller]
     BC -->|Observe / Apply| FC3[(FC3 自定义域名)]
     AC -.->|status.current 变化<br/>唤醒| BC
 ```
@@ -2622,7 +2764,7 @@ flowchart LR
 | Kubernetes | ≥ 1.25（CRD 用了 CEL `x-kubernetes-validations`）；OpenShift ≥ 4.12 | `kubectl version -o json \| jq -r .serverVersion.minor` |
 | cert-manager | 已安装并可用。编译期钉在 v1.21.1，运行期建议同版本；更低版本未验证 | `kubectl get pods -n cert-manager` |
 | Issuer / ClusterIssuer | 由你自己创建，operator 不管它 | `kubectl get clusterissuer` |
-| Prometheus Operator | 可选。装了才用得上 `ServiceMonitor` 与 `PrometheusRule` | `kubectl get crd prometheusrules.monitoring.coreos.com` |
+| Prometheus Operator | **使用 openshift overlay 时必需**：该 overlay 含 `ServiceMonitor` 与 `PrometheusRule`。OpenShift 自带 `monitoring.coreos.com` CRD，所以 apply 不会失败，但需要启用 user workload monitoring 才会真的被抓取；其他集群必须先安装 Prometheus Operator，否则 Argo sync 会因为缺 CRD 而失败 | `kubectl get crd prometheusrules.monitoring.coreos.com servicemonitors.monitoring.coreos.com` |
 ```
 
 然后两段必须写的警告：
@@ -2662,7 +2804,7 @@ kubectl apply -f deploy/argocd/application-operator.yaml
 
 三条硬约束，写在这里是因为踩中任何一条都会丢证书：
 
-- **`ServerSideApply=true` 必开**。CRD 体积超过 262144 字节的注解上限，客户端 apply 会直接失败。
+- **`ServerSideApply=true` 必开**。SSA 让 Argo 与 apiserver 共享字段所有权，避免 `last-applied-configuration` 与 CRD 默认值互相打架；CRD 将来增长也不会撞上 262144 字节的注解上限。（本仓库两个 CRD 目前合计约 32 KB，离上限还很远——开 SSA 是为了避免所有权打架，不是因为现在就会失败。）
 - **绝不给 CRD 用 `Replace=true`**。Replace 是 delete + create，会连带删除全部 `AliyunCertificate`，finalizer 随即去删云上的证书。
 - **凭证 Secret 必须与 CR 分属不同 Application**。同一个 Application 里 prune 的顺序不确定；凭证先消失时 finalizer 拿不到凭证，云上会留下孤儿证书。
 ````
@@ -2718,7 +2860,7 @@ make uninstall
 
 `AliyunCertificate.status` 的关键字段：`current`（当前代次的 `fingerprint` / `certId` / `casName` / `notAfter`）、`history`（≤ `keepLast-1` 代）、`pendingUpload`（write-ahead 记录，上传成功即清空）、`issuance`（镜像 cert-manager 的 `revision` / `renewalTime` / `failedIssuanceAttempts`）、`casProbedAt`、`conditions`。
 
-`AliyunCertificateBinding.spec`（类型已定义，controller 由 Plan 2 交付）：
+`AliyunCertificateBinding.spec`（**字段以合并后的 `api/v1alpha1` 为准**——Plan 2 给 binding 加过字段，写表前逐个 `grep json:"` 核对，不要照抄本计划）：
 
 | 字段 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
@@ -2729,6 +2871,8 @@ make uninstall
 | `target.fc3CustomDomain.ensureHTTPSProtocol` | bool | 否 | `false` | 只有为 true 且当前 protocol 不含 HTTPS 时才改 protocol |
 | `credentialsRef.name` | string | 否 | 继承证书的 | |
 | `deletionPolicy` | enum | 否 | `Orphan` | `Orphan`：删 Binding 不动云侧；`Unbind`：清掉自己那张证书 |
+
+`AliyunCertificateBinding.status` 的关键字段：`appliedFingerprint` / `appliedAt`（目标上当前生效的那一代）、`observedTarget`、`cleanupStartedAt`（`Unbind` 清理的起点，用于有界清理的超时判定）、`conditions`。**这张表同样以合并后的 `api/v1alpha1/aliyuncertificatebinding_types.go` 为准**：Plan 2 往 status 里加过字段（`cleanupStartedAt` 是其中之一），逐个核对 json tag 再写，Step 6 的校验脚本会把漏掉的字段抓出来。
 
 示例直接引用仓库里的样本，保证「文档里的命令可执行」：
 
@@ -2748,9 +2892,12 @@ for f in secretName certificateTemplate issuerRef dnsNames commonName ipAddresse
          uploadToCAS keepLast minAge; do
   grep -q "json:\"$f" api/v1alpha1/aliyuncertificate_types.go && echo "OK   $f" || echo "MISS $f"
 done
-for f in certificateRef target type fc3CustomDomain domainName ensureHTTPSProtocol deletionPolicy; do
+for f in certificateRef target type fc3CustomDomain domainName ensureHTTPSProtocol deletionPolicy \
+         appliedFingerprint appliedAt cleanupStartedAt; do
   grep -q "json:\"$f" api/v1alpha1/aliyuncertificatebinding_types.go && echo "OK   $f" || echo "MISS $f"
 done
+# 反向核对：类型文件里有、README 表里没有的字段，一个都不许漏
+grep -oE 'json:"[a-zA-Z]+' api/v1alpha1/aliyuncertificatebinding_types.go | sort -u
 # 命令里引用的文件都存在
 ls config/samples/aliyun-credentials-secret.yaml \
    config/samples/certs_v1alpha1_aliyuncertificate.yaml \
@@ -2777,11 +2924,14 @@ git commit -m "docs(readme): overview, architecture, prerequisites, install and 
 
 ### Task 13: README 下半——Flags、指标与告警、RAM、威胁模型、已知限制、故障排查、开发
 
+**与 Task 12 同一个口径前提：本 Task 执行时 Plan 2 已经合并进本分支。** 绑定 controller、FC3 provider 与 5 个 binding 指标都写成**已交付**，README 里不出现「Plan 2」「尚未交付」「没有消费方」。
+
 **Files:**
 - Modify: `README.md`
+- Create: `docs/ram/certificate-cas-policy.json`（证书 controller 的 RAM 策略，内容抄 spec §8.3）
 
 **Interfaces:**
-- Consumes: `cmd/main.go` 的 `registerOperatorFlags` 与脚手架 flag 注册；`internal/controller/metrics.go` 的 12 个指标；`api/v1alpha1/conditions.go` 的 condition 与 reason 常量；Task 9 更新后的 spec §10.2 事件表；spec §8.3 的两份 RAM 策略；spec §13、§14。
+- Consumes: `cmd/main.go` 的 `registerOperatorFlags` 与脚手架 flag 注册；`internal/controller/metrics.go` 的 12 个指标；`api/v1alpha1/conditions.go` 的 condition 与 reason 常量；Task 9 更新后的 spec §10.2 事件表；spec §8.3 的两份 RAM 策略；spec §13、§14；`docs/ram/binding-fc3-policy.json`（Plan 2 Task 6 新建）。
 - Produces: 完整的 README；Task 14 的验收会逐条跑它里面的命令。
 
 - [ ] **Step 1: 写「Flags」**
@@ -2794,7 +2944,7 @@ git commit -m "docs(readme): overview, architecture, prerequisites, install and 
 | `--default-issuer-kind` | `Issuer` | |
 | `--default-issuer-group` | `cert-manager.io` | |
 | `--certificate-resync-interval` | `1h` | 证书 controller 的周期 resync。**Secret 不进 cache，这是漂移检测的承重通道** |
-| `--drift-check-interval` | `1h` | 绑定 controller 的周期 Observe（Plan 2 才消费，现在注册了但没有消费方） |
+| `--drift-check-interval` | `1h` | 绑定 controller 的周期 Observe：每隔这么久回读一次目标上的实际证书，发现漂移就纠正 |
 | `--cas-probe-interval` | `12h` | CAS 存在性探测的节流间隔 |
 | `--issuance-stall-threshold` | `6h` | `Issuing=True` 持续超过即判 `IssuanceStalled` |
 | `--cloud-call-timeout` | `30s` | 每次阿里云调用的 context 超时 |
@@ -2802,7 +2952,7 @@ git commit -m "docs(readme): overview, architecture, prerequisites, install and 
 | `--cleanup-failure-policy` | `Abandon` | `Abandon`：超时后放弃并计数告警；`Block`：保持 finalizer 持续重试 |
 | `--watch-namespaces` | 空（全集群） | 逗号分隔。配合 namespace 级 Role 才能真正收窄 `secrets: get` |
 
-脚手架 flag（对照 `cmd/main.go:141-163`）：`--metrics-bind-address`（默认 `0`，即关闭；`config/operator/manager_metrics_patch.yaml` 会改成 `:8443`）、`--health-probe-bind-address`（`:8081`）、`--leader-elect`（**代码默认 `false`**，`config/manager/manager.yaml` 显式传上开启）、`--metrics-secure`（`true`）、`--enable-http2`（`false`，防 HTTP/2 Rapid Reset）、`--webhook-cert-path` / `--webhook-cert-name` / `--webhook-cert-key`、`--metrics-cert-path` / `--metrics-cert-name` / `--metrics-cert-key`、以及 zap 的 `--zap-devel` 等（部署清单传 `--zap-devel=false`：development 模式会把日志级别降到 Debug 并换成 console 编码，采集侧解析不出结构化字段）。
+脚手架 flag（对照 `cmd/main.go:144-164`，含末尾的 `zapOpts.BindFlags`）：`--metrics-bind-address`（默认 `0`，即关闭；`config/operator/manager_metrics_patch.yaml` 会改成 `:8443`）、`--health-probe-bind-address`（`:8081`）、`--leader-elect`（**代码默认 `false`**，`config/manager/manager.yaml` 显式传上开启）、`--metrics-secure`（`true`）、`--enable-http2`（`false`，防 HTTP/2 Rapid Reset）、`--webhook-cert-path` / `--webhook-cert-name` / `--webhook-cert-key`、`--metrics-cert-path` / `--metrics-cert-name` / `--metrics-cert-key`、以及 zap 的 `--zap-devel` 等（部署清单传 `--zap-devel=false`：development 模式会把日志级别降到 Debug 并换成 console 编码，采集侧解析不出结构化字段）。
 
 - [ ] **Step 2: 写「指标与告警」**
 
@@ -2821,18 +2971,39 @@ git commit -m "docs(readme): overview, architecture, prerequisites, install and 
 | `aliyuncert_aliyun_api_requests_total` | counter | service, action, code | 覆盖 `UploadUserCertificate` / `DeleteUserCertificate` / `ListUserCertificateOrder` 三个动作 |
 | `aliyuncert_aliyun_api_duration_seconds` | histogram | service, action | 同上 |
 
-`aliyuncert_binding_applied_age_seconds`、`aliyuncert_binding_ready`、`aliyuncert_binding_conflict`、`aliyuncert_binding_apply_total`、`aliyuncert_binding_drift_detected_total` 由 **Plan 2** 注册。
+绑定 controller 的 5 个指标同表列出，**不加任何「由 Plan 2 提供」之类的标注**：
+
+| 指标 | 类型 | label | 含义 |
+|---|---|---|---|
+| `aliyuncert_binding_applied_age_seconds` | gauge | namespace, name, provider | **滞后时长**：证书 CR 的 `status.current` 推进后，Binding 尚未把该代应用到目标的持续秒数；已同步时为 0 |
+| `aliyuncert_binding_ready` | gauge | namespace, name | `Ready` condition 为 True 时 1 |
+| `aliyuncert_binding_conflict` | gauge | namespace, name | 同一目标被多个 Binding 争用时 1 |
+| `aliyuncert_binding_apply_total` | counter | — | Apply 次数 |
+| `aliyuncert_binding_drift_detected_total` | counter | — | Observe 发现漂移的次数 |
+
+label 与类型以 `internal/controller/metrics.go` 的实际注册为准，写表前逐个核对。
 
 告警指向 `config/prometheus/prometheusrule.yaml` 里的四条，并解释为什么前两条缺一不可：到期告警看不见「续期成功但没推到线上」，新鲜度告警看不见「根本没续上」。
 
 - [ ] **Step 3: 写「RAM 权限」**
 
-两份策略原文照抄 spec §8.3，一份含 CAS、一份仅 FC3，并在下面写清三点：
+先新建 `docs/ram/certificate-cas-policy.json`，内容抄 spec §8.3 那份含 CAS 的策略（`yundun-cert` 的 Upload / Delete / List 三个 Action）。另一份仅 FC3 的策略是 `docs/ram/binding-fc3-policy.json`，由 Plan 2 Task 6 新建，**本 Task 不重写它**。
+
+**README 的「RAM 权限」一节只引用这两个文件路径，不在 README 里再抄一份 JSON**：
+
+| 文件 | 给谁 | 内容 |
+|---|---|---|
+| `docs/ram/certificate-cas-policy.json` | 证书 controller（`uploadToCAS: true` 时需要） | `yundun-cert` 的 Upload / Delete / List |
+| `docs/ram/binding-fc3-policy.json` | 绑定 controller | `fc` 的自定义域名读写，按域名 ARN 授权 |
+
+理由：两份同源策略一旦在 README 里各抄一份，迟早会漂移，而这类文件漂移的后果是线上权限配错。README 里只放差异说明，策略原文永远只有一个来源。
+
+差异说明写清这四点：
 
 - `yundun-cert:*` 的资源类型是「全部资源」，**无法资源级收窄**。持有这个 AK 就能删掉账号下任意上传证书。这是不可回避的爆炸半径。**必须用独立 RAM 子账号 + 独立 AK**，不要复用任何现有账号。
 - `fc` 支持逐域名 ARN 授权（`acs:fc:{regionId}:{accountId}:custom-domains/{domainName}`），必须用上，别偷懒写 `*`。
 - **不授 `yundun-cert:GetUserCertificateDetail`**：它会返回私钥，operator 完全不需要它。
-- 只用 FC3、不需要控制台里看到证书的用户，设 `spec.aliyun.uploadToCAS: false` 并只用第二份策略——`yundun-cert:*` 一个都不给。
+- 只用 FC3、不需要控制台里看到证书的用户，设 `spec.aliyun.uploadToCAS: false` 并只用 `docs/ram/binding-fc3-policy.json`——`yundun-cert:*` 一个都不给。
 
 - [ ] **Step 4: 写「威胁模型」（spec §13）**
 
@@ -2845,7 +3016,7 @@ git commit -m "docs(readme): overview, architecture, prerequisites, install and 
 
 - [ ] **Step 5: 写「已知限制」**
 
-按 spec §14 的八条 + 集成测试暴露的结论逐条写，每条都要说清「什么情况下会咬人」和「怎么发现」：
+按 spec §14 的八条 + 集成测试暴露的结论逐条写，每条都要说清「什么情况下会咬人」和「怎么发现」。注意 **原第 9 条（Binding controller 未交付）删除**——Plan 2 已合并，创建 Binding 会正常 reconcile：
 
 1. FC3 的 Get 与 Update 之间没有已确认的乐观锁，是 last-write-wins。缓解是窗口极短、写入频率极低（正常一年 4–6 次）。
 2. `yundun-cert:*` 无法资源级收窄，用独立子账号。
@@ -2853,9 +3024,14 @@ git commit -m "docs(readme): overview, architecture, prerequisites, install and 
 4. CAS 的 `Name` 字符集、`ClientToken` 语义、跨 region 可见性由 `make test-integration` 实测，结论见 `RESULTS.md`；`ClientToken` 若不支持幂等，兜底退化为 `ListUserCertificateOrder` 分页查询（QPS 仅 10）。
 5. `Abandon` 清理策略会在 CAS 留下孤儿证书。有计数器（`aliyuncert_cleanup_abandoned_total`）和事件（`Warning CleanupAbandoned`），**必须配告警**，否则孤儿会静默吃满账号配额。
 6. cert-manager 依赖是编译期的：module 钉在 v1.21.1，运行期建议同版本。
-7. **CAS 证书名不含 namespace**：`sanitize(CR名)[:50] + "_" + fingerprint[:12]`。撞名的前提是两个不同 namespace 的同名 CR 持有完全相同的 leaf DER，cert-manager 正常签发不会产生这种形状；兜底是 `DuplicateName → findByName` 认领既有 certId 和 12h 的存在性探测。**引入 `ReferencesCertByID: true` 的 provider（CDN / CLB / ALB）之前必须重新评估。**
+7. **CAS 证书名不含 namespace**：`sanitize(CR名)[:50] + "_" + fingerprint[:12]`。撞名的前提是两个不同 namespace 的同名 CR 持有完全相同的 leaf DER（即同一把私钥、同一张证书），cert-manager 正常签发不会产生这种形状；兜底是 `DuplicateName → findByName` 认领既有 certId 和 12h 的存在性探测。**引入 `ReferencesCertByID: true` 的 provider（CDN / CLB / ALB）之前必须重新评估。**
 8. 事件仍用已弃用的 `record.EventRecorder`（旧 events API）。迁移要改动全部 12 个事件调用点并补 `action` 参数，属行为变更，暂以 `.golangci.yml` 的排除规则挂起。
-9. `AliyunCertificateBinding` 的 controller、FC3 provider 与 binding 侧指标由 **Plan 2** 交付。现在创建 Binding 只会通过 CRD 校验，不会有任何 reconcile。
+9. **FC3 不支持 `endpointOverride`**：`spec.aliyun.endpointOverride` 只作用于 CAS，FC3 客户端按 region 走公网默认 endpoint。VPC 内网 / 专有云环境里 CAS 可以走内网而 FC3 不行，网络策略要为 FC3 单独放行出网。怎么发现：Binding 一直 `ApplyFailed` 且错误是连接超时，而同一个 CR 的 CAS 上传是成功的。
+10. **CAS `Keyword` 对通配符域名的匹配行为**：通配符证书的首个 SAN 是 `*.example.com`，`probe.go` 的 `casFindHint` 把它原样当 `Keyword` 传给 `ListUserCertificateOrder`。若 CAS 不认这种 Keyword，存在性探测就会持续误判「证书丢了」并反复重传。实测结论见 `test/integration/RESULTS.md` 的 `#12`。怎么发现：通配符证书的 `aliyuncert_cas_upload_total` 每 12 小时涨一次。
+11. **`--watch-namespaces` 生效时，跨 namespace 仲裁退化为跨已 watch namespace 仲裁**：「同一个目标只能有一个 Binding 生效」这条约束靠 controller 自己看到的全量 Binding 列表来判定。限定了 watch 范围之后，范围外的 Binding 看不见也就不参与仲裁，两个不同 namespace 的 Binding 可能同时认为自己是赢家并互相覆盖目标上的证书。怎么发现：`aliyuncert_binding_conflict` 恒为 0，而目标上的证书在两代之间来回翻。用 `--watch-namespaces` 时必须自己保证同一个 FC3 域名不被范围外的 Binding 引用。
+12. **`aliyuncert_cleanup_abandoned_total{reason}` 的 `reason` 混用两套词表**：证书侧放弃清理时填的是 `aliyun.ErrClass`（`Retryable` / `Permanent` / `Auth` …），绑定侧填的是 `provider.Code*`。同一个 label 上出现两套取值，按 `reason` 做聚合或告警时要分别列举，不能假定它是一个封闭枚举。
+
+「CAS 证书名不含 namespace、不同 namespace 的同名 CR 持有同一把私钥时会撞名」（Plan 1 Task 6 parked）已由上面第 7 条覆盖，不再单列一条。
 
 - [ ] **Step 6: 写「故障排查」**
 
@@ -2970,9 +3146,9 @@ for f in default-issuer-name default-issuer-kind default-issuer-group \
          health-probe-bind-address leader-elect metrics-secure enable-http2; do
   grep -q "\"$f\"" cmd/main.go && echo "OK   --$f" || echo "MISS --$f"
 done
-# 指标表里每个指标都真实注册
+# 指标表里每个指标都真实注册（Plan 2 已合并，5 个 binding 指标同样必须是 OK）
 for m in $(grep -oE "aliyuncert_[a-z_]+" README.md | sort -u); do
-  grep -q "$m" internal/controller/metrics.go && echo "OK   $m" || echo "PLAN2 $m"
+  grep -q "$m" internal/controller/metrics.go && echo "OK   $m" || echo "MISS $m"
 done
 # reason 表里每个 reason 都真实存在
 for r in NoIssuer SecretNameConflict CertificateNotReady IssuanceStalled \
@@ -2988,13 +3164,13 @@ for t in build test test-race lint test-integration test-e2e install deploy dock
 done
 ```
 
-Expected: flag / reason / make 目标全部 `OK`；指标里只有 5 个 `binding` 相关的标 `PLAN2`（README 已注明它们由 Plan 2 注册）。
+Expected: flag / reason / make 目标全部 `OK`；**指标也全部 `OK`，包括 5 个 `aliyuncert_binding_*`**——Plan 2 已合并，它们由绑定 controller 注册在同一个 `metrics.go` 里。任何一个 `MISS` 都说明 README 写了一个不存在的指标名，或者 Plan 2 还没合进来，两种情况都不许留着。
 
 - [ ] **Step 9: 提交**
 
 ```bash
 make build test lint
-git add README.md
+git add README.md docs/ram/certificate-cas-policy.json
 git commit -m "docs(readme): flags, metrics, RAM policies, threat model, limits and runbooks"
 ```
 
@@ -3038,7 +3214,7 @@ test -f test/integration/RESULTS.md && grep -c "未实测" test/integration/RESU
 
 - [ ] **Step 3: 回填 spec §2.2 的事实表**
 
-`#1`（私钥编码）与 `#5`（链形状）的结论进 §2.2 的「仅支持 PEM 编码」那一行；`#4`（Name 字符集）进 `UploadUserCertificate` 那一行；`#3-dup` 的真实错误码进同一行。每条都注明「实测」与日期，与文档来源列里的官方链接区分开。
+`#1`（私钥编码）与 `#5`（链形状）的结论进 §2.2 的「仅支持 PEM 编码」那一行；`#4`（Name 字符集）进 `UploadUserCertificate` 那一行；`#13` 的真实重名错误码进同一行。每条都注明「实测」与日期，与文档来源列里的官方链接区分开。
 
 - [ ] **Step 4: 回填代码注释**
 
@@ -3064,21 +3240,44 @@ make test-integration          # 无凭证时应全部 skip 且 exit 0
 ./bin/kustomize build config/default   > /dev/null && echo "OK config/default"
 ./bin/kustomize build config/crd       > /dev/null && echo "OK config/crd"
 ./bin/kustomize build config/overlays/openshift > /dev/null && echo "OK overlay"
-make manifests generate && git status --porcelain && echo "OK 生成物幂等"
+make manifests generate
+git status --porcelain config/crd/bases api/v1alpha1/zz_generated.deepcopy.go config/rbac/role.yaml
 go mod tidy -diff && echo "OK go.mod tidy"
 ```
 
-Expected: 每一条 exit 0；`git status --porcelain` 无输出（生成物幂等，没被手改）。
+Expected: 每一条 exit 0；`git status --porcelain` 那一行**限定在三处生成物路径上**，必须无输出（生成物幂等，没被手改）。**不要去掉这个作用域**：这一步跑在 Step 8 提交之前，工作区里必然还有 Step 2–5 的未提交改动，无作用域的 `git status --porcelain` 一定有输出，断言会恒假。作用域与 Task 10 Step 11 的写法一致。
+
+再重跑一次 Task 10 Step 8 的指标存在性脚本（Plan 2 此时已经合并）：
+
+```bash
+for m in aliyuncert_certificate_not_after_timestamp_seconds \
+         aliyuncert_binding_applied_age_seconds \
+         aliyuncert_certificate_ready \
+         aliyuncert_certmanager_certificate_recreated_total \
+         aliyuncert_cleanup_abandoned_total; do
+  grep -q "$m" internal/controller/metrics.go && echo "OK   $m" || echo "MISS $m"
+done
+```
+
+Expected: **五行全部 `OK`**（Task 10 执行时 `aliyuncert_binding_applied_age_seconds` 还是 `MISS`，Plan 2 合并后它必须转绿）。把这个结果 `Record` 进 ledger；仍是 `MISS` 说明 Plan 2 没有真的合进来，停下来先查。
 
 - [ ] **Step 7: 最后确认仓库里没有凭证**
 
+扫描范围限定在 **`git ls-files` 里的源码与清单**，排除 `docs/`、`go.sum`、`*.md`、`.superpowers/`：
+
 ```bash
-grep -rniE "LTAI[0-9A-Za-z]{8,}|accessKeySecret: *[^R\"' ]|BEGIN [A-Z ]*PRIVATE KEY" \
-  --exclude-dir=.git --exclude-dir=bin . || echo "无凭证残留"
+git ls-files -z \
+  | grep -zvE '^(docs/|\.superpowers/)|(^|/)go\.sum$|\.md$' \
+  | xargs -0 -r grep -lnE 'LTAI[0-9A-Za-z]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----' \
+  || echo "无凭证残留"
 git check-ignore -v local.env 2>/dev/null || echo "注意：local.env 未被忽略，检查 .gitignore"
 ```
 
 Expected: 打印 `无凭证残留`；`local.env`（若存在）被 `.gitignore` 的 `*.env` 命中。
+
+**这一步的验收要求是双向的**：干净树上必须为绿（打印 `无凭证残留`），而真实 AK 或 PEM 私钥出现时必须为红。两个方向都要自己验一遍——把一行 `LTAI` 开头的 12 位以上假 AK 临时写进某个 `.go` 文件再跑一次，脚本必须报出那个文件，确认后删掉。**一个永远为红的扫描等于没有扫描**：执行者会习惯性忽略它，反而削弱了「仓库不许有凭证」这条约束；所以排除项写成上面这样，而不是扫全仓库。
+
+若 `pkg/aliyun/credentials.go` 仍被命中，**先确认那一行只是注释或常量名**（例如 `LTAI` 前缀的说明文字），再针对性地排除掉那一处，并在 ledger 里记一条说明为什么排除。不要因为「反正是误报」就把整个 `pkg/` 排除掉。
 
 - [ ] **Step 8: 提交**
 
@@ -3118,9 +3317,11 @@ git commit -m "docs: backfill real-cloud integration findings into the spec and 
 | §12.3 #10 FC3 频控与错误码 | 8 |
 | §12.3 #11 cert-manager Secret 注解 | 7 |
 | §12.3 新增 #12 `Keyword` 通配符、#13 重名错误码 | 6、5；表本身在 9 Step 5 补 |
+| §12.3 新增 FC3 三条（`GetCustomDomain` NotFound 码、限流码是否 `Throttling` 前缀、`CertConfig` 对 PKCS#1/EC 与 LE 链形状） | 8（探测并 `Record`）；表本身在 9 Step 7 补 |
+| §7 Provider 接口第三形参 `Credentials` → `Client`；§10.2 Binding 侧新增 `ObserveFailed` | 9 Step 7（从 Plan 2 移交） |
 | §12.3「结论写入代码注释」 | 14 |
 | §13 威胁模型 | 13 Step 4 |
-| §14 已知限制 1–6 + 新增 7（CASName 无 namespace）、8（EventRecorder 弃用）、9（Plan 2 范围） | 9 Step 6（spec）、13 Step 5（README） |
+| §14 已知限制 1–6 + 新增 7（CASName 无 namespace）、8（EventRecorder 弃用） | 9 Step 6（spec）、13 Step 5（README；README 侧再补 FC3 无 `endpointOverride`、Keyword 通配符、`--watch-namespaces` 仲裁退化、`cleanup_abandoned_total{reason}` 两套词表四条） |
 | §15 未来演进（新 provider、RRSA、defaulting webhook、v1beta1） | 13 Step 5 的第 7 条已写「引入 `ReferencesCertByID` provider 前重新评估」；README 不单列演进章节，避免与 spec 重复 |
 
 ### Plan 1 ledger / 最终评审的延后项归属
@@ -3145,9 +3346,9 @@ git commit -m "docs: backfill real-cloud integration findings into the spec and 
 ### 依赖 Plan 2 的任务
 
 - **Task 8 全部**：需要 Plan 2 的 FC3 client（`GetCustomDomain` / `UpdateCustomDomain`）与 `CustomDomain` / `UpdateCustomDomainInput` 类型，以及它引入的 `github.com/alibabacloud-go/fc-20230330/v4`。Plan 2 未合并时跳过本 Task 并在 ledger 记 blocked。
-- **Task 10 Step 8**：`aliyuncert_binding_applied_age_seconds` 由 Plan 2 注册，告警规则先就位。
-- **Task 13 Step 2 与 Step 8**：README 的指标表里 5 个 binding 指标标注为 Plan 2 交付；验证脚本对它们期望输出 `PLAN2` 而非 `OK`。
-- **Task 13 Step 5 第 9 条**：README 必须明说 Binding controller 尚未交付，创建 Binding 不会有任何 reconcile。
+- **Task 10 Step 8**：`aliyuncert_binding_applied_age_seconds` 由 Plan 2 注册；Task 10 执行时 Plan 2 尚未合并，Expected 保持 `MISS`，告警规则先就位。Task 14 Step 6 在合并 Plan 2 之后重跑同一段脚本，期望五行全部 `OK` 并 `Record`。
+- **Task 12 与 Task 13 的 README 口径**：这两个 Task 在 **Plan 2 已合并**的前提下执行（ledger P3-R14 的 phase 2 尾段）。绑定 controller 写成已交付；架构图无「Plan 2」标注；`--drift-check-interval` 写成由绑定 controller 消费；指标表的 5 个 binding 指标不标 `PLAN2`，Task 13 Step 8 的验证脚本对它们期望 `OK`；原「已知限制」第 9 条（Binding 未交付）删除；Binding 字段表含 `status.cleanupStartedAt` 等 Plan 2 新增字段，以合并后的 `api/v1alpha1` 为准。
+- **Task 10 的 `prometheusrule.yaml`**：注释只写中性说明，**不写**「Plan 2 合并之前永不触发」这类带时序假设的话。
 
 ### 执行者现场核实清单
 
@@ -3157,7 +3358,7 @@ git commit -m "docs: backfill real-cloud integration findings into the spec and 
 2. **Task 7 Step 3 的 `go mod tidy` 结果**：`k8s.io/client-go/tools/clientcmd` 可能已经被间接引入。只允许 direct/indirect 标记变化，不允许 require 列表出现新 module 路径。
 3. **Task 8 Step 1 的 FC3 接口签名**：必须以 Plan 2 合并后的真实代码为准，不要照抄本计划的假设签名。
 4. **Task 7 的集群前提**：目标集群必须装了 cert-manager v1.21.x，且已 `kubectl apply -k config/crd`（`#6` 要创建真实的 `AliyunCertificate` 当 ownerRef 的目标）。
-5. **Task 10 Step 1 的 18 个 `kind:`**：如果 Plan 2 往 `config/rbac` 里加了新的 Role，这个数字会变。判据是 Step 4 的 `diff` 为空，不是数字相等。
+5. **Task 10 Step 1 的 19 个 `kind:`**：如果 Plan 2 往 `config/rbac` 里加了新的 Role，这个数字会变。判据是 Step 4 的 `diff` 为空，不是数字相等。
 6. **Task 6 的 `ALIYUN_CAS_REGION_ALT`**：必须选一个在 SDK 的 `EndpointMap` 里有独立 endpoint 的 region（`ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `me-central-1` / `ap-south-1` / `me-east-1`）。选中国区任一 region 都会映射到同一个 `cas.aliyuncs.com`，测不出任何东西。
 7. **Task 11 的 `repoURL`**：三个 Application 里写的是 `https://git.dev.bestheme.ac.cn/infra/le-to-alicloud.git`。如果实际仓库地址不同，三处一起改。
 8. **Task 14 Step 1 的分支**：没有真实凭证时**不许伪造结论**，走「未实测」分支并在 ledger 记下。
