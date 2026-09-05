@@ -64,8 +64,15 @@ func TestCASPKCS8KeyOutcome(t *testing.T) {
 	}
 }
 
-// TestCASRejectsEncryptedKey：加密私钥必须被拒。operator 侧 pki.ParseBundle 已经
-// 拦在前面，这一项确认云侧也是同样立场（万一有人绕过 operator 手工上传）。
+// TestCASRejectsEncryptedKey：上传一个带 Proc-Type: 4,ENCRYPTED 头的私钥块，确认
+// 云侧也拒（operator 侧 pki.ParseBundle 已经拦在前面，这一项防的是有人绕过 operator
+// 手工上传）。
+//
+// 结论的边界必须说清楚：testutil.Encrypted 的 body 是字面量 not-a-real-key、不是可解析
+// 的 DER，而且这里的 certPEM 来自另一把钥匙，证书与私钥本就不配对。所以这一项能证明的
+// 只是「带 ENCRYPTED 头的垃圾 key body 被拒，且格式校验先于配对校验」，**不能**证明
+// 「CAS 会解析并拒绝一个格式良好的加密私钥」。下面那道 NotMatch 断言就是在守这条边界：
+// 一旦 CAS 先报配对不上，这次上传连「格式校验先行」都证明不了，不该记成 key-format 结论。
 func TestCASRejectsEncryptedKey(t *testing.T) {
 	cred, region := requireCAS(t, "#1", q1)
 	c := newCAS(t, cred, region)
@@ -74,14 +81,24 @@ func TestCASRejectsEncryptedKey(t *testing.T) {
 
 	certID, err := uploadForTest(t, c, itName(t, "enc"), certPEM, testutil.Encrypted(t), randToken(t))
 	result, detail := outcome(certID, err)
-	Record(t, "#1", q1+"（加密私钥）", result, detail)
+	Record(t, "#1", q1+"（带 Proc-Type: 4,ENCRYPTED 头的私钥块）", result, detail)
 	if err == nil {
-		t.Fatalf("CAS 接受了加密私钥（certId=%d），与 spec §2.2 的记载不符", certID)
+		t.Fatalf("CAS 接受了带 ENCRYPTED 头的私钥块（certId=%d），与 spec §2.2 的记载不符", certID)
+	}
+	var ae *aliyun.Error
+	if asAliyunError(err, &ae) && ae.Code == "NotMatch.CertificateAndPrivateKey" {
+		t.Fatalf("CAS 先做了证书/私钥配对校验（code=%s），这次上传证明不了私钥格式校验的立场", ae.Code)
 	}
 }
 
-// TestCASAcceptsLeafPlusIntermediate：LE 的链就是 leaf + intermediate、不含 root，
-// 这是生产上唯一会出现的形状。testutil 的 CA 在这里扮演 intermediate。
+// TestCASAcceptsLeafPlusIntermediate：上传「leaf + 其签发 CA」两块，确认 CAS 接受
+// 多块链。
+//
+// 标签必须如实：testutil.NewCA 是自签的（CreateCertificate(tmpl, tmpl)、IsCA: true），
+// 尽管它的 CN 写着 "Test Intermediate CA"，第二块实际上是一张 root，**不是** LE 那种
+// 在锚点前就终止的 leaf+intermediate。所以这一项只证明「两块链可用」。
+// 「LE 的 leaf+intermediate 形状（无 root）可用」这个结论要由本项与 TestCASLeafOnly
+// 联合推出：leaf-only 都能过，说明 CAS 对链锚点没有任何要求。
 func TestCASAcceptsLeafPlusIntermediate(t *testing.T) {
 	cred, region := requireCAS(t, "#5", q5)
 	c := newCAS(t, cred, region)
@@ -93,7 +110,7 @@ func TestCASAcceptsLeafPlusIntermediate(t *testing.T) {
 
 	certID, err := uploadForTest(t, c, itName(t, "chain"), certPEM, keyPEM, randToken(t))
 	result, detail := outcome(certID, err)
-	Record(t, "#5", q5+"（leaf+intermediate，无 root）", result, detail)
+	Record(t, "#5", q5+"（leaf + 其签发 CA，两块）", result, detail)
 	if err != nil {
 		t.Fatalf("CAS 拒绝了 leaf+intermediate，这是 LE 的标准形状: %v", err)
 	}
