@@ -19,5 +19,22 @@ jobs:
 
       - name: Running Tests
         run: |
-          go mod tidy
+          go mod tidy -diff
           make test
+
+  test-race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Running Tests with race detector
+        run: |
+          go mod tidy -diff
+          make test-race
