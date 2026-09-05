@@ -43,15 +43,37 @@ func TestHarnessSplitJoinRoundTrip(t *testing.T) {
 	}
 }
 
-// TestHarnessScrubRemovesSecrets 验证报告器不会把凭证写进 RESULTS.md。
+// TestHarnessScrubRemovesSecrets 验证报告器不会把凭证写进日志与 RESULTS.md。
+//
+// 用 t.Setenv 造假值而不是读真凭证：这是本计划后果最严重的失败模式（AK/SK 泄漏进
+// 提交物）的唯一防线，它必须在每一次 CI 与本机运行里都真的被执行过一遍，而不是在
+// 没有凭证的机器上悄悄 skip 掉。t.Setenv 会在用例结束时自动还原。
 func TestHarnessScrubRemovesSecrets(t *testing.T) {
-	secret := env(EnvAccessKeySecret)
-	if secret == "" {
-		t.Skip("未设置 " + EnvAccessKeySecret + "，无可抹内容")
+	const (
+		fakeID     = "FAKE-AK-ID-FOR-SCRUB-TEST"
+		fakeSecret = "FAKE-SECRET-FOR-SCRUB-TEST"
+		fakeToken  = "FAKE-STS-TOKEN-FOR-SCRUB-TEST"
+	)
+	t.Setenv(EnvAccessKeyID, fakeID)
+	t.Setenv(EnvAccessKeySecret, fakeSecret)
+	t.Setenv(EnvSecurityToken, fakeToken)
+
+	// 断言刻意不打印 got：它在失败时正含着未被抹掉的凭证。
+	got := scrub("SDK 回显了请求参数：id=" + fakeID + " secret=" + fakeSecret + " token=" + fakeToken + "（结束）")
+	for name, v := range map[string]string{
+		EnvAccessKeyID:     fakeID,
+		EnvAccessKeySecret: fakeSecret,
+		EnvSecurityToken:   fakeToken,
+	} {
+		if strings.Contains(got, v) {
+			t.Fatalf("scrub 没有抹掉 %s", name)
+		}
 	}
-	got := scrub("错误文本里混进了 " + secret + " 这一段")
-	if strings.Contains(got, secret) {
-		t.Fatal("scrub 没有抹掉 accessKeySecret")
+	if !strings.HasSuffix(got, "（结束）") {
+		t.Fatal("凭证之外的文本被吞掉了")
+	}
+	if n := strings.Count(got, "***"); n != 3 {
+		t.Fatalf("期望 3 个 *** 占位符，得到 %d", n)
 	}
 }
 
@@ -89,6 +111,27 @@ func TestHarnessScrubRedactsPrivateKey(t *testing.T) {
 			}
 		})
 	}
+
+	// 截断块：有 BEGIN、没有配对的 END。云 SDK 对超长参数常做截断，回显出来的请求体
+	// 恰好是这个形状，而只认配对块的正则对它一个字符都不会抹——这是 redactTruncatedKeys
+	// 存在的全部理由。
+	t.Run("BEGIN 无 END", func(t *testing.T) {
+		lines := strings.Split(strings.TrimSpace(string(ecKey)), "\n")
+		truncated := strings.Join(lines[:len(lines)-1], "\n") // 砍掉 END 行
+		body := lines[len(lines)-2]
+		const prefix = "SDK 回显了被截断的请求参数："
+
+		got := scrub(prefix + truncated)
+		if strings.Contains(got, body) {
+			t.Fatal("scrub 没有抹掉截断私钥块的正文")
+		}
+		if !strings.Contains(got, redactedKey) {
+			t.Fatal("截断私钥块没有被替换成占位符")
+		}
+		if !strings.HasPrefix(got, prefix) {
+			t.Fatal("截断块之前的正常文本被吞掉了")
+		}
+	})
 
 	// 一段文本里有多个私钥块时，必须逐块替换，而不是从第一个 BEGIN 吞到最后一个 END。
 	two := scrub(string(ecKey) + "中间这段要留下" + string(rsaKey))

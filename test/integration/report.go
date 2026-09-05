@@ -29,20 +29,30 @@ var (
 )
 
 // Record 登记一条结论。result 与 detail 都要经 scrub——RESULTS.md 是要提交进
-// 仓库的，绝不能夹带 AK/SK。
+// 仓库的，绝不能夹带 AK/SK 或私钥。
+//
+// scrub 必须在 t.Logf 之前完成：Makefile 的 test-integration 带 -v，这条日志
+// 用例 PASS 也照打，日志与 RESULTS.md 是同一档约束（「绝不出现在日志、event、
+// status、error message、测试报告中」）。只护住落盘的那一份等于漏了一半。
 func Record(t *testing.T, id, question, result, detail string) {
 	t.Helper()
+	result, detail = scrub(result), scrub(detail)
 	t.Logf("[%s] %s => %s (%s)", id, question, result, detail)
 	findingsMu.Lock()
 	defer findingsMu.Unlock()
 	findings = append(findings, finding{
-		ID: id, Question: question, Result: scrub(result), Detail: scrub(detail),
+		ID: id, Question: question, Result: result, Detail: detail,
 	})
 }
 
 // RecordSkip 登记一条「未实测」并 skip 当前用例。它不返回。
+//
+// why 同样要过 scrub：它落进的是与 Record 相同的 Detail 字段、同一份 RESULTS.md，
+// 并且会经 t.Skip 进入测试日志。调用方写出 "探测失败: "+err.Error() 是完全自然的，
+// 那串 error 里可能带着回显的请求参数。
 func RecordSkip(t *testing.T, id, question, why string) {
 	t.Helper()
+	why = scrub(why)
 	findingsMu.Lock()
 	findings = append(findings, finding{
 		ID: id, Question: question, Result: "未实测", Detail: why, Skipped: true,
@@ -57,9 +67,27 @@ func RecordSkip(t *testing.T, id, question, why string) {
 var privateKeyBlock = regexp.MustCompile(
 	`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`)
 
+// beginKeyMarker 只匹配一条私钥的 BEGIN 行，用于兜底截断块。
+var beginKeyMarker = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)
+
 // redactedKey 是私钥块被抹掉后留下的占位符。留一个可见的记号而不是删成空白，
 // 是为了让读报告的人知道「这里原本有过一段私钥」，而不是以为证据缺了一块。
 const redactedKey = "[REDACTED PRIVATE KEY]"
+
+// redactTruncatedKeys 是私钥兜底的第二道：privateKeyBlock 跑完之后仍然残留的 BEGIN，
+// 一定是没有配对 END 的截断块——云 SDK 对超长参数常做截断，回显出来的请求体恰好就是
+// 这个形状，而只认配对块的正则对它一个字符都不会抹。
+//
+// 残块从它的 BEGIN 一直算到下一个 BEGIN 之前、或字符串结尾。宁可多抹一段正常文本，
+// 也不能让半截私钥漏进日志与 RESULTS.md。
+func redactTruncatedKeys(s string) string {
+	locs := beginKeyMarker.FindAllStringIndex(s, -1)
+	if len(locs) == 0 {
+		return s
+	}
+	// 首个 BEGIN 之前的文本是安全的；从它开始，每个残块折成一个占位符。
+	return s[:locs[0][0]] + strings.Repeat(redactedKey, len(locs))
+}
 
 // scrub 把凭证明文与私钥从报告里抹掉。云 SDK 的错误文本偶尔会回显请求参数，而探针
 // 手里真的握着私钥，这一层是「报告绝不含凭证与私钥」这条约束唯一的执行点。
@@ -72,7 +100,8 @@ func scrub(s string) string {
 			s = strings.ReplaceAll(s, v, "***")
 		}
 	}
-	return privateKeyBlock.ReplaceAllLiteralString(s, redactedKey)
+	s = privateKeyBlock.ReplaceAllLiteralString(s, redactedKey)
+	return redactTruncatedKeys(s)
 }
 
 // resultsFile 相对 cwd；go test 的 cwd 就是包目录。
@@ -137,7 +166,7 @@ func writeResults() error {
 	b.WriteString("| # | 待核实 | 结论 | 证据 |\n|---|---|---|---|\n")
 	for _, f := range findings {
 		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
-			f.ID, mdCell(f.Question), mdCell(f.Result), mdCell(f.Detail))
+			mdCell(f.ID), mdCell(f.Question), mdCell(f.Result), mdCell(f.Detail))
 	}
 	return os.WriteFile(resultsFile, []byte(b.String()), 0o644)
 }

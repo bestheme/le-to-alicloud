@@ -61,7 +61,7 @@ linters:
       # 而合并成表驱动反而让「哪一项失败了」在输出里看不清
       - linters:
           - dupl
-        path: _test\.go
+        path: test/integration/
       # 脚手架期的临时豁免：test/integration/ 的探针 helper（requireCAS / newCAS /
       # uploadForTest / outcome 等）调用方要到 Task 4–8 才出现，而 unused 做的是从
       # 测试函数与导出标识符出发的可达性分析，整条链会一起被判死。
