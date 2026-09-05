@@ -25,6 +25,14 @@ spec:
     automated:
       # 这里可以开 prune：本 Application 只管 operator 自己的部署件，
       # 删掉它们不会波及 CR，也不会触发任何 finalizer 去动云上的资源。
+      #
+      # 该断言有一个前提，必须写出来：本 Application 的资源里包含
+      # Namespace/le-to-alicloud-system，它也在 prune 范围内——prune 掉一个
+      # namespace 会带走里面的一切。所以前提是 **le-to-alicloud-system 里不放任何
+      # AliyunCertificate / AliyunCertificateBinding，也不放凭证 Secret**：
+      # 它们住在使用者自己的业务 namespace（凭证 Secret 必须与引用它的 CR 同
+      # namespace，见 application-credentials.yaml.example）。若违反这个前提，
+      # 这里的 prune: true 就会变成一条通往云上孤儿证书的路径。
       prune: true
       selfHeal: true
     syncOptions:
@@ -32,6 +40,13 @@ spec:
       - CreateNamespace=true
   ignoreDifferences:
     # 两个 CR 的 status 由 operator 写，Argo 不该把它当 drift。
+    #
+    # 但请注意：**本 Application 一个 CR 都不含**（它只有 RBAC / SA / Service /
+    # Namespace / Deployment / ServiceMonitor / PrometheusRule），所以下面这两条在
+    # 这里是空转的。它们真正的归属是**管理 AliyunCertificate 的那个 Application**
+    # ——也就是使用者放自己业务 CR 的那份清单。保留在这里是当模板用：抄走这份文件
+    # 去写 CR Application 的人不会漏掉这一段，漏掉的后果是 Argo 把 operator 写的
+    # status 当成 drift、配合 selfHeal 无限 sync。
     - group: certs.bestheme.ac.cn
       kind: AliyunCertificate
       jsonPointers:
