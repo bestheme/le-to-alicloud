@@ -860,4 +860,6 @@ make kustomize && ./bin/kustomize build config/default | grep -c "^kind: CustomR
 
 ## License
 
+Copyright 2026 Hangzhou Yunqi Intelligence Technology Co., Ltd.
+
 Apache License 2.0，与各源文件头部的许可声明一致。全文见 [LICENSE](LICENSE)。完整条款见 <https://www.apache.org/licenses/LICENSE-2.0>。
