@@ -11,7 +11,12 @@ import (
 )
 
 // ErrDuplicateName 模拟 CAS 的同名拒绝。
-var ErrDuplicateName = &aliyun.Error{Class: aliyun.ClassPermanent, Op: "Upload", Code: "CertNameDuplicated", Err: errors.New("name already exists")}
+var ErrDuplicateName = &aliyun.Error{
+	Class: aliyun.ClassPermanent,
+	Op:    "Upload",
+	Code:  "CertNameDuplicated",
+	Err:   errors.New("name already exists"),
+}
 
 // Cert 是 fake 中的一张证书。
 type Cert struct {
@@ -102,7 +107,13 @@ func (f *CAS) Upload(_ context.Context, name string, certPEM, keyPEM []byte, tok
 	}
 	f.nextID++
 	id := f.nextID
-	f.certs[id] = Cert{ID: id, Name: name, CertPEM: append([]byte(nil), certPEM...), KeyPEM: append([]byte(nil), keyPEM...), Token: token}
+	f.certs[id] = Cert{
+		ID:      id,
+		Name:    name,
+		CertPEM: append([]byte(nil), certPEM...),
+		KeyPEM:  append([]byte(nil), keyPEM...),
+		Token:   token,
+	}
 	if token != "" {
 		f.byToken[token] = id
 	}

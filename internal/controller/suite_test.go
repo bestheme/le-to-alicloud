@@ -65,12 +65,11 @@ var (
 // currentCAS 让每个测试可以替换 fakeCAS 而 manager 无需重启。
 func currentCAS() *fake.CAS { fakeMu.Lock(); defer fakeMu.Unlock(); return fakeCAS }
 
-// resetCAS 换上一个全新的 fake，返回它以便用例直接断言。
-func resetCAS() *fake.CAS {
+// resetCAS 换上一个全新的 fake，用例随后用 currentCAS() 取。
+func resetCAS() {
 	fakeMu.Lock()
 	defer fakeMu.Unlock()
 	fakeCAS = fake.NewCAS()
-	return fakeCAS
 }
 
 // newNamespace 为每个用例创建独立 namespace，避免资源名冲突。

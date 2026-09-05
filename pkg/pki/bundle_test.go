@@ -104,7 +104,8 @@ func TestBundle_CertPEM_Normalized(t *testing.T) {
 	ca := testutil.NewCA(t)
 	certPEM, keyPEM := testutil.IssueLeaf(t, ca, "a.example.com")
 	// 人为加入空行与注释，规范化后必须消失
-	dirty := append([]byte("# bundle comment\n\n"), bytes.ReplaceAll(certPEM, []byte("-----END CERTIFICATE-----\n"), []byte("-----END CERTIFICATE-----\n\n"))...)
+	spaced := bytes.ReplaceAll(certPEM, []byte("-----END CERTIFICATE-----\n"), []byte("-----END CERTIFICATE-----\n\n"))
+	dirty := append([]byte("# bundle comment\n\n"), spaced...)
 	b, err := pki.ParseBundle(dirty, keyPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +213,7 @@ func TestBundle_FormatRedactsPrivateKey(t *testing.T) {
 			case *rsa.PrivateKey:
 				d = k.D
 			case *ecdsa.PrivateKey:
-				d = k.D
+				d = k.D //nolint:staticcheck // 只读取标量做泄漏断言，不修改私钥
 			default:
 				t.Fatalf("意外的 Signer 类型 %T", b.Signer)
 			}

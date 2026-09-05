@@ -104,7 +104,8 @@ func registerOperatorFlags(fs *flag.FlagSet) *operatorOptions {
 
 // validate 在 Parse 之后校验并展开派生字段。
 func (o *operatorOptions) validate() error {
-	if o.CleanupFailurePolicy != controller.CleanupPolicyAbandon && o.CleanupFailurePolicy != controller.CleanupPolicyBlock {
+	if o.CleanupFailurePolicy != controller.CleanupPolicyAbandon &&
+		o.CleanupFailurePolicy != controller.CleanupPolicyBlock {
 		return fmt.Errorf("--cleanup-failure-policy 必须是 Abandon 或 Block，得到 %q", o.CleanupFailurePolicy)
 	}
 	o.WatchNamespaces = nil

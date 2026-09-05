@@ -36,6 +36,25 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # 测试与测试辅助包里的重复字面量是被测数据，不是待抽取的常量
+      - linters:
+          - goconst
+        path: (_test\.go|/testutil/)
+      # 脚手架生成的 SchemeBuilder：controller-runtime 已弃用，但这一行由 operator-sdk 生成
+      - linters:
+          - staticcheck
+        path: api/v1alpha1/groupversion_info.go
+        text: "SA1019"
+      # 迁移到 events.EventRecorder 会改动全部 12 个事件调用点并要求补 action 参数，
+      # 属于行为变更，不在 lint 清理的范围内；见 README「已知限制」
+      - linters:
+          - staticcheck
+        text: "SA1019.*GetEventRecorderFor"
+      # 集成探针的 Record(t, id, question, result, detail) 天然是长参数列表，
+      # 折行只会让「哪一项在记什么」更难读；Task 3 建的 test/integration/ 整目录豁免 lll
+      - linters:
+          - lll
+        path: test/integration/
     paths:
       - third_party$
       - builtin$

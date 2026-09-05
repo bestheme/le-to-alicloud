@@ -155,7 +155,7 @@ func uploadToken(uid types.UID, fingerprint string, startedAt time.Time) string 
 // 分属两个不同版本，算出来的差异可能只含嵌套对象的部分字段，拼出一个缺 notBefore /
 // notAfter / uploadedAt 的残缺 CertificateGeneration。
 func (r *AliyunCertificateReconciler) refreshUploadState(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate) error {
-	reader := client.Reader(r.APIReader)
+	reader := r.APIReader
 	if reader == nil {
 		reader = r.Client
 	}
