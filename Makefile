@@ -232,6 +232,35 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
+# undeploy-safe 存在的理由：直接跑 undeploy 会造成云上孤儿。
+#
+# undeploy 把 config/default 整个流交给 kubectl delete，而 Namespace/le-to-alicloud-system
+# 是这个流里的**第一个**对象——operator 先被拆掉，随后 CRD 被删、apiserver 级联删光所有
+# CR，而这些 CR 都带 finalizer、已经没有 operator 去执行它们。结果是 CR 与 CRD 双双卡在
+# Terminating，CAS 上的证书与 FC3 上的绑定原样留着，正是整份 README 拼命在防的结局。
+#
+# 唯一安全的顺序是：operator 还活着的时候先删 CR、等 finalizer 把云侧清理跑完，再拆 operator。
+# 第 2 步的残留检查是硬闸：CR 没删干净就 exit 1，绝不带着孤儿风险往下走。
+CLEANUP_TIMEOUT ?= 5m
+CR_TYPES := aliyuncertificatebindings.certs.bestheme.ac.cn,aliyuncertificates.certs.bestheme.ac.cn
+
+.PHONY: undeploy-safe
+undeploy-safe: kustomize ## Delete all CRs first (finalizers do the cloud cleanup), then undeploy. Use this instead of undeploy.
+	@echo ">>> 1/3 删除全部 Binding 与 Certificate（operator 仍在运行，finalizer 会去清理云侧）"
+	-$(KUBECTL) delete aliyuncertificatebindings.certs.bestheme.ac.cn --all --all-namespaces --wait --timeout=$(CLEANUP_TIMEOUT)
+	-$(KUBECTL) delete aliyuncertificates.certs.bestheme.ac.cn --all --all-namespaces --wait --timeout=$(CLEANUP_TIMEOUT)
+	@echo ">>> 2/3 确认没有 CR 残留"
+	@n=$$($(KUBECTL) get $(CR_TYPES) --all-namespaces --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$n" != "0" ]; then \
+	  echo "!!! 仍有 $$n 个 CR 没删干净，说明 finalizer 还没跑完（或正卡在云侧清理上）。"; \
+	  echo "!!! 现在继续拆 operator 一定会留下云上孤儿，所以停在这里。"; \
+	  echo "!!! 排查见 README「故障排查」；确认可以放弃云侧清理时，把 operator 的"; \
+	  echo "!!! --cleanup-failure-policy 设为 Abandon（默认就是），等 --cleanup-grace-period 走完。"; \
+	  exit 1; \
+	fi
+	@echo ">>> 3/3 CR 已清空，拆掉 operator 与 CRD"
+	$(MAKE) undeploy
+
 ##@ Dependencies
 
 ## Location to install dependencies to

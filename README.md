@@ -25,7 +25,7 @@ flowchart LR
     AC --> CC[证书 controller]
     CC -->|owns| CM[cert-manager Certificate]
     CM -->|签发| SEC[(TLS Secret)]
-    CC -->|APIReader 直读，不缓存| SEC
+    CC -->|Client 读，Secret 已 DisableFor 等同直读| SEC
     CC -->|UploadUserCertificate<br/>DeleteUserCertificate<br/>ListUserCertificateOrder| CAS[(阿里云 CAS)]
     U -->|创建| AB[AliyunCertificateBinding]
     AB --> BC[绑定 controller]
@@ -84,7 +84,7 @@ oc get crd prometheusrules.monitoring.coreos.com servicemonitors.monitoring.core
 |---|---|---|---|
 | `deploy/argocd/root-application.yaml` | `deploy/argocd` 目录本身（app-of-apps 根） | — | 关 |
 | `deploy/argocd/application-crds.yaml` | `config/crd` | -2 | 关（prune CRD 会级联删除所有 CR） |
-| `deploy/argocd/application-credentials.yaml.example` | 你自己的密钥仓库 | -1 | 关 |
+| `application-credentials.yaml`（由 `…yaml.example` 复制而来，见下文第 3 步；带 `.example` 后缀的模板本身不会被 Argo 同步） | 你自己的密钥仓库 | -1 | 关 |
 | `deploy/argocd/application-operator.yaml` | `config/overlays/openshift` | 0 | 开 |
 
 **为什么必须从 `root-application.yaml` 装。** sync wave 排序的是**单次 sync 操作内部**的资源。写在 Application 对象**自身**上的 `argocd.argoproj.io/sync-wave` 注解，只有当这些 Application 本身是某个父 Application 的资源、由父应用在一次 sync 里一起下发时才会被读取。如果直接 `oc apply -f deploy/argocd/`，三个 Application 会各自独立 automated sync、并发执行，`-2` / `-1` / `0` 全是死字符串——operator 的 Deployment 可能先于 CRD 起来，controller-runtime 在 `SetupWithManager` 阶段 RESTMapper 找不到 `certs.bestheme.ac.cn/v1alpha1`，进程直接退出并 CrashLoopBackOff，直到 CRD 落地才自愈。
@@ -170,7 +170,22 @@ make kustomize && ./bin/kustomize build config/crd | grep -c "argocd.argoproj.io
 
 > `bin/` 是构建产物、被 `.gitignore` 排除，全新 clone 里没有 `./bin/kustomize`。所以本文所有用到它的命令都前置了 `make kustomize`——那个目标会在缺失时把工具下载到 `bin/`，已存在则什么都不做，重复执行是安全的。
 
-代价是将来真要删 CRD 时必须先手工摘掉这个注解——这道摩擦是有意的。
+代价是将来真要删 CRD 时必须先手工摘掉这个注解——这道摩擦是有意的。**但摘注解这一步会被 Argo 自己撤销**：`application-crds.yaml` 开了 `automated.selfHeal: true`，从活的 CRD 上删掉注解是 drift，Argo 在下一个 reconcile 周期就会把它加回来。所以顺序不能颠倒：
+
+```bash
+# 1. 先让 Argo 撒手（二选一）
+argocd app delete le-to-alicloud-crds --cascade=false      # 或
+argocd app set le-to-alicloud-crds --sync-policy=none      # 只关 auto-sync，Application 留着
+
+# 2. 再摘注解（这时不会被 selfHeal 加回来）
+kubectl annotate crd aliyuncertificates.certs.bestheme.ac.cn \
+  aliyuncertificatebindings.certs.bestheme.ac.cn \
+  argocd.argoproj.io/sync-options-
+
+# 3. 最后删 CRD——注意这会级联删光所有 CR，云侧清理是否发生取决于 operator 还活不活着
+kubectl delete crd aliyuncertificates.certs.bestheme.ac.cn \
+  aliyuncertificatebindings.certs.bestheme.ac.cn
+```
 
 ### kubectl / oc（开发与验证）
 
@@ -181,6 +196,8 @@ make docker-build docker-push IMG=registry.example.com/le-to-alicloud:v0.1.0
 make install                                   # 只装 CRD
 make deploy IMG=registry.example.com/le-to-alicloud:v0.1.0
 ```
+
+> **这条路径一条告警都没有。** `config/default/kustomization.yaml` 里 `- ../prometheus` 是注释掉的，所以 `make deploy` 装出来的东西**不含 `PrometheusRule` 与 `ServiceMonitor`**——包括「已知限制」里点名**必须配**的 `AliyunCertificateCleanupAbandoned`（没有它，`Abandon` 留下的孤儿会静默吃满账号配额）。要告警请改用 `config/overlays/openshift`（`kubectl apply -k config/overlays/openshift`，需先装 Prometheus Operator；它接了 `../prometheus`）。**不要直接 apply `config/prometheus`**：那一层没有 `namespace` 前缀转换，对象会落在字面量 `namespace: system` 里。
 
 确认 operator 起来了：
 
@@ -194,12 +211,49 @@ oc -n le-to-alicloud-system get deploy le-to-alicloud-controller-manager
 kubectl -n le-to-alicloud-system get deploy le-to-alicloud-controller-manager
 ```
 
-卸载（**会删掉全部 CR，从而触发云侧清理**——`AliyunCertificate` 的 finalizer 会去删 CAS 上的证书，`deletionPolicy: Unbind` 的 Binding 会去解绑 FC3 域名）：
+#### 卸载：**不要**直接 `make undeploy`
+
+**卸载不会触发云侧清理，反而会留下孤儿。** `make undeploy` 把 `config/default` 的整个流交给 `kubectl delete`，而 `Namespace/le-to-alicloud-system` 是这个流里的**第一个**对象（`kustomize build config/default | grep -n "^kind:"` 自己看：`Namespace` 在第 2 行、CRD 在第 11 与 233 行、`Deployment` 在第 1121 行）。于是 operator 连同它的 namespace **先**被拆掉，随后 CRD 被删、apiserver 级联删光所有 `AliyunCertificate` 与 `AliyunCertificateBinding`——而这些 CR 都带 finalizer，**已经没有 operator 去执行它们**。
+
+结果是：CR 卡在 `Terminating`，CRD 卡在 `customresourcecleanup.apiextensions.k8s.io` 后面，`kubectl delete` 挂住不返回，**CAS 上的证书与 FC3 上的绑定原样留着**。
+
+（这与上面「Argo CD 级联删除」那一节并不矛盾，两节说的是**相反**的两个场景：那里危险是因为 operator **还活着**、会真的去删云上的东西；这里危险是因为 operator **已经死了**、云上的东西没人删。）
+
+唯一安全的顺序是：**operator 还活着的时候先删 CR、等 finalizer 把云侧清理跑完，再拆 operator。** 已经封装成一个目标：
 
 ```bash
-make undeploy
-make uninstall
+make undeploy-safe    # 1) 删全部 CR → 2) 硬闸检查无残留 → 3) 才跑 undeploy
+make uninstall        # 只删 CRD；undeploy-safe 已经带 CRD 了，通常不必再跑
 ```
+
+手工做也可以，两套命令等价：
+
+```bash
+# oc
+oc delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=5m
+oc delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=5m
+oc get aliyuncertificates,aliyuncertificatebindings -A     # 必须为空再往下
+make undeploy
+```
+
+```bash
+# kubectl
+kubectl delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=5m
+kubectl delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=5m
+kubectl get aliyuncertificates,aliyuncertificatebindings -A   # 必须为空再往下
+make undeploy
+```
+
+**怎么确认 finalizer 真的跑完了、而不是放弃了。** 删 CR 时 operator 有 `--cleanup-grace-period`（默认 `15m`）的有界重试，超时后按 `--cleanup-failure-policy`（默认 `Abandon`）**放弃清理并照常删掉对象**——对象没了不等于云上干净。两个信号能区分：
+
+```bash
+# 事件：放弃清理会发 Warning，message 里带 casName
+kubectl get events -A --field-selector reason=CleanupAbandoned
+# 指标：这个计数器涨了就说明有孤儿留在云上
+#   aliyuncert_cleanup_abandoned_total
+```
+
+只要 `aliyuncert_cleanup_abandoned_total` 没涨、也没有 `Warning CleanupAbandoned` 事件，CR 又已经删干净，就说明云侧清理确实完成了。反之请拿事件里的 `casName` 去 CAS 控制台手工删除。
 
 ## CRD 参考
 
@@ -324,7 +378,9 @@ kubectl apply -f config/samples/certs_v1alpha1_aliyuncertificatebinding.yaml
 kubectl get aliyuncertificate,aliyuncertificatebinding -o wide
 ```
 
-样本里的 `AliyunCertificate` 没写 `certificateTemplate.issuerRef`，所以它依赖 operator 的 `--default-issuer-name` 已经配好；否则请在 CR 里显式写上 `issuerRef`。
+样本里的 `AliyunCertificate` 没写 `certificateTemplate.issuerRef`，所以它依赖 operator 的 `--default-issuer-name`；否则请在 CR 里显式写上 `issuerRef`。
+
+> **出厂清单已经替你填了一个值，而且是生产 issuer。** `config/manager/manager.yaml` 硬编码了 `--default-issuer-name=letsencrypt-prod --default-issuer-kind=ClusterIssuer`（见「Flags」表）。两种后果都要当心：集群上**没有** `ClusterIssuer/letsencrypt-prod` 时，样本 CR 会停在 `Issued=False` / `NoIssuer`，而那个状态**不会自动重试**、也看不出是清单里的默认值在作祟；集群上**有**的时候，apply 样本会直接开一个**真实的 Let's Encrypt 生产 order**，与本文「先用 staging 验证」的建议相冲突。请在部署前按你自己的 issuer 名改掉这两行，或者在样本 CR 里显式写 `issuerRef`。
 
 ## Flags
 
@@ -334,8 +390,8 @@ kubectl get aliyuncertificate,aliyuncertificatebinding -o wide
 
 | flag | 默认 | 说明 |
 |---|---|---|
-| `--default-issuer-name` | 空 | `spec.certificateTemplate.issuerRef` 未写、且 `status.effectiveIssuerRef` 尚未固化时使用的 Issuer 名。为空且 CR 也没写，`Issued` 会停在 `NoIssuer` |
-| `--default-issuer-kind` | `Issuer` | 默认 issuer 的 Kind |
+| `--default-issuer-name` | 代码默认空；**`config/manager/manager.yaml` 的 `args` 显式传 `letsencrypt-prod`** | `spec.certificateTemplate.issuerRef` 未写、且 `status.effectiveIssuerRef` 尚未固化时使用的 Issuer 名。为空且 CR 也没写，`Issued` 会停在 `NoIssuer`（该状态**不会自动重试**，见「故障排查」） |
+| `--default-issuer-kind` | 代码默认 `Issuer`；**清单显式传 `ClusterIssuer`** | 默认 issuer 的 Kind |
 | `--default-issuer-group` | `cert-manager.io` | 默认 issuer 的 Group |
 | `--certificate-resync-interval` | `1h` | 证书 controller 的周期 resync。**Secret 不进 cache，这是漂移检测的承重通道**——调大它等于按比例放大「Secret 被换掉但没人发现」的窗口 |
 | `--drift-check-interval` | `1h` | 绑定 controller 的周期 Observe：每隔这么久回读一次目标上实际生效的证书，发现漂移就纠正 |
@@ -728,7 +784,7 @@ config/
 ├── operator/             # ../rbac + ../manager + metrics Service，刻意不含 CRD
 ├── default/              # ../crd + ../operator，供 make deploy 与 make build-installer
 ├── prometheus/           # ServiceMonitor + PrometheusRule
-├── samples/              # 三个样本 CR，见「CRD 参考 → 上手」；手工 apply，不进上面任何一层
+├── samples/              # 三个样本：两个 CR + 一个凭证 Secret，见「CRD 参考 → 上手」；手工 apply，不进上面任何一层
 └── overlays/openshift/   # ../operator + ../prometheus，Argo CD 的 operator Application 指向这里
 ```
 
