@@ -29,7 +29,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
@@ -245,6 +250,66 @@ var _ = Describe("绑定 controller：删除", func() {
 		Expect(d.CertName).NotTo(BeEmpty())
 	})
 })
+
+// notFoundOnUpdate 造一个「读得到、写不进去」的 client：Update 一律以 NotFound 失败。
+//
+// 它复现的是删除分支上一个每次都会发生的时序：finalizer 摘掉、对象被 API server 真正
+// 删除之后，informer cache 里那份带 finalizer 的旧版本还会再唤起一轮删除，而那一轮的
+// Update 打在一个已经不存在的对象上。
+func notFoundOnUpdate(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().
+		WithScheme(factoryScheme(t)).
+		WithObjects(objs...).
+		WithStatusSubresource(&certsv1alpha1.AliyunCertificateBinding{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(_ context.Context, _ client.WithWatch, obj client.Object,
+				_ ...client.UpdateOption) error {
+				return apierrors.NewNotFound(
+					schema.GroupResource{Group: certsv1alpha1.GroupVersion.Group, Resource: "aliyuncertificatebindings"},
+					obj.GetName())
+			},
+		}).Build()
+}
+
+// 摘 finalizer 时的 NotFound 必须被吸收掉。抛上去的代价是**每一次 Binding 删除**
+// （Orphan 也不例外）都推高一次 controller_runtime_reconcile_errors_total 并打一条
+// reconciler error 日志——而那个指标正是运维配告警的地方。
+func TestFinishBindingDeletion_IgnoresNotFound(t *testing.T) {
+	b := bindingWithDomain("api.example.com")
+	b.Namespace, b.Name = "ns1", "b1"
+	b.Finalizers = []string{certsv1alpha1.FinalizerName}
+
+	r := &AliyunCertificateBindingReconciler{Client: notFoundOnUpdate(t, b.DeepCopy())}
+	res, err := r.finishBindingDeletion(context.Background(), newBindingRound(b))
+	if err != nil {
+		t.Fatalf("对象已经不在了，摘 finalizer 的目的已经达到，不该报错: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("删除收尾不该要求重排: %+v", res)
+	}
+}
+
+// 反方向：真正的写入失败（不是 NotFound）仍必须抛上去，否则 IgnoreNotFound 就成了
+// 「吞掉一切」，一个摘不掉的 finalizer 会安静地把对象永远钉在 Terminating 上。
+func TestFinishBindingDeletion_PropagatesOtherErrors(t *testing.T) {
+	b := bindingWithDomain("api.example.com")
+	b.Namespace, b.Name = "ns1", "b1"
+	b.Finalizers = []string{certsv1alpha1.FinalizerName}
+
+	boom := errors.New("etcd unavailable")
+	c := fake.NewClientBuilder().WithScheme(factoryScheme(t)).WithObjects(b.DeepCopy()).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+				return boom
+			},
+		}).Build()
+
+	r := &AliyunCertificateBindingReconciler{Client: c}
+	if _, err := r.finishBindingDeletion(context.Background(), newBindingRound(b)); !errors.Is(err, boom) {
+		t.Fatalf("非 NotFound 的写入失败必须抛上去: %v", err)
+	}
+}
 
 // TestShouldAbandonCleanup 把「还要不要继续重试解绑」的决定表死。
 //

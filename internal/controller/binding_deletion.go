@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -175,9 +176,16 @@ func (r *AliyunCertificateBindingReconciler) unbindTarget(ctx context.Context, r
 }
 
 // finishBindingDeletion 摘 finalizer 并清掉指标 series。
+//
+// NotFound 必须吸收掉。删除分支读的是 informer cache：finalizer 摘掉、对象被 API server
+// 真正删除之后，缓存里那份带 finalizer 的旧版本还会再唤起**一轮**删除（这一轮真实存在，
+// 见 binding_deletion_test.go 里的实测记录）。那一轮的这次 Update 打在一个已经不存在的
+// 对象上，返回 NotFound；把它当错误往上抛，等于**每一次 Binding 删除**（Orphan 也不例外）
+// 都推高一次 controller_runtime_reconcile_errors_total 并打一条 reconciler error 日志——
+// 而那个指标正是运维配告警的地方。对象没了，摘 finalizer 的目的已经达到。
 func (r *AliyunCertificateBindingReconciler) finishBindingDeletion(ctx context.Context, rd *bindingRound) (ctrl.Result, error) {
 	controllerutil.RemoveFinalizer(rd.b, certsv1alpha1.FinalizerName)
-	if err := r.Update(ctx, rd.b); err != nil {
+	if err := client.IgnoreNotFound(r.Update(ctx, rd.b)); err != nil {
 		return ctrl.Result{}, err
 	}
 	// 对象没了，它的 gauge 也必须跟着消失：留下的 Ready=0 会一直告警下去。
