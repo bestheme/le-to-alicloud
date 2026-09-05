@@ -128,9 +128,15 @@ func TestCASNameCharset(t *testing.T) {
 			certID, err := uploadForTest(t, c, tc.name, certPEM, keyPEM, randToken(t))
 			result, detail := outcome(certID, err)
 			if err == nil {
-				stored := cloudName(t, c, certID)
+				stored, roundTripped := cloudName(t, c, certID)
 				detail += " 云上存的名字=" + stored
-				if stored != tc.name {
+				switch {
+				case !roundTripped:
+					// 回查本身没成功（列举报错，或列举里没有这张）。这既不是「名字被
+					// 改写」也不是「往返通过」——把查不到写成被改写，会让 RESULTS.md
+					// 落下一条假结论。cloudName 已经留了红灯，这里只把话说准。
+					result += "，但云上名字未能回查（Name 往返本轮未验证）"
+				case stored != tc.name:
 					// 云静默改了名字：sanitize 一旦放宽到保留这个字符，findByName
 					// 的精确相等就会失配，认领路径又会断在同一个地方。
 					result += "，但云上名字被改写"
@@ -152,20 +158,24 @@ func TestCASNameCharset(t *testing.T) {
 //
 // 查不到或对不上都只 t.Errorf 而不 Fatal：#4 的「接受/拒绝」已经测到了，名字这一
 // 项失败不该把整条结论一起抹掉，但必须留下红灯。
-func cloudName(t *testing.T, c aliyun.CASClient, certID int64) string {
+//
+// 第二个返回值区分「回查成功」与「没查成」。两个哨兵字符串（"回查失败" / "未列出"）
+// 只供 detail 展示，**绝不能进等值比较**：它们必然不等于提交的名字，调用方若只比字符串，
+// 就会把「没查到」写成「云上名字被改写」这条假结论。
+func cloudName(t *testing.T, c aliyun.CASClient, certID int64) (string, bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
 	list, err := c.FindUploaded(ctx, testDomain())
 	if err != nil {
 		t.Errorf("回查云上名字失败，本次没能验证 Name 往返: %v", err)
-		return "回查失败"
+		return "回查失败", false
 	}
 	for _, s := range list {
 		if s.CertID == certID {
-			return s.Name
+			return s.Name, true
 		}
 	}
 	t.Errorf("FindUploaded 没列出刚上传的 certId=%d，Name 往返未验证", certID)
-	return "未列出"
+	return "未列出", false
 }

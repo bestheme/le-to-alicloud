@@ -112,7 +112,10 @@ func TestCASAcceptsLeafPlusIntermediate(t *testing.T) {
 	result, detail := outcome(certID, err)
 	Record(t, "#5", q5+"（leaf + 其签发 CA，两块）", result, detail)
 	if err != nil {
-		t.Fatalf("CAS 拒绝了 leaf+intermediate，这是 LE 的标准形状: %v", err)
+		// 夹具的第二块是本地自签的 root CA，不是 LE 的中间证书；这里只能说「leaf + 其签发
+		// CA 两块」被拒，不能说「LE 的标准形状被拒」。#5 的 LE 形状结论要靠本用例与
+		// 「仅 leaf」用例联合推出，见 spec §12.3 #5。
+		t.Fatalf("CAS 拒绝了 leaf + 其签发 CA 这种两块形状: %v", err)
 	}
 }
 

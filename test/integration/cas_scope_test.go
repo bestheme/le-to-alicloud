@@ -106,14 +106,19 @@ func TestCASUploadedInventory(t *testing.T) {
 		}
 	}
 
-	scope := "（Status 留空，不含已过期证书；配了 " + EnvResourceGroupID + " 时仅限该资源组）"
+	// 这两条是必须随结论附上的**范围限定**，不是本探针的观测：Status 留空会漏掉哪些证书
+	// 出自 SDK 的枚举语义（pkg/aliyun/cas_sdk.go），不是这里量出来的；而账号里 0 张证书时
+	// 「不含已过期证书」在构造上就无从观测。措辞必须让读者一眼看出这是推导。
+	scope := "（Status 留空，按 SDK 枚举语义**推导**应不含已过期证书；配了 " +
+		EnvResourceGroupID + " 时仅限该资源组——这两条是范围限定，非本探针的观测）"
 	if !sentinelVisible {
 		Record(t, "#8", q8,
 			"无法经 API 测得：空 Keyword 列举连刚上传的哨兵证书都不返回，不能当作账号清单",
 			"空 Keyword 返回 "+itoa(int64(len(all)))+" 条、上传哨兵后仍为 "+
 				itoa(int64(len(after)))+" 条；Keyword="+testDomain()+" 命中 "+
-				itoa(int64(len(list)))+" 张。账号总量与配额上限需在控制台"+
-				"「数字证书管理服务 → 证书管理 → 上传证书」页核对并写进 README")
+				itoa(int64(len(list)))+" 张。配额上限本探针刻意不实测（撞上限会污染账号），"+
+				"这是有意划下的边界、不是待办；要看账号总量与上限，去控制台"+
+				"「数字证书管理服务 → 证书管理 → 上传证书」页")
 		// 这条分支上空 Keyword 的清单不可信，从它算出的残留数跟着不可信，所以孤儿
 		// 泄漏检查改用 Keyword=testDomain() 那份：探针上传的证书 SAN 恒为 testDomain()，
 		// 这个口径虽窄但可信，不至于把泄漏检查整个跳过。
@@ -131,8 +136,8 @@ func TestCASUploadedInventory(t *testing.T) {
 		"哨兵证书上传后可见（条数 "+itoa(int64(len(all)))+" → "+itoa(int64(len(after)))+
 			"），说明空 Keyword 至少不是「匹配不到任何东西」；但这只证明列举包含哨兵，"+
 			"不足以证明它是账号全集。itest_ 前缀的残留 "+itoa(int64(orphans))+" 张。"+
-			"配额上限本探针不实测（撞上限会污染账号），账号总量与上限需在控制台"+
-			"「数字证书管理服务 → 证书管理 → 上传证书」页核对并写进 README")
+			"配额上限本探针刻意不实测（撞上限会污染账号），这是有意划下的边界、不是待办；"+
+			"要看账号总量与上限，去控制台「数字证书管理服务 → 证书管理 → 上传证书」页")
 	if orphans > orphanLimit {
 		t.Errorf("残留了 %d 张 itest_ 证书，registerCleanup 没有生效，先清理再继续", orphans)
 	}
@@ -218,9 +223,10 @@ func TestCASCrossRegionVisibility(t *testing.T) {
 // 它原样当 Keyword 传给 ListUserCertificateOrder。如果 CAS 不认这种 Keyword，
 // 存在性探测就会一直判「证书丢了」并反复重传。
 //
-// 四个 Keyword 是为了把几种候选匹配规则分开，而不只是否掉 DNS 通配符语义：
-// 「域名中段」既不是 SAN 字符串的前缀也不是后缀，只有子串匹配才会命中它——
-// 它是「子串匹配」与「后缀匹配」之间唯一的判别性观测。
+// 最多五个 Keyword（前三个恒有，后两个要测试域名够长才构造得出），是为了把几种候选
+// 匹配规则分开，而不只是否掉 DNS 通配符语义：「域名中段」既不是 SAN 字符串的前缀也不是
+// 后缀，只有子串匹配才会命中它——它是「子串匹配」与「后缀匹配」之间唯一的判别性观测；
+// 「标签内片段」再把「任意子串」与「按标签对齐的包含」分开。
 func TestCASKeywordWildcard(t *testing.T) {
 	cred, region := requireCAS(t, "#12", q12)
 	c := newCAS(t, cred, region)
