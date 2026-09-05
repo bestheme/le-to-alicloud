@@ -144,6 +144,16 @@ func (f *FC3) UpdateCustomDomain(_ context.Context, domain string, in *aliyun.Up
 		d.CertName = in.CertConfig.CertName
 		d.CertPEM = append([]byte(nil), in.CertConfig.CertPEM...)
 		d.KeyPEM = append([]byte(nil), in.CertConfig.KeyPEM...)
+	default:
+		// 两个都没给 = 证书保持原样。这里刻意**不**像 Protocol 那样要求显式，
+		// 二者看着对称，其实不是：读取路径会丢弃私钥（customDomainFromSDK 的存在理由），
+		// 所以调用方拿不到刚读回来的证书、无法把它原样回传。全量替换语义下「保持原样」
+		// 因此根本无法表达——要求显式在这里是个不可实现的契约，而不是更严格的契约。
+		// 何况 operator 的真实路径都不落进这一支：Apply 必定带 CertConfig，Unbind 策略下的
+		// Cleanup 必定带 ClearCert，Orphan 策略下的 Cleanup 压根不调 Update。
+		//
+		// spec §12.3：未实测（FC3 UpdateCustomDomain 是全量替换还是按字段合并语义未核实；
+		// 若为全量替换，省略 certConfig 会清掉云上证书），实测结论见 test/integration/RESULTS.md
 	}
 	// 回填体照单全收：调用方漏带就等于把它清成 nil，测试因此能抓到 read-modify-write
 	// 少读了一次的 bug。
