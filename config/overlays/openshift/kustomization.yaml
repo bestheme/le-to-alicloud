@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Argo CD 的 operator Application 指向这里。CRD 不在其中：见 config/operator 的注释。
+namespace: le-to-alicloud-system
+namePrefix: le-to-alicloud-
+
+# ../prometheus 带进来的 ServiceMonitor 与 PrometheusRule 属于本 Application，不另开
+# 第四个 Argo Application。代价是集群必须先装好 Prometheus Operator（提供
+# monitoring.coreos.com/v1 这两个 CRD），否则 sync 会失败——用 openshift overlay 时它
+# 是必需项，不是可选项。OpenShift 自带的 cluster-monitoring 已经提供了这两个 CRD。
+# 离线核对：./bin/kustomize build config/overlays/openshift
+resources:
+- ../../operator
+- ../../prometheus
+
+patches:
+- path: sync-waves.yaml
+  target:
+    kind: Deployment
+- path: openshift-scc.yaml
+  target:
+    kind: Deployment

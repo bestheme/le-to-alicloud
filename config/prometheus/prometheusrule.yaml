@@ -1,0 +1,55 @@
+# operator 的告警规则。四条覆盖四种彼此独立的失败模式，删掉任何一条都会留下盲区。
+#
+# aliyuncert_binding_applied_age_seconds 由绑定 controller 注册；
+# 该指标尚未出现时，AliyunCertificateBindingStale 对空 series 求值为空，不会误报。
+#
+# 关于 status.lastAppliedTime 为 nil：绑定 controller 有一条「采纳既有正确域名」的短路
+# 路径，它写下 appliedFingerprint 但把 lastAppliedTime 留成 nil（见 freezeApplied 的
+# wrote 分支）。这些规则一概**不读 lastAppliedTime**——applied_age 的取值来自
+# appliedFingerprint 与证书 status.current.fingerprint 的比对（appliedLag），指纹相等即
+# 为 0。所以短路采纳在这里被正确地读成「已采纳」，而不是「从未应用」，不会误报。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: le-to-alicloud
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-alerts
+  namespace: system
+spec:
+  groups:
+    - name: le-to-alicloud
+      rules:
+        # 到期。最直接的一条，但它单独不够：证书续期成功而线上没跟上，它是沉默的。
+        - alert: AliyunCertificateExpiringSoon
+          expr: aliyuncert_certificate_not_after_timestamp_seconds - time() < 7 * 86400
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "AliyunCertificate {{ $labels.namespace }}/{{ $labels.name }} 将在 7 天内过期"
+        # 新鲜度。独有的失败模式：证书续期成功，但没被推到线上。必须与上一条并存。
+        - alert: AliyunCertificateBindingStale
+          expr: |
+            aliyuncert_binding_applied_age_seconds > 86400
+              and on (namespace, name) aliyuncert_certificate_ready == 1
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "Binding {{ $labels.namespace }}/{{ $labels.name }} 上生效的证书已超过 24 小时未更新"
+        # 应恒为 0：重建 cert-manager Certificate 会消耗 Let's Encrypt 配额。
+        - alert: AliyunCertificateManagerCertRecreated
+          expr: increase(aliyuncert_certmanager_certificate_recreated_total[1d]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.name }} 的 cert-manager Certificate 被重建，会消耗 ACME 配额"
+        # Abandon 策略会在 CAS 留下孤儿证书，需要人工清理，且会吃掉账号配额。
+        - alert: AliyunCertificateCleanupAbandoned
+          expr: increase(aliyuncert_cleanup_abandoned_total[1d]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "region {{ $labels.region }} 放弃了 CAS 清理，存在需人工删除的孤儿证书"
