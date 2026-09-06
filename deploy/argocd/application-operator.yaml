@@ -17,7 +17,10 @@ spec:
     kustomize:
       images:
         # 部署前替换成真实镜像；tag 请用不可变 tag 或 digest。
-        - controller=registry.dev.bestheme.ac.cn/infra/le-to-alicloud:v0.1.0
+        # 下面这个 v0.1.0 tag 由打 `v0.1.0` git tag 触发 .github/workflows/image.yml 发布，
+        # 发布前请先 `git tag v0.1.0 && git push --tags`，否则 Argo 同步出来的 Deployment
+        # 会因为镜像不存在而 ImagePullBackOff。
+        - controller=ghcr.io/bestheme/le-to-alicloud:v0.1.0
   destination:
     server: https://kubernetes.default.svc
     namespace: le-to-alicloud-system

@@ -192,9 +192,9 @@ kubectl delete crd aliyuncertificates.certs.bestheme.ac.cn \
 不走 Argo CD 的直装路径。`make deploy` 用的是 `config/default`，它把 CRD 与 operator 聚合在一起（与 Argo CD 下两个 Application 分治的布局不同）。
 
 ```bash
-make docker-build docker-push IMG=registry.example.com/le-to-alicloud:v0.1.0
+make docker-build docker-push IMG=ghcr.io/bestheme/le-to-alicloud:v0.1.0
 make install                                   # 只装 CRD
-make deploy IMG=registry.example.com/le-to-alicloud:v0.1.0
+make deploy IMG=ghcr.io/bestheme/le-to-alicloud:v0.1.0
 ```
 
 > **这条路径一条告警都没有。** `config/default/kustomization.yaml` 里 `- ../prometheus` 是注释掉的，所以 `make deploy` 装出来的东西**不含 `PrometheusRule` 与 `ServiceMonitor`**——包括「已知限制」里点名**必须配**的 `AliyunCertificateCleanupAbandoned`（没有它，`Abandon` 留下的孤儿会静默吃满账号配额）。要告警请改用 `config/overlays/openshift`（`kubectl apply -k config/overlays/openshift`，需先装 Prometheus Operator；它接了 `../prometheus`）。**不要直接 apply `config/prometheus`**：那一层没有 namespace 变换器，对象会落在字面量 `namespace: system` 里。那个 `system` 是 kubebuilder 脚手架的占位、不是真实 namespace——引用它的入口（目前只有 `config/overlays/openshift`；`config/default` 未引用）会用 namespace 变换器把它改写成 `le-to-alicloud-system`，所以只有从该入口渲染才落对地方。
@@ -780,6 +780,21 @@ kubectl get events --field-selector "involvedObject.name=$NAME"
 | `make build-installer` | 把 `config/default` 打成单文件 `dist/install.yaml` |
 
 `make help` 会列出全部目标。
+
+### 镜像发布
+
+`.github/workflows/image.yml` 用 buildx 构建 `linux/amd64,linux/arm64` 双架构镜像并推到 `ghcr.io/bestheme/le-to-alicloud`。push 到 `main`、push `v*` tag 时推送；pull request 只构建不推送（fork 的 PR 拿不到 `packages: write`）。
+
+产出的 tag：`sha-<短 SHA>`（每次构建都有）、分支名（如 `main`）、`vX.Y.Z` 与 `X.Y`（打 `v*` tag 时），以及 `latest`（只在默认分支上）。
+
+```bash
+docker pull ghcr.io/bestheme/le-to-alicloud:main
+```
+
+两件必须知道的事：
+
+- **GHCR package 的可见性独立于仓库**，默认 private。仓库设为 public 不会让镜像变 public——所有者需要在 GitHub Packages 设置里把 `le-to-alicloud` 这个 package 单独设为 public，否则集群拉取需要配 `imagePullSecret`。
+- **`deploy/argocd/application-operator.yaml` 引用的是 `v0.1.0` tag**，它不会自动存在：先 `git tag v0.1.0 && git push --tags` 让 workflow 发布出来，Argo 才拉得到。
 
 ### 清单布局
 
