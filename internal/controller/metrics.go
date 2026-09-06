@@ -38,13 +38,14 @@ const (
 
 // crLabels 是「一个 CR 一条 series」的 label 集合。抽成变量不只是去重：它保证五个
 // 指标的 label 顺序永远一致，recordCertMetrics 里 WithLabelValues(ns, n) 才是对的。
-var crLabels = []string{"namespace", "name"}
+var crLabels = []string{labelNamespace, "name"}
 
 // 跨多个指标复用的 label 名。抽成常量与 crLabels 同理：写错一个字面量，只有到
 // WithLabelValues panic 时才会发现。
 const (
-	labelResult   = "result"
-	labelProvider = "provider"
+	labelResult    = "result"
+	labelProvider  = "provider"
+	labelNamespace = "namespace"
 )
 
 // label 集合刻意很小：绝不把 fingerprint / certId 放进 label（每次轮换都会新增永不消失的 series）。
@@ -93,7 +94,7 @@ var (
 		Name: "aliyuncert_secret_deletion_skipped_total",
 		Help: "Deletions that left the TLS Secret in place because it is not owned by " +
 			"this AliyunCertificate (cert-manager.io/certificate-name points elsewhere)",
-	}, []string{"namespace"})
+	}, []string{labelNamespace})
 	// spec §10.1 的两个 API 级指标。casUploadTotal / casDeleteTotal 只覆盖写通道，
 	// 而 ListUserCertificateOrder 才是限流最紧（QPS 8、burst 1）也最容易被 RAM 权限
 	// 卡住的那一条：没有它就没人答得上「探测是不是一直在失败」「list 配额打满没有」。
@@ -124,7 +125,7 @@ var (
 	bindingAppliedAge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "aliyuncert_binding_applied_age_seconds",
 		Help: "Seconds the target has been behind the certificate's current generation; 0 when up to date",
-	}, []string{"namespace", "name", labelProvider})
+	}, []string{labelNamespace, "name", labelProvider})
 	bindingApplyTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aliyuncert_binding_apply_total", Help: "Binding apply attempts by provider and result",
 	}, []string{labelProvider, labelResult})

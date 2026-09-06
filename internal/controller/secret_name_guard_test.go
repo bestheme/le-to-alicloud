@@ -174,7 +174,7 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 			To(Succeed(), "不属于本 CR 的 Secret 不能被删除")
 		// 跳过删除必须留下痕迹，否则私钥留在集群里这件事就无声无息了。
 		// 事件面向用户，文案逐字钉住；类型必须是 Warning。
-		Expect(acEventMessage(ctx, ns, "foreign", corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict)).
+		Expect(acWarningEventMessage(ctx, ns, "foreign", certsv1alpha1.ReasonSecretNameConflict)).
 			To(Equal(secretDeletionSkippedMessage))
 		// 事件会随 namespace 一起过期，指标才是能长期告警的那一份痕迹（同 CleanupAbandoned）。
 		Expect(promtestutil.ToFloat64(secretDeletionSkippedTotal.WithLabelValues(ns))).
