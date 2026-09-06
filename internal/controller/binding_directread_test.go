@@ -42,17 +42,20 @@ import (
 // staleReader 是一个「永远落后一拍」的 client.Reader：Get 一律返回构造时给定的那份快照，
 // 不管 API server 上已经变成什么样。它扮演的是没追上的 informer cache。
 //
-// 只覆写 Get。Reconcile 只用 APIReader 读本对象，其余（证书 CR、仲裁用的 List）照旧走
-// Client；List 直接委派下去，好让这个包装可以整个替换掉 APIReader 而不改变别的行为。
+// 只把 Binding 换成快照，别的类型与 List 一律委派给底层 reader，好让这个包装可以整个
+// 替换掉 APIReader 而不改变别的行为。今天 Reconcile 只用 APIReader 读本对象，所以别的
+// 类型走不到这里；但「走不到」不该写成「返回一个零值对象」——哪天有人给 APIReader 加了
+// 第二个读取点，静默的零值会让这条用例假绿，而委派只是把它照实读出来。
 type staleReader struct {
 	client.Reader
 	snapshot *certsv1alpha1.AliyunCertificateBinding
 }
 
-func (s staleReader) Get(_ context.Context, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+func (s staleReader) Get(ctx context.Context, key client.ObjectKey,
+	obj client.Object, opts ...client.GetOption) error {
 	b, ok := obj.(*certsv1alpha1.AliyunCertificateBinding)
 	if !ok {
-		return nil
+		return s.Reader.Get(ctx, key, obj, opts...)
 	}
 	s.snapshot.DeepCopyInto(b)
 	return nil
@@ -141,10 +144,10 @@ func TestReconcile_StatusPatchBaselineIsAPIServerTruth(t *testing.T) {
 
 	// 云上装的就是这一张：本轮走幂等短路，不写云，直接 freezeApplied → setApplied。
 	//
-	// 落盘结果由 API server 把 merge patch 应用到**存储里那一份**上决定，而 fake client
-	// 的 status 子资源是整段覆盖、不做服务端合并，复现不出「差量为空所以什么都没改」。
-	// 所以断言下沉一层，直接看**发出去的 patch**：JSON merge patch 里没有 conditions，
-	// 就等于 API server 上那个 ObserveFailed 一个字节都不会被碰。
+	// 两个层次都断言：**发出去的 patch**（conditions 在不在差量里，这是丢更新的机制本身）
+	// 与**落盘结果**（那条假的诊断痕迹到底擦没擦掉，这是用户看得见的后果）。fake client
+	// 会把 JSON merge patch 应用到存储里那一份上，差量里没有 conditions 就真的什么都不改，
+	// 所以后一条断言是有效的，不必只靠前一条。
 	newReconciler := func(t *testing.T, sink *[]byte) (*AliyunCertificateBindingReconciler, client.Client) {
 		t.Helper()
 		c := crfake.NewClientBuilder().WithScheme(factoryScheme(t)).
@@ -217,6 +220,14 @@ func TestReconcile_StatusPatchBaselineIsAPIServerTruth(t *testing.T) {
 		}
 		if bytes.Contains(sent, []byte("conditions")) {
 			t.Errorf("陈旧基准下 conditions 不该出现在差量里；出现了说明这条用例已经不再钉住直读: %s", sent)
+		}
+		// 后果：API server 上那条 ObserveFailed 原封不动。
+		got := &certsv1alpha1.AliyunCertificateBinding{}
+		if err := c.Get(context.Background(), req.NamespacedName, got); err != nil {
+			t.Fatalf("读回对象失败: %v", err)
+		}
+		if r := bindingCondReason(got, certsv1alpha1.ConditionApplied); r != certsv1alpha1.ReasonObserveFailed {
+			t.Errorf("差量里没有 conditions，落盘就该原样保留 ObserveFailed，实际是 %q", r)
 		}
 	})
 }
