@@ -91,3 +91,9 @@ formatters:
       - third_party$
       - builtin$
       - examples$
+
+# 不截断输出：默认 max-same-issues=3 会把同文案的告警只列前 3 处，
+# 摸底时会得到偏小的数字（2026-09-06 gosec 基线 23 条被报成 12 条）。门禁判定不受影响。
+issues:
+  max-same-issues: 0
+  max-issues-per-linter: 0
