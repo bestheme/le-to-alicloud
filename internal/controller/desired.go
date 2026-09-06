@@ -67,13 +67,12 @@ func secretNameConflictMessage(ac *certsv1alpha1.AliyunCertificate) string {
 // secretNameGuardHolding 报告 SecretNameConflict 护栏此刻是否正拦着一次 spec.secretName
 // 变更——也就是「用户想要的 Secret 名」与「真正在服役的那个」不一致。
 //
-// 判据是 status.secretName：它**只**在 Reconcile 步骤 3 的 CreateOrUpdate 成功之后被赋值
-// （`ac.Status.SecretName = cert.Spec.SecretName`），所以护栏放行时它会在同一轮里被拉平，
-// 只有拦住的时候才会与 spec 分叉。对象刚建出来、还没走完第一轮时它是空的，不算分叉。
+// status.secretName 记的就是在役的那一个：Reconcile 步骤 3 之后无条件写回，冲突时写回的
+// 是未被改动的 existing。于是这个判据是定义上的等价，而不是依赖赋值位置的派生猜测。
+// 空串只意味着 Certificate 还不存在（第一轮之前），那时谈不上「在役」，不算分叉。
 //
-// **改动 status.secretName 的赋值位置会悄悄破坏这个判据。** 它是 aggregateReady 施加
-// 一票否决的唯一依据：冲突期间 operator 照常维护在役证书，Issued / Uploaded 会正常变成
-// True，只有这一条能拦住 Ready 跟着变成 True。
+// 它是 aggregateReady 施加一票否决的唯一依据：冲突期间 operator 照常维护在役证书，
+// Issued / Uploaded 会正常变成 True，只有这一条能拦住 Ready 跟着变成 True。
 func secretNameGuardHolding(ac *certsv1alpha1.AliyunCertificate) bool {
 	return ac.Status.SecretName != "" && ac.Status.SecretName != secretNameFor(ac)
 }

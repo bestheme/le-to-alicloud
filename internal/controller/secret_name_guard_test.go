@@ -104,7 +104,7 @@ func TestSecretNameGuardHolding(t *testing.T) {
 		{"spec 改指到别处而在役的还是旧的", "victim-tls", "mine-tls", true},
 		{"两者一致", "mine-tls", "mine-tls", false},
 		{"spec 为空、在役的是默认名", "", "mine-tls", false},
-		{"还没走完第一轮（status 为空）", "victim-tls", "", false},
+		{"Certificate 还不存在，谈不上在役（status 为空）", "victim-tls", "", false},
 		{"清空 spec.secretName 回落默认名，而在役的是别的", "", "custom-tls", true},
 	}
 	for _, c := range cases {

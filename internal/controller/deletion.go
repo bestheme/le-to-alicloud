@@ -152,9 +152,14 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	// 按名字无条件删是不安全的：spec.secretName 可以在 CR 生命周期里被改指到别人的
 	// Secret 上。变更期的护栏（aliyuncertificate_controller.go 第 2 步）是主防线，这里
 	// 是兜底，挡住护栏上线之前就已经指歪了的存量对象。注解缺失的手工 Secret 同样不删。
+	//
+	// 找的是**在役**的那个名字，不是 spec 里的：冲突正挂着时 spec.secretName 指着受害者，
+	// 按 spec 去删等于既碰了不该碰的，又把真正属于本 CR 的那份私钥留在集群里没人管
+	// （Certificate 已在步骤 c 删掉，之后不会再有人回来收它）。
 	skippedSecret := ""
 	s := &corev1.Secret{}
-	err = r.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: secretNameFor(ac)}, s)
+	err = r.Get(ctx, types.NamespacedName{
+		Namespace: ac.Namespace, Name: servingSecretName(ac, ac.Status.SecretName)}, s)
 	switch {
 	case err == nil && secretOwnedByUs(s, ac):
 		if derr := r.Delete(ctx, s); derr != nil && !apierrors.IsNotFound(derr) {
@@ -174,8 +179,9 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	// Update 打在已经不存在的对象上。抛上去等于每一次删除都推高一次
 	// controller_runtime_reconcile_errors_total——运维正是拿它配告警的。
 	controllerutil.RemoveFinalizer(ac, certsv1alpha1.FinalizerName)
-	if err := client.IgnoreNotFound(r.Update(ctx, ac)); err != nil {
-		return ctrl.Result{}, err
+	uerr := r.Update(ctx, ac)
+	if client.IgnoreNotFound(uerr) != nil {
+		return ctrl.Result{}, uerr
 	}
 
 	// 「私钥留在集群里」这件事不能无声无息。三样痕迹各有各的读者：日志带 Secret 名，给
@@ -185,7 +191,11 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	// 从头重跑步骤 d，放在前面等于每重试一次就多发一条事件、多涨一次计数。计数器是拿来
 	// 回答「有几个 Secret 被留下了」的，虚高就等于读不得。走到这里说明删除已经收尾，
 	// 成功路径恰好经过一次。
-	if skippedSecret != "" {
+	//
+	// uerr == nil 这一半同样承重：上面那次 Update 的 NotFound 是被吸收的，而 NotFound 恰恰
+	// 是「对象已经真正删除、cache 里那份带 finalizer 的旧版本又唤起了一轮」——那一轮会重跑
+	// 步骤 d、重新发现同一个 Secret。只在真正摘掉 finalizer 的那一轮留痕迹。
+	if skippedSecret != "" && uerr == nil {
 		log.Info("secret is not owned by this certificate, skipping deletion", "secret", skippedSecret)
 		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict, secretDeletionSkippedMessage)
 		secretDeletionSkippedTotal.WithLabelValues(ac.Namespace).Inc()

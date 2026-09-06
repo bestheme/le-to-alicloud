@@ -229,11 +229,17 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			certManagerCertRecreatedTotal.WithLabelValues(ac.Namespace, ac.Name).Inc()
 			r.Recorder.Event(ac, corev1.EventTypeWarning, "CertificateRecreated", "cert-manager Certificate was recreated")
 		}
-		ac.Status.CertManagerCertificateName = cert.Name
-		// 这一行是 secretNameGuardHolding 的全部依据：status.secretName 只在这里被赋值，
-		// 冲突时走不到，于是它与 spec 分叉，aggregateReady 据此一票否决 Ready。
-		ac.Status.SecretName = cert.Spec.SecretName
 	}
+	// 两条状态写回都在块外：此刻 cert 要么是刚同步好的期望态，要么（冲突时）就是未被改动
+	// 的 existing，两种情形下它记的都是**在役**的那一份。
+	//
+	// status.secretName 因此恒等于在役 Secret 名，secretNameGuardHolding 才是定义上的等价
+	// （在役的 ≠ 用户想要的 ⇔ 护栏正拦着），而不是一个依赖「谁在哪儿赋值」的派生猜测。
+	// 关在 if 里的话，「集群里预先存在同名 Certificate + spec 指向他人 Secret」这条路上它
+	// 永远是空串，Ready 会被聚合成 True。
+	// certManagerCertificateName 同理：CertificateRecreated 那道护栏靠它判断「以前建过」。
+	ac.Status.CertManagerCertificateName = cert.Name
+	ac.Status.SecretName = cert.Spec.SecretName
 
 	// 4. 镜像 cert-manager status；未 Ready 则等 watch
 	mirrorIssuance(ac, cert)
@@ -255,9 +261,14 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionFalse, certsv1alpha1.ReasonCertificateNotReady, "等待 cert-manager 签发")
 		}
 		r.aggregateReady(ac)
-		if stalled {
+		if stalled || secretNameGuardHolding(ac) {
 			// 首次签发就停滞：Certificate 还没 Ready，没有任何 watch 会因为「又过了一小时」
 			// 而唤醒我们，只能定时重来。
+			//
+			// 冲突挂着时同理，而且更硬：占用者是一个 Secret，Secret 刻意不进 cache 也不
+			// watch，删掉它不会产生任何事件。不重排的话这个 CR 会一直卡在
+			// Ready=False/SecretNameConflict 上——而 README 与 spec §5.2 都承诺
+			// 「每个 resync 周期自动重试」。
 			return ctrl.Result{RequeueAfter: r.resyncInterval()}, r.patchStatus(ctx, ac, orig)
 		}
 		return ctrl.Result{}, r.patchStatus(ctx, ac, orig)
