@@ -345,7 +345,7 @@ var _ = Describe("证书 controller：删除", func() {
 		// Certificate 与 Secret 仍应被清理
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "abandon-tls"}, &corev1.Secret{}))).To(BeTrue())
 		// 放弃必须留下痕迹，否则孤儿证书就无声无息了
-		Expect(acEventMessage(ctx, ns, "abandon", certsv1alpha1.ReasonCleanupAbandoned)).To(Equal(cleanupAbandonedMessage))
+		Expect(acEventMessage(ctx, ns, "abandon", corev1.EventTypeWarning, certsv1alpha1.ReasonCleanupAbandoned)).To(Equal(cleanupAbandonedMessage))
 		// 事件会随 namespace 一起过期，指标才是能长期告警的那一份痕迹
 		Expect(promtestutil.ToFloat64(cleanupAbandonedTotal.WithLabelValues("cn-hangzhou", aliyun.ClassAuth.String()))).
 			To(BeNumerically(">=", 1))
@@ -380,11 +380,15 @@ var _ = Describe("证书 controller：删除", func() {
 })
 
 // acEventMessage 返回 ns 下打在 name 上、reason 为指定值的第一条事件的 message；没有则返回 ""。
-func acEventMessage(ctx context.Context, ns, name, reason string) string {
+// acEventMessage 取 CR 上第一条类型与 reason 都匹配的事件的 message，没有则返回 ""。
+//
+// evType 必须传：只按 reason 找的话，同一个 reason 将来在别处补一条 Normal 事件，
+// 断言「发了 Warning」的用例不会发现。
+func acEventMessage(ctx context.Context, ns, name, evType, reason string) string {
 	list := &corev1.EventList{}
 	ExpectWithOffset(1, k8sClient.List(ctx, list, client.InNamespace(ns))).To(Succeed())
 	for i := range list.Items {
-		if list.Items[i].InvolvedObject.Name == name && list.Items[i].Reason == reason {
+		if list.Items[i].InvolvedObject.Name == name && list.Items[i].Type == evType && list.Items[i].Reason == reason {
 			return list.Items[i].Message
 		}
 	}

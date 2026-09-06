@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -44,6 +43,12 @@ const requeueDeletionWait = 2 * time.Second
 // 原文与遗留的 certId 都可能夹带只对运维有意义的细节，那些只进日志。
 const cleanupAbandonedMessage = "gave up deleting the CAS certificates after the cleanup grace period; see operator logs for the leaked certificate IDs"
 
+// secretDeletionSkippedMessage 是删除期跳过删除 Secret 时的固定文案。与
+// cleanupAbandonedMessage 同一个理由抽成常量：文案是用户看得见的契约，用例逐字钉住它，
+// 改措辞时才会有人提醒。Secret 名不进消息——它就是 spec.secretName，用户手上已经有了，
+// 而事件文案里带变量会让 K8s 的聚合失效。
+const secretDeletionSkippedMessage = "Secret 不属于本 CR（cert-manager.io/certificate-name 指向别的 Certificate），跳过删除"
+
 // activeBindingNames 只统计未在删除中的 Binding（避免与 Argo CD prune 死锁）。
 // Argo CD 会同时 prune AliyunCertificate 与引用它的 Binding；若把已带 deletionTimestamp
 // 的 Binding 也算作阻塞方，两边会互相等待到谁都删不掉。
@@ -61,8 +66,8 @@ func activeBindingNames(bindings []certsv1alpha1.AliyunCertificateBinding) []str
 // a. 活着的 Binding → 阻塞
 // b. CAS 各代（有界，Abandon/Block）
 // c. 显式删 cmapi.Certificate 并等它消失（否则 cert-manager 会重建 Secret）
-// d. 删 Secret
-// e. 摘 finalizer
+// d. 删 Secret（仅限注解指向本 CR 的那一个；不属于本 CR 则跳过并留下事件与计数）
+// e. 摘 finalizer（d 跳过与否都照常摘）
 func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, orig *certsv1alpha1.AliyunCertificate) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(ac, certsv1alpha1.FinalizerName) {
 		return ctrl.Result{}, nil
@@ -155,10 +160,10 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 			return ctrl.Result{}, derr
 		}
 	case err == nil:
-		// 私钥留在集群里这件事不能无声无息：日志给运维定位，事件给用户看见。
+		// 私钥留在集群里这件事不能无声无息。三样痕迹各有各的读者：日志带 Secret 名，
+		// 给运维定位；事件面向用户；计数器是唯一活得比 namespace 长的那一份，配告警用它。
 		log.Info("secret is not owned by this certificate, skipping deletion", "secret", s.Name)
-		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict,
-			fmt.Sprintf("Secret %q 不属于本 CR，跳过删除", s.Name))
+		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict, secretDeletionSkippedMessage)
 	case !apierrors.IsNotFound(err):
 		return ctrl.Result{}, err
 	}

@@ -83,6 +83,17 @@ var (
 			"The reason label carries two vocabularies, one per controller " +
 			"(aliyun error class vs provider error code)",
 	}, []string{"region", "reason"})
+	// 与 cleanupAbandonedTotal 同一个理由：这条路径也会「留下需要人工收拾的东西」，
+	// 而事件会随 namespace 一起过期，指标才是能长期告警的那一份痕迹。
+	//
+	// label 只有 namespace，没有 name：CR 删掉之后 clearCertMetrics 会清掉按 CR 打的
+	// gauge，counter 却必须活过对象本身——按 name 打 label 等于给每一个删掉的 CR 留一条
+	// 永不消失的 series。
+	secretDeletionSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aliyuncert_secret_deletion_skipped_total",
+		Help: "Deletions that left the TLS Secret in place because it is not owned by " +
+			"this AliyunCertificate (cert-manager.io/certificate-name points elsewhere)",
+	}, []string{"namespace"})
 	// spec §10.1 的两个 API 级指标。casUploadTotal / casDeleteTotal 只覆盖写通道，
 	// 而 ListUserCertificateOrder 才是限流最紧（QPS 8、burst 1）也最容易被 RAM 权限
 	// 卡住的那一条：没有它就没人答得上「探测是不是一直在失败」「list 配额打满没有」。
@@ -132,6 +143,7 @@ const (
 func init() {
 	metrics.Registry.MustRegister(certNotAfter, certReadyGauge, certIssuanceStalled, issuerDefaultDiverged,
 		casUploadTotal, casDeleteTotal, certManagerCertRecreatedTotal, cleanupAbandonedTotal,
+		secretDeletionSkippedTotal,
 		aliyunAPIRequestsTotal, aliyunAPIDuration,
 		bindingReadyGauge, bindingConflictGauge, bindingAppliedAge, bindingApplyTotal, bindingDriftTotal)
 }

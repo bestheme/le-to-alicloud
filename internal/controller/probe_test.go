@@ -26,6 +26,7 @@ import (
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -145,7 +146,7 @@ var _ = Describe("证书 controller：Diverged 与 CAS 探测", func() {
 			return condTrue(got, certsv1alpha1.ConditionIssuerDefaultDiverged) && condTrue(got, certsv1alpha1.ConditionReady)
 		})
 		eventually(func() bool {
-			return acEventMessage(ctx, ns, "div", certsv1alpha1.ReasonIssuerDefaultDiverged) != ""
+			return acEventMessage(ctx, ns, "div", corev1.EventTypeWarning, certsv1alpha1.ReasonIssuerDefaultDiverged) != ""
 		})
 		// Diverged 只是提示：Pin 依旧生效，下发的 Certificate 不许跟着 flag 走。
 		cert, err := getCert(ctx, ns, "div")
@@ -234,7 +235,9 @@ var _ = Describe("证书 controller：Diverged 与 CAS 探测", func() {
 		}
 		advance(13 * time.Hour)
 		touch(ns, "apifail", "1")
-		eventually(func() bool { return acEventMessage(ctx, ns, "apifail", "ProbeFailed") == probeFailedMessage })
+		eventually(func() bool {
+			return acEventMessage(ctx, ns, "apifail", corev1.EventTypeWarning, "ProbeFailed") == probeFailedMessage
+		})
 
 		// 列不出清单 ≠ 证书丢了：不许重传，也不许把 current 清掉
 		Consistently(func() bool {

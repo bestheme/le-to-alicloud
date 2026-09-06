@@ -24,6 +24,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -133,6 +134,11 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 		}, "1500ms", "200ms").Should(Equal("chg-tls"))
 
 		// 受害 Secret 逐字节不变。用布尔断言而不是直接比对 map：失败时不该把字节倒进日志。
+		//
+		// 这几条在 envtest 里是**形式上的完备**，不是回归探测器：envtest 没有真的
+		// cert-manager 在跑，护栏就算完全失效，被改写的也只是 cmapi.Certificate 的 spec，
+		// 没有任何东西会去动这个 Secret。真正的探测器是上面那条
+		// Consistently(cert.Spec.SecretName)——删掉它，这个用例就不再守任何东西了。
 		got := &corev1.Secret{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "victim-tls"}, got)).To(Succeed())
 		gotKeys := make([]string, 0, len(got.Data))
@@ -167,6 +173,11 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-tls"}, &corev1.Secret{})).
 			To(Succeed(), "不属于本 CR 的 Secret 不能被删除")
 		// 跳过删除必须留下痕迹，否则私钥留在集群里这件事就无声无息了。
-		Expect(acEventMessage(ctx, ns, "foreign", certsv1alpha1.ReasonSecretNameConflict)).NotTo(BeEmpty())
+		// 事件面向用户，文案逐字钉住；类型必须是 Warning。
+		Expect(acEventMessage(ctx, ns, "foreign", corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict)).
+			To(Equal(secretDeletionSkippedMessage))
+		// 事件会随 namespace 一起过期，指标才是能长期告警的那一份痕迹（同 CleanupAbandoned）。
+		Expect(promtestutil.ToFloat64(secretDeletionSkippedTotal.WithLabelValues(ns))).
+			To(BeNumerically(">=", 1))
 	})
 })

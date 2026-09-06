@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -121,7 +122,9 @@ var _ = Describe("证书 controller：签发停滞", func() {
 			"上传状态与续期是否卡住无关")
 		Expect(got.Status.Current).NotTo(BeNil(), "status.current 指向仍在服役的证书，不许被清")
 		Expect(*got.Status.Current.CertID).To(Equal(id1))
-		eventually(func() bool { return acEventMessage(ctx, ns, "api", certsv1alpha1.ReasonIssuanceStalled) != "" })
+		eventually(func() bool {
+			return acEventMessage(ctx, ns, "api", corev1.EventTypeWarning, certsv1alpha1.ReasonIssuanceStalled) != ""
+		})
 
 		// 探测不再被挂起：13h 已越过 12h 周期，这一轮必须真的去列过 CAS
 		Expect(currentCAS().FindCalls()).To(BeNumerically(">=", 1),
