@@ -158,8 +158,14 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	r.detectIssuerDivergence(ac, source)
 	log.V(1).Info("issuer resolved", "name", issuer.Name, "kind", issuer.Kind, "source", source)
 
-	// 2. 首次创建前检查 Secret 名冲突
-	if existing == nil {
+	// 2. 检查 Secret 名冲突：首次创建前，以及之后每一次 spec.secretName 改指到新目标时。
+	//
+	// 第二个条件不能省。spec.secretName 可变（CRD 上没有不可变约束，也没有 webhook），
+	// 而护栏一旦只在首次创建时跑，用户后来把它改指到别人的 Secret，下面第 3 步就会把新
+	// 名字 Update 到 Certificate 上——cert-manager 随即用本证书的私钥覆写受害 Secret，
+	// 并把归属注解改成指向本 CR。那之后删除期的注解复核会一路放行，于是覆写加删除。
+	// 所以真正的护栏必须在这里、在 Update 之前拦住，删除期的复核只是兜底。
+	if existing == nil || existing.Spec.SecretName != secretNameFor(ac) {
 		conflict, err := r.secretNameConflict(ctx, ac)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -167,8 +173,9 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if conflict {
 			setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonSecretNameConflict,
 				fmt.Sprintf("Secret %q 已存在且不属于本证书", secretNameFor(ac)))
-			// 这条路径上没有任何 watch 能唤醒我们：Certificate 从未创建（Owns 无对象），
-			// Secret 刻意不进 cache 也不 watch。占用者被删掉后只能靠定时重试自愈。
+			// 这条路径上没有任何 watch 能唤醒我们：Certificate 要么从未创建（Owns 无对象），
+			// 要么内容没变、不会再产生事件；Secret 刻意不进 cache 也不 watch。占用者被删掉
+			// 后只能靠定时重试自愈。
 			return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
 		}
 	}

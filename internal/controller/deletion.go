@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -141,9 +142,24 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 		return ctrl.Result{}, err
 	}
 
-	// d. 删 Secret
-	s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ac.Namespace, Name: secretNameFor(ac)}}
-	if err := r.Delete(ctx, s); err != nil && !apierrors.IsNotFound(err) {
+	// d. 删 Secret——但只删注解确实指向本 CR 的那一个。
+	//
+	// 按名字无条件删是不安全的：spec.secretName 可以在 CR 生命周期里被改指到别人的
+	// Secret 上。变更期的护栏（aliyuncertificate_controller.go 第 2 步）是主防线，这里
+	// 是兜底，挡住护栏上线之前就已经指歪了的存量对象。注解缺失的手工 Secret 同样不删。
+	s := &corev1.Secret{}
+	err = r.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: secretNameFor(ac)}, s)
+	switch {
+	case err == nil && secretOwnedByUs(s, ac):
+		if derr := r.Delete(ctx, s); derr != nil && !apierrors.IsNotFound(derr) {
+			return ctrl.Result{}, derr
+		}
+	case err == nil:
+		// 私钥留在集群里这件事不能无声无息：日志给运维定位，事件给用户看见。
+		log.Info("secret is not owned by this certificate, skipping deletion", "secret", s.Name)
+		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict,
+			fmt.Sprintf("Secret %q 不属于本 CR，跳过删除", s.Name))
+	case !apierrors.IsNotFound(err):
 		return ctrl.Result{}, err
 	}
 
