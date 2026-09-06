@@ -164,6 +164,10 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	$(GOLANGCI_LINT) config verify
 
+.PHONY: verify-ram-policy
+verify-ram-policy: ## Verify the RAM policy in README matches docs/ram/*.json
+	python3 hack/verify-ram-policy.py
+
 ##@ Build
 
 .PHONY: build

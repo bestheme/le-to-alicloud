@@ -21,3 +21,8 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.13.2
+
+      # README 的「RAM 权限」一节内联了完整策略 JSON，docs/ram/ 下还有三份文件版。
+      # 副本之间的漂移会直接变成线上权限配错，所以由门禁盯着，而不是靠人记得同步。
+      - name: Verify the RAM policy copies agree
+        run: make verify-ram-policy

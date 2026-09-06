@@ -632,7 +632,7 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
 }
 ```
 
-`<fc3Region>` / `<accountId>` / `<domainName>` 是占位符，**带尖括号的原文不是合法 ARN**，创建策略前必须替换，怎么填见下面「把占位符填成真实值」。同一份内容也在 `docs/ram/full-policy.json`，那是可以直接喂给 `aliyun ram CreatePolicy` 的文件版。**这份 JSON 与 `docs/ram/full-policy.json` 是同一份内容的两处副本，改一处必须同步另一处。**
+`<fc3Region>` / `<accountId>` / `<domainName>` 是占位符，**带尖括号的原文不是合法 ARN**，创建策略前必须替换，怎么填见下面「把占位符填成真实值」。同一份内容也在 `docs/ram/full-policy.json`，那是可以直接喂给 `aliyun ram CreatePolicy` 的文件版。**这份 JSON 与 `docs/ram/full-policy.json` 是同一份内容的两处副本，一致性由 `make verify-ram-policy` 门禁保证**（见下面「文件版」）。
 
 ### 每个 Action 用在哪、缺了会怎样
 
@@ -686,6 +686,12 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
 
 ```bash
 jq . docs/ram/full-policy.json docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
+```
+
+**这四处副本（README 里那份 + 三个文件）的一致性由门禁盯着，不靠人记得同步**：`make verify-ram-policy` 断言 README 里的完整策略与 `full-policy.json` 逐字相等、且另两份的 `Statement` 合并后等于它的 `Statement` 列表，任一不等就打印 diff 并失败。CI 的 lint workflow 每次 push / PR 都会跑它。改任何一处策略之后，本地跑一遍再提交：
+
+```bash
+make verify-ram-policy
 ```
 
 替换掉占位符之后创建策略：
