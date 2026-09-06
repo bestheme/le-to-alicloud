@@ -1,5 +1,7 @@
 # Build the manager binary
-FROM golang:1.26 AS builder
+# builder 钉在 $BUILDPLATFORM（runner 自己的架构）上，靠 Go 交叉编译产出目标架构的
+# 二进制。否则多架构构建时 arm64 那一路会在 QEMU 里跑 Go 编译器，慢一个数量级。
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 

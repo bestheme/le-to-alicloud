@@ -50,7 +50,7 @@ endif
 # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
 OPERATOR_SDK_VERSION ?= v1.42.3
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= ghcr.io/bestheme/le-to-alicloud:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -195,8 +195,11 @@ docker-push: ## Push docker image with the manager.
 PLATFORMS ?= linux/amd64,linux/arm64
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+	# Dockerfile 的 builder 阶段本身已经写了 --platform=$$BUILDPLATFORM，脚手架原来那条
+	# 往首个 FROM 前插 --platform 的 sed 会插出第二个同名 flag，BuildKit 会以
+	# "duplicate flag specified: platform" 直接失败。所以这里只是原样复制，
+	# 保留 Dockerfile.cross 这个中间文件是为了不动原始 Dockerfile。
+	cp Dockerfile Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name le-to-alicloud-builder
 	$(CONTAINER_TOOL) buildx use le-to-alicloud-builder
 	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
