@@ -194,7 +194,9 @@ func writeResults() error {
 		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
 			mdCell(f.ID), mdCell(f.Question), mdCell(f.Result), mdCell(f.Detail))
 	}
-	return os.WriteFile(resultsFile, []byte(b.String()), 0o644)
+	// 0o600：RESULTS.md 是本机跑集成测试的产物，只需生成它的人可读。虽然内容已过 scrub，
+	// 但它记录的是真云账号下的资源 ID 与错误原文，没有理由对同机其它用户开放。
+	return os.WriteFile(resultsFile, []byte(b.String()), 0o600)
 }
 
 // mdCell 转义竖线与换行，保证一段多行的云错误文本不会把表格撑破。

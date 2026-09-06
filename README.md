@@ -790,6 +790,12 @@ kubectl get events --field-selector "involvedObject.name=$NAME"
 
 `make help` 会列出全部目标。
 
+`make lint` 的 linter 列表里还有 `gosec` 与 `nolintlint`，各带一条纪律：
+
+- **`gosec` 不做全局排除。** 它标出来的每一处要么真修，要么在该行挂 `//nolint:gosec` 并写明为什么是误报——G101 的误报基本都标在环境变量名、Secret 的 data 键名或写着 `FAKE` 的测试假值上，落笔前要逐条确认标的不是真凭证。唯一一条按目录收窄的排除是 `test/e2e/` 的 G204：那套脚手架靠 `exec.Command` 驱动 `make` / `kubectl` / `kind`，参数全部来自本包常量。
+- **`nolintlint` 要求每条 `//nolint` 点名 linter、写明理由，并且不许留着已经不起作用的抑制**（`require-specific` + `require-explanation` + `allow-unused: false`）。理由必须跟在指令同一行的 `//` 之后；另起一行会被 gofmt 挪到注释块末尾而失效。
+- golangci-lint 默认 `max-same-issues: 3`，同一条规则重复命中时终端只会列出前 3 处。想看全量（比如第一次引入某个 linter 时摸底），跑 `./bin/golangci-lint run --max-same-issues=0 --max-issues-per-linter=0`。
+
 ### 镜像发布
 
 `.github/workflows/image.yml` 用 buildx 构建 `linux/amd64,linux/arm64` 双架构镜像并推到 `ghcr.io/bestheme/le-to-alicloud`。push 到 `main`、push `v*` tag 时推送；pull request 只构建不推送（fork 的 PR 拿不到 `packages: write`）。

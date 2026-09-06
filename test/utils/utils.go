@@ -64,6 +64,7 @@ func Run(cmd *exec.Cmd) (string, error) {
 // InstallPrometheusOperator installs the prometheus Operator to be used to export the enabled metrics.
 func InstallPrometheusOperator() error {
 	url := fmt.Sprintf(prometheusOperatorURL, prometheusOperatorVersion)
+	//nolint:gosec // G204: url 由本包的常量模板与版本号拼出，不来自外部输入
 	cmd := exec.Command("kubectl", "create", "-f", url)
 	_, err := Run(cmd)
 	return err
@@ -72,6 +73,7 @@ func InstallPrometheusOperator() error {
 // UninstallPrometheusOperator uninstalls the prometheus
 func UninstallPrometheusOperator() {
 	url := fmt.Sprintf(prometheusOperatorURL, prometheusOperatorVersion)
+	//nolint:gosec // G204: 同上，url 由本包常量拼出
 	cmd := exec.Command("kubectl", "delete", "-f", url)
 	if _, err := Run(cmd); err != nil {
 		warnError(err)
@@ -108,6 +110,7 @@ func IsPrometheusCRDsInstalled() bool {
 // UninstallCertManager uninstalls the cert manager
 func UninstallCertManager() {
 	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+	//nolint:gosec // G204: url 由本包的常量模板与版本号拼出，不来自外部输入
 	cmd := exec.Command("kubectl", "delete", "-f", url)
 	if _, err := Run(cmd); err != nil {
 		warnError(err)
@@ -117,6 +120,7 @@ func UninstallCertManager() {
 // InstallCertManager installs the cert manager bundle.
 func InstallCertManager() error {
 	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+	//nolint:gosec // G204: 同上，url 由本包常量拼出
 	cmd := exec.Command("kubectl", "apply", "-f", url)
 	if _, err := Run(cmd); err != nil {
 		return err
@@ -173,6 +177,7 @@ func LoadImageToKindClusterWithName(name string) error {
 		cluster = v
 	}
 	kindOptions := []string{"load", "docker-image", name, "--name", cluster}
+	//nolint:gosec // G204: 镜像名由调用方给出、集群名取自开发者自己设的 KIND_CLUSTER，都是 e2e 脚手架的输入
 	cmd := exec.Command("kind", kindOptions...)
 	_, err := Run(cmd)
 	return err

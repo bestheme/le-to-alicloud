@@ -10,6 +10,7 @@ import (
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 )
 
+//nolint:gosec // G101 误报：PEM 头尾之间是字面量占位串，不是可解析的密钥，用来断言它不会被打印出来
 const fakeKeyPEM = "-----BEGIN RSA PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n-----END RSA PRIVATE KEY-----\n"
 
 // 私钥泄漏的真实通道是结构化日志：zap 对未知类型走反射 JSON 编码，导出字段会被原样写出。

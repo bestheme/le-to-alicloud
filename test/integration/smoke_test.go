@@ -52,7 +52,7 @@ func TestHarnessScrubRemovesSecrets(t *testing.T) {
 	const (
 		fakeID     = "FAKE-AK-ID-FOR-SCRUB-TEST"
 		fakeSecret = "FAKE-SECRET-FOR-SCRUB-TEST"
-		fakeToken  = "FAKE-STS-TOKEN-FOR-SCRUB-TEST"
+		fakeToken  = "FAKE-STS-TOKEN-FOR-SCRUB-TEST" //nolint:gosec // G101 误报：字面写着 FAKE 的假值，正是用来验证 scrub 会把它抹掉
 	)
 	t.Setenv(EnvAccessKeyID, fakeID)
 	t.Setenv(EnvAccessKeySecret, fakeSecret)

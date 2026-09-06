@@ -18,7 +18,7 @@ const (
 	KeySecurityToken     = "securityToken"
 	KeyRoleARN           = "roleArn"
 	KeyOIDCProviderARN   = "oidcProviderArn"
-	KeyOIDCTokenFilePath = "oidcTokenFilePath"
+	KeyOIDCTokenFilePath = "oidcTokenFilePath" //nolint:gosec // G101 误报：Secret 的 data 键名，不是键值
 )
 
 // Credentials 是从 Secret 读出的凭证材料。不要把它写进日志。

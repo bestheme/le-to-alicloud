@@ -47,7 +47,7 @@ const cleanupAbandonedMessage = "gave up deleting the CAS certificates after the
 // cleanupAbandonedMessage 同一个理由抽成常量：文案是用户看得见的契约，用例逐字钉住它，
 // 改措辞时才会有人提醒。Secret 名不进消息——它就是 spec.secretName，用户手上已经有了，
 // 而事件文案里带变量会让 K8s 的聚合失效。
-const secretDeletionSkippedMessage = "Secret 不属于本 CR（cert-manager.io/certificate-name 指向别的 Certificate），跳过删除"
+const secretDeletionSkippedMessage = "Secret 不属于本 CR（cert-manager.io/certificate-name 指向别的 Certificate），跳过删除" //nolint:gosec // G101 误报：这是发给用户看的事件文案，常量名里有 Secret 而已，值里没有任何凭证
 
 // activeBindingNames 只统计未在删除中的 Binding（避免与 Argo CD prune 死锁）。
 // Argo CD 会同时 prune AliyunCertificate 与引用它的 Binding；若把已带 deletionTimestamp

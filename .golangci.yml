@@ -12,6 +12,7 @@ linters:
     - ginkgolinter
     - goconst
     - gocyclo
+    - gosec
     - govet
     - ineffassign
     - lll
@@ -26,6 +27,10 @@ linters:
     - unused
   settings:
     nolintlint:
+      # 每条 //nolint 都要点名 linter 并在同一行写明理由；不再需要的抑制要被报出来删掉，
+      # 否则抑制会随代码变动悄悄扩大成永久豁免。gosec 不做全局 exclude：它标出来的每一处
+      # 都要么真修，要么逐行点名说明为什么是误报。
+      allow-unused: false
       require-explanation: true
       require-specific: true
     revive:
@@ -65,6 +70,13 @@ linters:
       - linters:
           - dupl
         path: test/integration/
+      # e2e 套件靠 exec.Command 驱动 make / kubectl / kind，9 处 G204 全部是同一回事：
+      # 参数来自本包的常量与 fmt.Sprintf 拼出的固定模板，没有一处取自用户输入或网络。
+      # 只收窄到 test/e2e/ 且只放 G204——同目录的其它 gosec 规则照常报。
+      - linters:
+          - gosec
+        path: test/e2e/
+        text: "G204"
     paths:
       - third_party$
       - builtin$

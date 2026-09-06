@@ -37,6 +37,7 @@ func TestErrorOf_PlainError(t *testing.T) {
 // 「响应体形状」的敏感片段注入被包住的 err，断言它不会经由 Error() 泄漏出来——只有
 // Code / Retryable / Reason 这三个取值有界的字段允许出现。
 func TestProviderError_MessageHasNoPayload(t *testing.T) {
+	//nolint:gosec // G101 误报：一段伪造的「像私钥」的探针文本，用例断言它不会经 Error() 泄漏
 	const payload = "-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEA-----END RSA PRIVATE KEY-----"
 	pe := provider.Errorf(provider.CodeAuth, false, "CredentialsInvalid", errors.New("upstream: "+payload))
 	msg := pe.Error()

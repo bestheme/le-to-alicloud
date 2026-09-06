@@ -277,6 +277,7 @@ var _ = Describe("Manager", Ordered, func() {
 // It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
 // and parsing the resulting token from the API response.
 func serviceAccountToken() (string, error) {
+	//nolint:gosec // G101 误报：这是 TokenRequest 的请求体模板，里面只有 apiVersion/kind，没有令牌
 	const tokenRequestRawString = `{
 		"apiVersion": "authentication.k8s.io/v1",
 		"kind": "TokenRequest"

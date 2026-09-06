@@ -27,7 +27,7 @@ import (
 // 环境变量契约。样板见 test/integration/env.example.sh。
 const (
 	EnvAccessKeyID     = "ALIYUN_ACCESS_KEY_ID"
-	EnvAccessKeySecret = "ALIYUN_ACCESS_KEY_SECRET"
+	EnvAccessKeySecret = "ALIYUN_ACCESS_KEY_SECRET" //nolint:gosec // G101 误报：环境变量名，不是它的值
 	EnvSecurityToken   = "ALIYUN_SECURITY_TOKEN"
 	EnvRegion          = "ALIYUN_REGION"
 	EnvCASRegionAlt    = "ALIYUN_CAS_REGION_ALT"

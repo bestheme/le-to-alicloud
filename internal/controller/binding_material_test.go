@@ -139,7 +139,7 @@ func TestLoadBindingMaterial_SecretNotFound(t *testing.T) {
 // 块内容，这个用例会红。
 func TestLoadBindingMaterial_SecretInvalid(t *testing.T) {
 	const junk = "not a pem block at all"
-	const secretBody = "U0VDUkVUS0VZQllURVM"
+	const secretBody = "U0VDUkVUS0VZQllURVM" //nolint:gosec // G101 误报：这是塞进一个故意不合法的 DSA PEM 块里的填充字节，不是凭证
 
 	ca := testutil.NewCA(t)
 	certPEM, _ := testutil.IssueLeaf(t, ca, "api.example.com")
