@@ -149,7 +149,8 @@ func arbitrateReconciler(t *testing.T, withIndex bool,
 		bld = bld.WithIndex(&certsv1alpha1.AliyunCertificateBinding{},
 			certsv1alpha1.IndexBindingByTarget, bindingTargetIndex)
 	}
-	return &AliyunCertificateBindingReconciler{Client: bld.Build()}
+	c := bld.Build()
+	return &AliyunCertificateBindingReconciler{Client: c, APIReader: c}
 }
 
 // TestArbitrate_CrossNamespace 钉住跨 namespace 仲裁：TargetKey() 不含 namespace，

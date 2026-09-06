@@ -33,7 +33,7 @@ flowchart LR
     AC -.->|status.current 变化<br/>唤醒| BC
 ```
 
-绑定 controller 只有三种唤醒条件：Binding 自己的 spec / annotation / label 变了、它引用的证书 `status.current` 变了、或者 `--drift-check-interval` 到点。**Binding 的 status 写入不唤醒任何 controller**，它自己也不例外——每一轮成功观测都会写 `status.lastObservedTime`，让那次 patch 唤醒下一轮就是一个只受云调用耗时约束的自循环。
+绑定 controller 的唤醒条件是这几种：Binding 自己的 spec / annotation / label 变了、同目标的 peer Binding 变了（仲裁）、它引用的 `AliyunCertificate` 变了（那条 watch 没有谓词，任何变化都算，续期信号就在里面）、`--drift-check-interval` 到点，以及失败路径自己排的重试（凭证问题 5 分钟、域名还不存在 5 分钟、retryable 走指数退避）。**Binding 的 status 写入不唤醒任何 controller**，它自己也不例外——每一轮成功观测都会写 `status.lastObservedTime`，让那次 patch 唤醒下一轮就是一个只受云调用耗时约束的自循环。
 
 三个贯穿全局的设计要点：
 

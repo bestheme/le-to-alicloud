@@ -88,14 +88,17 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingDelete(ctx context.
 			// ready gauge 要跟着 condition 走，否则看板上这个卡死的对象仍然是绿的；
 			// applied_age 不刷，理由见 patchBindingStatus。
 			//
-			// **必须在 patch 成功之后**，否则会立一块永远清不掉的墓碑：对象已经被上一轮
-			// 删干净了，而 informer cache 还持有带 finalizer 的旧版本，据此再进一轮删除
-			// 分支（这一轮真实存在，见 binding_deletion_test.go 里的实测记录）；这一轮的
-			// 解绑若撞上宽限期内的瞬时云错误，先刷 gauge 就会把 ready=0 重新建出来，
-			// 紧接着 patch 以 NotFound 失败——而 clearBindingMetrics 在这条路径上再也
-			// 不会被走到。于是一个已经不存在的对象留下一条永久为 0 的告警 series，
-			// 正是 clearBindingMetrics 存在的理由被反过来违反。patch 成功了才说明对象
-			// 还在，这时刷 gauge 才有对应的清理点。
+			// **必须在 patch 成功之后**，否则会立一块永远清不掉的墓碑：对象在本轮进行中
+			// 被删干净了（Reconcile 开头的直读看见它还在，此后另一条路径摘掉了 finalizer），
+			// 先刷 gauge 就会把 ready=0 重新建出来，紧接着 patch 以 NotFound 失败——而
+			// clearBindingMetrics 在这条路径上再也不会被走到。于是一个已经不存在的对象留下
+			// 一条永久为 0 的告警 series，正是 clearBindingMetrics 存在的理由被反过来违反。
+			// patch 成功了才说明对象还在，这时刷 gauge 才有对应的清理点。
+			//
+			// 这个窗口现在很窄。从前它每次删除都会发生：删除分支读的是 informer cache，
+			// 对象真删之后缓存里那份带 finalizer 的旧版本还会再唤起一轮。Reconcile 改用
+			// APIReader 直读之后（见那里的注释），那一轮在开头就 NotFound 早退了，剩下的
+			// 只有真正的并发。窄不等于没有，顺序照旧。
 			recordBindingReadiness(rd)
 			return ctrl.Result{}, err // 指数退避
 		}
@@ -177,12 +180,16 @@ func (r *AliyunCertificateBindingReconciler) unbindTarget(ctx context.Context, r
 
 // finishBindingDeletion 摘 finalizer 并清掉指标 series。
 //
-// NotFound 必须吸收掉。删除分支读的是 informer cache：finalizer 摘掉、对象被 API server
-// 真正删除之后，缓存里那份带 finalizer 的旧版本还会再唤起**一轮**删除（这一轮真实存在，
-// 见 binding_deletion_test.go 里的实测记录）。那一轮的这次 Update 打在一个已经不存在的
-// 对象上，返回 NotFound；把它当错误往上抛，等于**每一次 Binding 删除**（Orphan 也不例外）
-// 都推高一次 controller_runtime_reconcile_errors_total 并打一条 reconciler error 日志——
-// 而那个指标正是运维配告警的地方。对象没了，摘 finalizer 的目的已经达到。
+// NotFound 必须吸收掉：对象没了，摘 finalizer 的目的已经达到，把它当错误往上抛只会
+// 推高 controller_runtime_reconcile_errors_total 并打一条 reconciler error 日志——
+// 而那个指标正是运维配告警的地方。
+//
+// 这里守的是**并发**，不再是一条每次都走的路径。从前 Reconcile 读的是 informer cache：
+// finalizer 摘掉、对象被 API server 真正删除之后，缓存里那份带 finalizer 的旧版本还会
+// 再唤起一轮删除，那一轮的 Update 必然 NotFound，于是**每一次 Binding 删除**（Orphan
+// 也不例外）都会抛一次。Reconcile 改用 APIReader 直读之后，那一轮在开头就 NotFound
+// 早退，进不到这里。剩下的是真正的并发：本轮进行中对象被另一条路径删掉。
+// 罕见不是不会——这行吸收留着，代价为零。
 func (r *AliyunCertificateBindingReconciler) finishBindingDeletion(ctx context.Context, rd *bindingRound) (ctrl.Result, error) {
 	controllerutil.RemoveFinalizer(rd.b, certsv1alpha1.FinalizerName)
 	if err := client.IgnoreNotFound(r.Update(ctx, rd.b)); err != nil {

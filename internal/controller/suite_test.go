@@ -59,6 +59,7 @@ var (
 	k8sClient client.Client
 
 	reconciler *AliyunCertificateReconciler
+	certReads  *certReadCounter
 	fakeCAS    *fake.CAS
 	fakeMu     sync.Mutex
 	nsCounter  int
@@ -139,8 +140,12 @@ var _ = BeforeSuite(func() {
 	Expect(RegisterIndexes(k8sManager)).To(Succeed())
 
 	resetCAS()
+	// 证书侧的 Client 套一层计数器：Reconcile 第一句必读一次本对象，用作「证书
+	// controller 跑了几轮」的代理指标（见 certReadCounter）。只在 manager 起来**之前**
+	// 赋值，所以不存在并发写；其余方法原样委派，行为不变。
+	certReads = &certReadCounter{Client: k8sManager.GetClient(), n: map[string]int{}}
 	reconciler = &AliyunCertificateReconciler{
-		Client:    k8sManager.GetClient(),
+		Client:    certReads,
 		APIReader: k8sManager.GetAPIReader(),
 		Scheme:    k8sManager.GetScheme(),
 		Recorder:  k8sManager.GetEventRecorderFor("aliyuncertificate"),

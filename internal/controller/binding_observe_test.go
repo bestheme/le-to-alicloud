@@ -415,10 +415,11 @@ var _ = Describe("绑定 controller：Observe", func() {
 		eventually(func() bool { return currentFC3().GetCallsFor(domain) >= 8 })
 		n := bindingEventCount(ctx, ns, "b11", certsv1alpha1.ReasonObserveFailed)
 		Expect(n).To(BeNumerically(">=", 1), "跃迁那一轮必须发一条")
-		// 不断言恰好等于 1：跃迁判据取自 informer cache 里的那一份（rd.orig），缓存
-		// 滞后时紧邻的一两轮可能仍看着旧 reason，于是多发一条——**有界**的重复。
-		// 要钉死的是「有界」：坏掉的实现是每一轮都发，事件数跟着轮次一起涨。
-		Expect(n).To(BeNumerically("<=", 3),
+		// 不断言恰好等于 1：跃迁判据 rd.orig 现在来自 APIReader 直读，是 API server 的
+		// 真值，「cache 滞后所以多发一条」已经不成立；余量留给「status patch 失败、本轮
+		// 重来而上一轮 reason 没落盘」这一种真重复。
+		// 要钉死的仍是「有界」：坏掉的实现是每一轮都发，事件数跟着轮次一起涨。
+		Expect(n).To(BeNumerically("<=", 2),
 			fmt.Sprintf("已失败 %d 轮却发了 %d 条事件——事件数不该跟轮次一起涨",
 				currentFC3().GetCallsFor(domain), n))
 	})
@@ -513,12 +514,12 @@ var _ = Describe("绑定 controller：Observe", func() {
 		eventually(func() bool { return currentFC3().UpdateCallsFor(domain) >= 8 })
 		rounds := currentFC3().UpdateCallsFor(domain)
 
-		// 与 ObserveFailed 那一条同样的读法：跃迁判据取自 informer cache 里的那一份
-		// （rd.orig），缓存滞后时紧邻的一两轮可能仍看着旧值，于是多记一两次——**有界**的
-		// 重复。要钉死的是「有界」：坏掉的实现每一轮都记，数字跟着轮次一起涨。
+		// 与 ObserveFailed 那一条同样的读法：判据 rd.orig 来自 APIReader 直读，是真值；
+		// 余量留给「patch 失败、本轮重来」那一种真重复，不再是「cache 滞后」。
+		// 要钉死的是「有界」：坏掉的实现每一轮都记，数字跟着轮次一起涨。
 		events := bindingEventCount(ctx, ns, "b13", certsv1alpha1.ReasonDriftCorrected)
 		Expect(events).To(BeNumerically(">=", 1), "跃迁那一轮必须发一条")
-		Expect(events).To(BeNumerically("<=", 3),
+		Expect(events).To(BeNumerically("<=", 2),
 			fmt.Sprintf("已失败 %d 轮却发了 %d 条事件——事件数不该跟轮次一起涨", rounds, events))
 		drifts := promtestutil.ToFloat64(
 			bindingDriftTotal.WithLabelValues(certsv1alpha1.TargetTypeFC3CustomDomain)) - before

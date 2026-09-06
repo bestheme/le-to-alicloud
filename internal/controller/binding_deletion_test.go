@@ -154,16 +154,15 @@ var _ = Describe("绑定 controller：删除", func() {
 		// 写次数用**等号**：一次都不许写，这就是「一动不动」的全部含义，且不受下面那个
 		// 时序影响。
 		Expect(currentFC3().UpdateCallsFor(domain)).To(Equal(writes), "解绑别人的证书是越权")
-		// 读次数只能用「至少一次」。基线取自 switchToUnbind 之后的静默点，此后唯一能
-		// 推动它的就是删除，所以这里不存在「无关唤醒把断言骗过去」的空子。但删除**恰好
-		// 读几次**是不确定的：实测删除会跑 1–2 轮 unbindTarget——摘掉 finalizer 之后
-		// informer cache 可能仍持有带 finalizer 的旧版本，据此再进一轮删除分支（日志里
-		// 能看到第二条「跳过解绑」出现在「binding deleted」之后）。那一轮被指纹与账号两
-		// 道闸挡下，是无害的重复读，但它让精确等号变成一个看时序的断言。钉死次数需要在
-		// 删除分支里改用 APIReader 直读，代价是每一轮删除多一次 API 调用——留给
-		// reviewer 定夺，不在本轮改。
-		Expect(currentFC3().GetCallsFor(domain)).To(BeNumerically(">=", reads+1),
-			"Unbind 必须先 Observe 才能判断这张证书是不是自己写的")
+		// 读次数用**等号**：一次删除只该 Observe 一次。基线取自 switchToUnbind 之后的
+		// 静默点，此后唯一能推动它的就是删除。
+		//
+		// 这条断言从前只能写成「至少一次」：删除分支读的是 informer cache，摘掉 finalizer
+		// 之后缓存里那份带 finalizer 的旧版本还会再唤起一轮删除分支（日志里能看到第二条
+		// 「跳过解绑」出现在「binding deleted」之后），实测每次删除跑 1–2 轮 unbindTarget。
+		// Reconcile 改用 APIReader 直读之后那一轮在开头就 NotFound 早退，次数因此钉得死。
+		Expect(currentFC3().GetCallsFor(domain)).To(Equal(reads+1),
+			"Unbind 必须先 Observe 才能判断这张证书是不是自己写的，而且只该 Observe 一次")
 	})
 
 	It("Unbind：目标已经不存在时直接摘 finalizer", func() {
@@ -178,8 +177,8 @@ var _ = Describe("绑定 controller：删除", func() {
 		eventually(func() bool { return bindingGone(ctx, ns, "b4") })
 		// 同上：finalizer 被摘掉这一点，一个什么都不做的存根也能做到。真正要立的是
 		// 「走了 Unbind、Observe 撞上 TargetNotFound、把它当成功收场」这条路径。
-		// 同样只能用「至少一次」，理由见上一个用例。
-		Expect(currentFC3().GetCallsFor(domain)).To(BeNumerically(">=", reads+1),
+		// 同样用等号，理由见上一个用例（Reconcile 直读，删除只跑一轮）。
+		Expect(currentFC3().GetCallsFor(domain)).To(Equal(reads+1),
 			"Unbind 必须先 Observe；域名不存在才是这一路径要吸收的那个错误")
 	})
 
@@ -253,9 +252,10 @@ var _ = Describe("绑定 controller：删除", func() {
 
 // notFoundOnUpdate 造一个「读得到、写不进去」的 client：Update 一律以 NotFound 失败。
 //
-// 它复现的是删除分支上一个每次都会发生的时序：finalizer 摘掉、对象被 API server 真正
-// 删除之后，informer cache 里那份带 finalizer 的旧版本还会再唤起一轮删除，而那一轮的
-// Update 打在一个已经不存在的对象上。
+// 它复现的是「摘 finalizer 时对象已经不在了」这个时序。从前它每次删除都会发生：删除
+// 分支读的是 informer cache，对象真删之后缓存里那份带 finalizer 的旧版本还会再唤起
+// 一轮，那一轮的 Update 必然打在空处。Reconcile 改用 APIReader 直读之后，剩下的是
+// 本轮进行中被另一条路径删掉的并发窗口——窄了很多，但吸收 NotFound 的理由没变。
 func notFoundOnUpdate(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().
@@ -280,7 +280,8 @@ func TestFinishBindingDeletion_IgnoresNotFound(t *testing.T) {
 	b.Namespace, b.Name = "ns1", "b1"
 	b.Finalizers = []string{certsv1alpha1.FinalizerName}
 
-	r := &AliyunCertificateBindingReconciler{Client: notFoundOnUpdate(t, b.DeepCopy())}
+	c := notFoundOnUpdate(t, b.DeepCopy())
+	r := &AliyunCertificateBindingReconciler{Client: c, APIReader: c}
 	res, err := r.finishBindingDeletion(context.Background(), newBindingRound(b))
 	if err != nil {
 		t.Fatalf("对象已经不在了，摘 finalizer 的目的已经达到，不该报错: %v", err)
@@ -305,7 +306,7 @@ func TestFinishBindingDeletion_PropagatesOtherErrors(t *testing.T) {
 			},
 		}).Build()
 
-	r := &AliyunCertificateBindingReconciler{Client: c}
+	r := &AliyunCertificateBindingReconciler{Client: c, APIReader: c}
 	if _, err := r.finishBindingDeletion(context.Background(), newBindingRound(b)); !errors.Is(err, boom) {
 		t.Fatalf("非 NotFound 的写入失败必须抛上去: %v", err)
 	}

@@ -336,7 +336,7 @@ func handleFixture(t *testing.T) (*AliyunCertificateBindingReconciler, *bindingR
 	c := fake.NewClientBuilder().WithScheme(factoryScheme(t)).
 		WithObjects(b.DeepCopy()).
 		WithStatusSubresource(&certsv1alpha1.AliyunCertificateBinding{}).Build()
-	return &AliyunCertificateBindingReconciler{Client: c}, newBindingRound(b)
+	return &AliyunCertificateBindingReconciler{Client: c, APIReader: c}, newBindingRound(b)
 }
 
 func TestHandleFactoryError_Credentials(t *testing.T) {

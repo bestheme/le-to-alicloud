@@ -377,6 +377,12 @@ var bindingMeaningfulChange = predicate.Or(
 
 // SetupWithManager 注册 watch：主资源，外加证书变化与同目标 peer 的反查。
 func (r *AliyunCertificateBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// APIReader 是必填的：Reconcile 第一句就用它读本对象。漏接线的话第一轮 reconcile 才
+	// 在 worker 里 nil 解引用 panic，而 panic 出在 reconcile 循环里比一条接线错误难查得多
+	// （与 providerClient 里挡 nil ProviderFactory 同一条理由）。启动时就说清楚。
+	if r.APIReader == nil {
+		return errors.New("APIReader 未配置：Reconcile 用它直读本对象，见那里的注释")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&certsv1alpha1.AliyunCertificateBinding{}, builder.WithPredicates(bindingMeaningfulChange)).
 		// 证书的 status.current 一变就要唤醒引用它的全部 Binding。用 field index 反查，

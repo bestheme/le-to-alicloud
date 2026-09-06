@@ -199,9 +199,11 @@ var _ = Describe("绑定 controller：Apply", func() {
 		eventually(func() bool { return currentFC3().UpdateCallsFor(domain) >= 8 })
 		n := bindingEventCount(ctx, ns, "b2", certsv1alpha1.ReasonApplyFailed)
 		Expect(n).To(BeNumerically(">=", 1), "跃迁那一轮必须发一条")
-		// 不断言恰好等于 1：跃迁判据取自本轮开始时读到的那一份，informer cache 滞后时
-		// 紧邻的一两轮可能仍看着旧 reason，于是多发一条——**有界**的重复。
-		Expect(n).To(BeNumerically("<=", 3),
+		// 不断言恰好等于 1：跃迁判据取自本轮开始时读到的那一份，而 Reconcile 现在走
+		// APIReader 直读（见那里的注释），那一份就是 API server 的真值——「cache 滞后所以
+		// 多发一条」这个从前的解释已经不成立了。留一格余量是给另一件事：status patch 本身
+		// 失败时本轮会重来，而上一轮的 reason 没落盘，那一轮会真的再发一条。
+		Expect(n).To(BeNumerically("<=", 2),
 			fmt.Sprintf("已失败 %d 轮却发了 %d 条事件——事件数不该跟轮次一起涨",
 				currentFC3().UpdateCallsFor(domain), n))
 	})

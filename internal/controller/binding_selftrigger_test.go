@@ -98,8 +98,13 @@ var _ = Describe("绑定 controller：status 写入不自唤醒", func() {
 		// 要钉的是终态之后的增长：5 分钟的窗口里一轮都不该再有。容差 +1 留给基线那一刻
 		// 可能正在飞的那一轮。修复前这里不是 +1 而是每秒好几轮，一路涨到窗口结束。
 		updates, gets := currentFC3().UpdateCallsFor(domain), currentFC3().GetCallsFor(domain)
+		// 基线本身也要有个绝对上界，否则「建对象到进入终态」这一段打了多少次云完全不设限，
+		// 一个「每次证书 status 变化唤醒十轮」的回归会从这里静默溜过去。给得宽（设置阶段
+		// 实测 1–3 次，-race 下略多），这一条挡的是数量级，不是精确轮次。
+		Expect(updates).To(BeNumerically("<=", 8),
+			"进入终态之前也不该打这么多次云——设置阶段的唤醒放大同样是回归")
 		Consistently(func() int { return currentFC3().UpdateCallsFor(domain) },
-			"15s", "250ms").Should(BeNumerically("<=", updates+1),
+			"8s", "250ms").Should(BeNumerically("<=", updates+1),
 			"status 写入不该把自己唤醒——一个 5 分钟的失败周期只该打一次云")
 		Expect(currentFC3().GetCallsFor(domain)).To(BeNumerically("<=", gets+1),
 			"Observe 的次数同样受轮次约束")
