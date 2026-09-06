@@ -48,6 +48,7 @@ type FC3 struct {
 	getErrs    []error
 	updateErrs []error
 
+	alwaysUpdateErr error
 	failAfterCommit error
 
 	getCalls    int
@@ -97,6 +98,18 @@ func (f *FC3) QueueGetErr(err error) { f.mu.Lock(); f.getErrs = append(f.getErrs
 func (f *FC3) QueueUpdateErr(err error) {
 	f.mu.Lock()
 	f.updateErrs = append(f.updateErrs, err)
+	f.mu.Unlock()
+}
+
+// AlwaysUpdateErr 让此后**每一次** UpdateCustomDomain 都在生效前返回该错误。
+//
+// 与 QueueUpdateErr 的差别是有界与无界。排队表达的是「失败 N 次之后恢复」，用它模拟
+// 一个不会自己恢复的状态（RAM 上少一条 fc:UpdateCustomDomain）就得先猜一个轮次上界；
+// 而「轮次根本没有上界」恰恰是自唤醒那条用例要证明的事，用队列写它等于把结论塞进前提。
+// 优先级高于 QueueUpdateErr：两者同时设置时队列永远轮不到。
+func (f *FC3) AlwaysUpdateErr(err error) {
+	f.mu.Lock()
+	f.alwaysUpdateErr = err
 	f.mu.Unlock()
 }
 
@@ -158,6 +171,9 @@ func (f *FC3) UpdateCustomDomain(_ context.Context, domain string, in *aliyun.Up
 	defer f.mu.Unlock()
 	f.updateCalls++
 	f.updateCallsFor[domain]++
+	if f.alwaysUpdateErr != nil {
+		return f.alwaysUpdateErr
+	}
 	if err := pop(&f.updateErrs); err != nil {
 		return err
 	}
