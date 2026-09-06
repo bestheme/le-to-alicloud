@@ -126,7 +126,7 @@ envtest 里的 Secret 是 `simulateIssuance` 造出来的（没有真的 cert-ma
 |---|---|
 | **A** | 维持现状：不给 Secret 加 ownerRef，删除路径显式删 Secret，RBAC 保留 `secrets: get;delete` |
 | **B** | operator 给 Secret 加 ownerRef，删除路径同时去掉 c（等 Certificate NotFound）与 d（删 Secret），完全交给 GC |
-| **C** | operator 给 Secret 加 ownerRef，保留 c（仍等 Certificate NotFound），只去掉 d，RBAC 由 `delete` 换成 `patch` |
+| **C** | operator 给 Secret 加 ownerRef，保留 c（仍等 Certificate NotFound），只去掉 d，RBAC 由 `delete` 换成 `patch`。**注意**：§4.8 表明要达到 A 的可靠性还须保留 `delete` 作回落，届时 RBAC 是 `get;patch;delete`，比现状更宽 |
 | **D** | 代码与 RBAC 一律不动，只在部署文档里把 cert-manager 的 `--enable-certificate-owner-ref=true` 记为可选加固 |
 
 ### 3.1 对比表
@@ -134,8 +134,8 @@ envtest 里的 Secret 是 `simulateIssuance` 造出来的（没有真的 cert-ma
 | 维度 | A 维持现状 | B 全去掉 | C 折中 | D 只加文档 |
 |---|---|---|---|---|
 | **代码改动面** | 无 | 新增 `ensureSecretOwnerRef`（reconcile 热路径，需幂等 + 冲突重试）；`deletion.go:128-148` 整段删除 | 新增 `ensureSecretOwnerRef`；只删 `deletion.go:144-148` | 无 |
-| **RBAC** | `secrets: get;delete` | `secrets: get;patch` | `secrets: get;patch` | 不变 |
-| **RBAC 净效果** | — | `delete` → `patch`，从「能删」升级为「能改写任意 Secret 内容」 | 同 B | — |
+| **RBAC** | `secrets: get;delete` | `secrets: get;patch` | `secrets: get;patch`；若按 §4.8 补回落则为 `get;patch;delete` | 不变 |
+| **RBAC 净效果** | — | `delete` → `patch`，从「能删」升级为「能改写任意 Secret 内容」 | 同 B；补回落后是 `delete` **加上** `patch`，纯粹变宽 | — |
 | **删除时序** | 见 §3.2 | 见 §3.3 | 见 §3.4 | 同 A |
 | **孤儿 Secret 风险** | 低（operator 显式删；失败会重试到 finalizer 摘除前） | **高**：GC 无序 + informer 延迟导致 cert-manager 重建出无 owner 的 Secret（§3.3），叠加下一行 | **中**：竞速窗口被消掉，但「ownerRef 从未写上」仍留永久孤儿（§4.8） | 低（多一道兜底） |
 | **私钥残留窗口**（统一从用户发起删除起算） | CAS 清理 + 等 Certificate NotFound + 一次 Delete | B 省掉「等 Certificate NotFound」那一段，但末尾多一段未实测的 GC 排队延迟，端到端未必比 A 慢 | 与 A 同前半段，末尾换成未实测的 GC 延迟 | 同 A |
@@ -156,7 +156,8 @@ envtest 里的 Secret 是 `simulateIssuance` 造出来的（没有真的 cert-ma
   → a 无活 Binding
   → b CAS 各代删除（有界，超时 Abandon）
   → c Delete(Certificate)；每 2s 重查，直到 NotFound
-        （cert-manager 自己的 finalizer 在这期间跑完）
+        （Certificate 没有 finalizer，etcd 里立刻就没了；这几轮重查
+         等的是本 operator 的 informer cache 收敛，见 §3.4）
   → d Delete(Secret)                    ← 此刻 Certificate 已确认不存在，不会被重建
   → e RemoveFinalizer → AliyunCertificate 真正消失
 ```
@@ -313,7 +314,7 @@ _, err = s.secretClient.Secrets(secret.Namespace).Apply(ctx, applyCnf, applyOpts
 
 1. **cert-manager 写 Secret 确实走 SSA**（`Apply` + `FieldManager` + `Force: true`）。这不是观测，是钉住的依赖源码。§6 原先的假设「探针集群上是不是 SSA 无从确认」可以直接关掉。
 2. **不开 owner-ref flag 时，apply 配置根本不声明 `ownerReferences`**（`:109-111` 只有 annotations/labels/data/type；`:116-123` 那段带 ownerRef 的分支被 `if s.enableSecretOwnerReferences` 挡着）。SSA 只移除「同一 field manager 之前拥有、这次省略」的字段，而我们那条 ownerRef 属于另一个 field manager，不在移除范围内。**这就是 #6 观测到「保留」的机制**——不是巧合。
-3. **所有签发/重签路径都汇到这同一次 `Apply`**：非测试调用点只有两处，`issuing_controller.go:464`（签发路径）与 `secret_manager.go:99`（secretTemplate 复核路径），两者都调 `secretsManager.UpdateData`（接线在 `issuing_controller.go:165`）。与 issuer 类型（SelfSigned / ACME）和重签触发原因（`dnsNames` / `issuerRef` / duration）**无关**。
+3. **所有写 Secret 的路径都汇到这同一次 `Apply`**：非测试调用点共三处——`issuing_controller.go:464`（签发路径）、`secret_manager.go:99`（secretTemplate 复核路径）、`temporary.go:75`（`cert-manager.io/issue-temporary-certificate` 的临时证书路径，spec `:71` 列了这个注解，本仓库 §5.4 的临时证书拒绝规则（`:389`）与 D14（`:896`）也依赖它）——三者都调 `secretsManager.UpdateData`（接线在 `issuing_controller.go:165`）。与 issuer 类型（SelfSigned / ACME）和重签触发原因（`dnsNames` / `issuerRef` / duration）**无关**。
 
 所以「只测了 SelfSigned」和「只测了 `dnsNames` 触发」这两条在机制上不再有分量，本节不再把它们当作论据。
 
@@ -346,7 +347,7 @@ _, err = s.secretClient.Secrets(secret.Namespace).Apply(ctx, applyCnf, applyOpts
 关于 D 的两条限定，都要写进文档：
 
 - **不能设为默认或强制**：`--enable-certificate-owner-ref` 是集群级 cert-manager 部署参数，影响集群里**所有** Certificate 的 Secret 生命周期，不是本 operator 能单方面决定的，也无法在运行时低成本探测。它只能是「可选加固，副作用见 cert-manager 文档」。
-- **上游打算弃用它**：`cert-manager@v1.21.1/design/20220720-per-certificate-owner-ref.md:64` 写着「We intend to remove `--enable-certificate-owner-ref` within 3 to 6 releases. Or maybe never since the maintenance burden won't be high.」，替代品是 per-Certificate 的 `deletionPolicy`。v1.21.1 的 `CertificateSpec` 里**还没有**这个字段（`pkg/apis/certmanager/v1/types_certificate.go` 里 grep 不到 `DeletionPolicy`），所以今天不存在一个「靠 `deletionPolicy` 解决」的方案 E。推荐 D 时要说明它依赖一个上游态度不明的 flag。
+- **上游打算弃用它**：`cert-manager@v1.21.1/design/20220720-per-certificate-owner-ref.md:64` 写着「We intend to remove `--enable-certificate-owner-ref` within 3 to 6 releases. Or maybe never since the maintenance burden won't be high. We will strongly recommend users to switch to `--default-secret-deletion-policy`.」——注意上游给的替代品名字是 controller flag `--default-secret-deletion-policy`，对应 per-Certificate 的 `deletionPolicy` 字段。v1.21.1 的 `CertificateSpec` 里**还没有**这个字段（`pkg/apis/certmanager/v1/types_certificate.go` 里 grep 不到 `DeletionPolicy`），所以今天不存在一个「靠 `deletionPolicy` 解决」的方案 E。推荐 D 时要说明它依赖一个上游态度不明的 flag。
 
 ### 5.2 若最终仍决定采纳 C，需要的 Task（只列标题与验收）
 
@@ -373,7 +374,7 @@ _, err = s.secretClient.Secrets(secret.Namespace).Apply(ctx, applyCnf, applyOpts
 **这条 Task 存在本身就是 C 的收益证伪**（§4.8）：要达到与 A 相同的可靠性，`delete` 必须留着。派发前先确认决策者接受「RBAC 净变宽」这个结果。
 
 **Task 6：RBAC 变更与文档同步**
-验收：`aliyuncertificate_controller.go:113` 的 marker 由 `get;delete` 改为 `get;patch`，`make manifests` 后 `config/rbac/role.yaml` 一致；README 的权限说明与 spec `:610` 的「诚实的表述」段落必须**显式**写出 `patch` 是写权限、比 `delete` 影响面更大，不允许把这次改动描述成「收窄权限」。
+验收：`aliyuncertificate_controller.go:113` 的 marker 改为 `get;patch;delete`——`delete` 必须留着，因为 Task 5b 的回落路径要用它（理由见 §4.8）；只有在明确放弃那条回落时才改成 `get;patch`。`make manifests` 后 `config/rbac/role.yaml` 一致；README 的权限说明与 spec `:610` 的「诚实的表述」段落必须**显式**写出 `patch` 是写权限、比 `delete` 影响面更大，不允许把这次改动描述成「收窄权限」。
 
 **Task 7：删除路径改造**
 验收：保留 `deletion.go:128-143`（等 Certificate NotFound），删除 `:144-148`；`deletion_test.go:244` 与 `:346` 的断言改为「Secret 仍在，但带有指向本 CR 的 ownerRef」，并在用例里注释说明 envtest 无 GC（spec `:80`）、真正的删除由 #15 在真实集群背书。
@@ -421,7 +422,7 @@ _, err = s.secretClient.Secrets(secret.Namespace).Apply(ctx, applyCnf, applyOpts
 | 原假设 | 关掉的依据 |
 |---|---|
 | 探针集群上 cert-manager 写 Secret 走的是不是 SSA | `secret.go:108`/`:127` 是 `Apply` + `FieldManager` + `Force: true`，确为 SSA |
-| #6 能否推广到 `dnsNames` 之外的重签触发路径 | 非测试调用点只有 `issuing_controller.go:464` 与 `secret_manager.go:99`，都汇到同一个 `UpdateData`（接线在 `issuing_controller.go:165`），与触发原因无关 |
+| #6 能否推广到 `dnsNames` 之外的重签触发路径 | 非测试调用点共三处——`issuing_controller.go:464`、`secret_manager.go:99`、`temporary.go:75`——都汇到同一个 `UpdateData`（接线在 `issuing_controller.go:165`），与触发原因无关 |
 | #6 能否推广到 ACME issuer | 同上，与 issuer 类型无关 |
 
 另外一条从「推断」升格为**已查证**：cert-manager 在 `--enable-certificate-owner-ref=true` 下挂的是 controller ref 且带 `BlockOwnerDeletion`——`secret.go:117` 是 `ref := *metav1.NewControllerRef(crt, certificateGvk)`，`:121` 原样透传 `ref.Controller` 与 `ref.BlockOwnerDeletion`。
