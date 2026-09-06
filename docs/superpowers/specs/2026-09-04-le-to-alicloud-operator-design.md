@@ -350,12 +350,6 @@ const (
       改指到别人的 Secret 会让 cert-manager 用本证书覆写它（§5.6 步骤 d 的复核挡不住：
       那时注解已被改成指向本 CR）
     - 冲突时保持 Certificate 上的旧 secretName 不动，绝不 update
-    - **本轮到此为止**：探测 CAS 存在性、按保留策略回收、复读 Secret、上传新代次全部
-      暂停，直到冲突解除。这与步骤 4「签发停滞绝不结束本轮」的原则**相反**，是有意为之：
-      §5.4 之后的每一步都以 spec.secretName 为准（loadBundle 读的就是它），继续往下走
-      等于去读受害 Secret 的私钥并把它传上 CAS——比暂停维护糟得多。代价是冲突挂得久的
-      话，服役中的证书可能在无人续传的情况下静默过期，所以这条路径必须靠
-      Ready=False/SecretNameConflict 与 aliyuncert_certificate_ready 告警被看见
  3. CreateOrUpdate cmapi.Certificate（ownerRef 指向自己）
     - 期望态比对后才 update，避免无谓写入（LE 速率限制护栏）
     - 绝不因为「Secret 内容不对」删除并重建 Certificate
