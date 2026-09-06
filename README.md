@@ -677,7 +677,7 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 | condition | reason | 含义 | 处置 |
 |---|---|---|---|
 | `Issued=False` | `NoIssuer` | 既没写 `issuerRef` 也没配 `--default-issuer-name` | 补 `spec.certificateTemplate.issuerRef`。**不会自动重试**，等 spec 变更 |
-| `Ready=False` | `SecretNameConflict` | 目标 Secret 已存在，且不是我们这个 `Certificate` 的产物（判据是 `cert-manager.io/certificate-name` 注解，无注解的手工 Secret 同样算冲突）。**创建前检查一次，之后每次 `spec.secretName` 改指到新目标时重新检查**——改指期间 operator 不会更新 `Certificate`，所以别人的 Secret 不会被 cert-manager 覆写 | 改 `spec.secretName`，或删掉占用者。每个 resync 周期自动重试 |
+| `Ready=False` | `SecretNameConflict` | 目标 Secret 已存在，且不是我们这个 `Certificate` 的产物（判据是 `cert-manager.io/certificate-name` 注解，无注解的手工 Secret 同样算冲突）。**创建前检查一次，之后每次 `spec.secretName` 改指到新目标时重新检查**——改指期间 operator 不会更新 `Certificate`，所以别人的 Secret 不会被 cert-manager 覆写。**被拦住不等于停摆**：原来那个 Secret 仍在服役，续期、CAS 探测、上传、回收全部照常，只是 `Ready` 被一票否决（`Issued` / `Uploaded` 仍反映在役证书的真实状态） | 改 `spec.secretName`，或删掉占用者。每个 resync 周期自动重试 |
 | `Issued=False` | `CertificateNotReady` | cert-manager 正在签发 | 看 `describe certificate` 与它下面的 CertificateRequest / Order / Challenge |
 | `Issued=False` | `IssuanceStalled` | `Issuing=True` 超过 `--issuance-stall-threshold` | 多半是 DNS-01 solver 坏了或撞了 Let's Encrypt 速率限制。**这期间 CAS 探测、保留策略回收、Secret 复读照常进行** |
 | `Issued=False` | `SecretNotFound` | Secret 还没出现，或者被删了 | 检查 cert-manager 是否正常、Secret 是否被误删 |

@@ -349,7 +349,15 @@ const (
       且必须在步骤 3 的 update 之前——spec.secretName 可变，护栏若只在首次创建时跑，
       改指到别人的 Secret 会让 cert-manager 用本证书覆写它（§5.6 步骤 d 的复核挡不住：
       那时注解已被改成指向本 CR）
-    - 冲突时保持 Certificate 上的旧 secretName 不动，绝不 update
+    - 冲突时**跳过步骤 3**（保持 Certificate 上的旧 secretName 不动，绝不 update），
+      但**不结束本轮**：步骤 4–10 照常，全部以 Certificate 上仍然生效的那个在役 Secret
+      为准（读 Secret 的名字取 `cert.Spec.SecretName`，不取 `spec.secretName`）。
+      与步骤 4 的停滞不早退同一条原则：在役的仍是一张有效、正在服役的证书，
+      cert-manager 照样会给它续期，早退会让这些新代次永远传不上 CAS
+    - Ready 由 secretName 冲突**一票否决**：Issued / Uploaded 照常反映在役证书的真实
+      状态（都可以是 True），但 Ready 必须停在 False/SecretNameConflict——用户要的状态
+      并没有达成。判据是 `status.secretName`（只在步骤 3 成功后赋值）与 spec 分叉
+    - Certificate 尚未创建时（首次创建撞冲突）没有在役 Secret 可维护，此时仍然早退
  3. CreateOrUpdate cmapi.Certificate（ownerRef 指向自己）
     - 期望态比对后才 update，避免无谓写入（LE 速率限制护栏）
     - 绝不因为「Secret 内容不对」删除并重建 Certificate

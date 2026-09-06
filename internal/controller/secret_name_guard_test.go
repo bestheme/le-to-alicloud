@@ -59,6 +59,63 @@ func TestSecretOwnedByUs(t *testing.T) {
 	}
 }
 
+// TestServingSecretName 固定「读哪个 Secret」的决策：已经生效的那个名字优先，只有它为空
+// （对象还没走完第一轮）才回落到 spec。护栏拦住期间 spec 指着别人的 Secret，回落错了就是
+// 读别人的私钥。
+func TestServingSecretName(t *testing.T) {
+	cases := []struct {
+		name       string
+		specSecret string
+		effective  string
+		want       string
+	}{
+		{"生效值优先于 spec", "victim-tls", "mine-tls", "mine-tls"},
+		{"生效值为空时回落到 spec.secretName", "explicit-tls", "", "explicit-tls"},
+		{"生效值与 spec 都为空时回落到 <name>-tls", "", "", "mine-tls"},
+		{"spec 为空但已有生效值", "", "old-tls", "old-tls"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ac := &certsv1alpha1.AliyunCertificate{
+				ObjectMeta: metav1.ObjectMeta{Name: "mine", Namespace: "ns"},
+				Spec:       certsv1alpha1.AliyunCertificateSpec{SecretName: c.specSecret},
+			}
+			if got := servingSecretName(ac, c.effective); got != c.want {
+				t.Errorf("servingSecretName = %q, 期望 %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestSecretNameGuardHolding 固定「护栏是不是正拦着」的判据。它是 aggregateReady 一票否决
+// Ready 的唯一依据：冲突期间 Issued / Uploaded 都会正常变 True，只有这一条拦得住 Ready。
+func TestSecretNameGuardHolding(t *testing.T) {
+	cases := []struct {
+		name         string
+		specSecret   string
+		statusSecret string
+		want         bool
+	}{
+		{"spec 改指到别处而在役的还是旧的", "victim-tls", "mine-tls", true},
+		{"两者一致", "mine-tls", "mine-tls", false},
+		{"spec 为空、在役的是默认名", "", "mine-tls", false},
+		{"还没走完第一轮（status 为空）", "victim-tls", "", false},
+		{"清空 spec.secretName 回落默认名，而在役的是别的", "", "custom-tls", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ac := &certsv1alpha1.AliyunCertificate{
+				ObjectMeta: metav1.ObjectMeta{Name: "mine", Namespace: "ns"},
+				Spec:       certsv1alpha1.AliyunCertificateSpec{SecretName: c.specSecret},
+				Status:     certsv1alpha1.AliyunCertificateStatus{SecretName: c.statusSecret},
+			}
+			if got := secretNameGuardHolding(ac); got != c.want {
+				t.Errorf("secretNameGuardHolding = %v, 期望 %v", got, c.want)
+			}
+		})
+	}
+}
+
 var _ = Describe("证书 controller：Secret 归属护栏", func() {
 	ctx := context.Background()
 	var ca *testutil.CA
@@ -151,6 +208,59 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 		}
 		Expect(got.Annotations[certManagerCertificateNameAnnotation]).To(Equal("someone-else"),
 			"受害 Secret 的归属注解不该被改写")
+	})
+
+	// 被护栏拦住不等于停止维护。冲突期间在役的仍是一张有效、正在服役的证书，cert-manager
+	// 照样会给它续期——早退会让这些新代次永远走不到 CAS，服役证书静默过期。理由与
+	// aliyuncertificate_controller.go 里「签发停滞绝不结束本轮」那两段注释逐字相同。
+	It("冲突期间继续维护在役 Secret：续期照常上传，改回原名后 Ready 恢复", func() {
+		ns := newNamespace(ctx)
+
+		victim := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "victim2-tls", Namespace: ns,
+				Annotations: map[string]string{certManagerCertificateNameAnnotation: "someone-else"}},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       []byte("victim-cert-placeholder"),
+				corev1.TLSPrivateKeyKey: []byte("victim-key-placeholder"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, victim)).To(Succeed())
+
+		ac := baseAC(ns, "keep")
+		ac.Spec.SecretName = "keep-tls"
+		issueReady(ns, "keep", ac)
+		gen1 := getAC(ctx, ns, "keep").Status.Current
+		Expect(gen1).NotTo(BeNil())
+		Expect(gen1.CertID).NotTo(BeNil())
+
+		// 改指到别人的 Secret：护栏拦住，Certificate 上仍是 keep-tls。
+		setSecretName(ns, "keep", "victim2-tls")
+		eventually(func() bool {
+			return condReason(getAC(ctx, ns, "keep"), certsv1alpha1.ConditionReady) == certsv1alpha1.ReasonSecretNameConflict
+		})
+		cert, err := getCert(ctx, ns, "keep")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cert.Spec.SecretName).To(Equal("keep-tls"))
+
+		// cert-manager 给**在役** Secret 续期。被拦住期间这一代必须照常走完探测与上传。
+		crt2, key2 := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
+		simulateIssuance(ctx, ns, "keep", 2, crt2, key2)
+
+		eventually(func() bool {
+			cur := getAC(ctx, ns, "keep").Status.Current
+			return cur != nil && cur.Fingerprint != gen1.Fingerprint && cur.CertID != nil
+		})
+		gen2 := getAC(ctx, ns, "keep").Status.Current
+		Expect(currentCAS().Has(*gen2.CertID)).To(BeTrue(), "续期出的新代次必须真的传上 CAS")
+		// 维护照跑，但用户要的状态并没有达成：Ready 必须仍然停在 SecretNameConflict。
+		Expect(condReason(getAC(ctx, ns, "keep"), certsv1alpha1.ConditionReady)).
+			To(Equal(certsv1alpha1.ReasonSecretNameConflict))
+		Expect(condTrue(getAC(ctx, ns, "keep"), certsv1alpha1.ConditionIssued)).
+			To(BeTrue(), "在役证书本身是好的，Issued 应照常为 True")
+
+		// 改回原名，冲突解除，Ready 恢复。
+		setSecretName(ns, "keep", "keep-tls")
+		eventually(func() bool { return condTrue(getAC(ctx, ns, "keep"), certsv1alpha1.ConditionReady) })
 	})
 
 	// 删除期复核：Secret 在 CR 生命周期里被别的 Certificate 接管之后，删 CR 不能顺手把它删掉。

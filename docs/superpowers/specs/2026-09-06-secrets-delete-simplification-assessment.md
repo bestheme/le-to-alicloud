@@ -384,7 +384,9 @@ _, err = s.secretClient.Secrets(secret.Namespace).Apply(ctx, applyCnf, applyOpts
 
 **Task 9（独立，可先做）：堵住 `spec.secretName` 变更导致的覆写与误删** — **已实现（commit `b100b9f`，测试见 `a70c79e`）**
 
-两条都已落地：(a) 护栏改成「首次创建，或 desired 与 `existing.Spec.SecretName` 不同」时执行，位置仍在 `CreateOrUpdate` 之前；(b) 删除步骤 d 先 `Get` 再按注解复核归属，不匹配则跳过删除并发 Warning event。归属判定抽成纯函数 `secretOwnedByUs`（`desired.go`），创建期与删除期共用同一份判断。两个新 envtest 用例在 `internal/controller/secret_name_guard_test.go`。
+两条都已落地：(a) 护栏改成「首次创建，或 desired 与 `existing.Spec.SecretName` 不同」时执行，位置仍在 `CreateOrUpdate` 之前；(b) 删除步骤 d 先 `Get` 再按注解复核归属，不匹配则跳过删除并发 Warning event。归属判定抽成纯函数 `secretOwnedByUs`（`desired.go`），创建期与删除期共用同一份判断。新 envtest 用例在 `internal/controller/secret_name_guard_test.go`。
+
+**评审 I1（冲突分支早退导致维护全面停摆）已根治**：`loadBundle` 改为按调用方给出的名字读 Secret——证书 controller 传 `cert.Spec.SecretName`、绑定 controller 传 `status.secretName`，两者都是「已经生效」的那个（`servingSecretName`）。于是冲突时不必再早退：跳过 `CreateOrUpdate`，其余步骤照常以在役 Secret 为准，续期出的新代次仍会被探测、上传、回收。`Ready` 由 `secretNameGuardHolding`（`status.secretName` 与 spec 分叉）在 `aggregateReady` 里一票否决，`Issued` / `Uploaded` 照常反映在役证书的真实状态。Certificate 尚未创建的首次冲突仍然早退——那时没有在役 Secret 可维护。
 
 验收是**两条并列，缺一不可**（只做 (b) 是无效修复，理由见 §4.6）：
 

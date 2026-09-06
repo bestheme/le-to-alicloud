@@ -51,7 +51,12 @@ func loadBindingMaterial(
 
 	// 读 Secret 与解析这一段与证书 controller 共用，见 loadBundle：两边对同一个故障
 	// 必须给出同一组 reason / message，而零凭证泄漏的护栏也只该有一处。
-	b, me := loadBundle(ctx, reader, ac)
+	//
+	// 名字取 status.secretName 而不是 spec：它只在证书 controller 跑完 CreateOrUpdate
+	// 之后才从 cert.Spec.SecretName 赋值，反映的正是在役的那个 Secret。用户改了
+	// spec.secretName 而护栏正拦着的时候，这里必须继续读在役的那一个——读受害者的
+	// 私钥并把它推上 FC3 是这条路径上最坏的结果。
+	b, me := loadBundle(ctx, reader, ac.Namespace, servingSecretName(ac, ac.Status.SecretName))
 	if me != nil {
 		return m, me
 	}

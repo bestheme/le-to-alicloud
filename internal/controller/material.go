@@ -45,13 +45,17 @@ type materialError struct {
 // data key、改写 message、新增一类 invalid 子情形）都会只落在一份里，而用户看到的是
 // 两个 controller 对同一个故障给出不一样的 condition。
 //
+// **name 由调用方给出，不在这里从 spec 推导。** spec.secretName 是用户随时可改的字段，
+// 而改动要过 SecretNameConflict 护栏才会真正生效；护栏拦住期间按 spec 去读，读到的就是
+// 受害者的私钥，而它下一步会被传上 CAS。两个调用方各自传「已经生效」的那个名字，见
+// servingSecretName。
+//
 // 零凭证泄漏的护栏也因此只有这一处：pki 的错误只描述格式问题，不含密钥内容，可安全
 // 写入 message。
 func loadBundle(ctx context.Context, reader client.Reader,
-	ac *certsv1alpha1.AliyunCertificate) (*pki.Bundle, *materialError) {
+	namespace, name string) (*pki.Bundle, *materialError) {
 	s := &corev1.Secret{}
-	name := secretNameFor(ac)
-	err := reader.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: name}, s)
+	err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, s)
 	if apierrors.IsNotFound(err) {
 		return nil, &materialError{certsv1alpha1.ReasonSecretNotFound, fmt.Sprintf("Secret %q 不存在", name)}
 	}
@@ -67,7 +71,9 @@ func loadBundle(ctx context.Context, reader client.Reader,
 
 // loadMaterial 直读 Secret（不经 cache），解析并校验。任何失败都不上传。
 func loadMaterial(ctx context.Context, reader client.Reader, ac *certsv1alpha1.AliyunCertificate, cert *cmapi.Certificate) (*pki.Bundle, *materialError) {
-	b, me := loadBundle(ctx, reader, ac)
+	// 读 Certificate 上实际生效的那个名字：cert 是本轮 CreateOrUpdate 的结果，冲突被拦住
+	// 时它就是未被改动的 existing，于是这里读到的始终是在役 Secret。
+	b, me := loadBundle(ctx, reader, ac.Namespace, servingSecretName(ac, cert.Spec.SecretName))
 	if me != nil {
 		return nil, me
 	}

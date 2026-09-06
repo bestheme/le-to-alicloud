@@ -165,44 +165,57 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// 名字 Update 到 Certificate 上——cert-manager 随即用本证书的私钥覆写受害 Secret，
 	// 并把归属注解改成指向本 CR。那之后删除期的注解复核会一路放行，于是覆写加删除。
 	// 所以真正的护栏必须在这里、在 Update 之前拦住，删除期的复核只是兜底。
+	conflict := false
 	if existing == nil || existing.Spec.SecretName != secretNameFor(ac) {
-		conflict, err := r.secretNameConflict(ctx, ac)
-		if err != nil {
+		var err error
+		if conflict, err = r.secretNameConflict(ctx, ac); err != nil {
 			return ctrl.Result{}, err
 		}
-		if conflict {
-			setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse, certsv1alpha1.ReasonSecretNameConflict,
-				fmt.Sprintf("Secret %q 已存在且不属于本证书", secretNameFor(ac)))
-			// 这条路径上没有任何 watch 能唤醒我们：Certificate 要么从未创建（Owns 无对象），
-			// 要么内容没变、不会再产生事件；Secret 刻意不进 cache 也不 watch。占用者被删掉
-			// 后只能靠定时重试自愈。
-			return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
-		}
+	}
+	if conflict && existing == nil {
+		// Certificate 还没建出来：没有在役 Secret 可维护，后面每一步都无从谈起，只能早退。
+		// 这条路径上也没有任何 watch 能唤醒我们（Owns 无对象，Secret 刻意不进 cache 也不
+		// watch），占用者被删掉后只能靠定时重试自愈。
+		setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse,
+			certsv1alpha1.ReasonSecretNameConflict, secretNameConflictMessage(ac))
+		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
 	}
 
 	// 3. CreateOrUpdate cert-manager Certificate（只有 spec 真变了才会发出 Update）
-	cert := &cmapi.Certificate{ObjectMeta: metav1.ObjectMeta{Name: certManagerNameFor(ac), Namespace: ac.Namespace}}
-	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
-		cert.Spec = desiredCertificateSpec(ac, issuer)
-		if cert.Labels == nil {
-			cert.Labels = map[string]string{}
+	//
+	// 冲突时跳过这一步，但**不早退**：Certificate 与它的在役 Secret 都还在，里面躺着一张
+	// 有效、正在服役的证书，cert-manager 照样会给它续期。早退会让 operator 在冲突挂着的
+	// 整段时间里彻底停止维护它——不探测 CAS、不回收、不复读 Secret、续期出的新代次永远
+	// 传不上去——与步骤 4「签发停滞绝不结束本轮」是同一条原则。后面每一步用的都是
+	// existing 与它的在役 Secret（见 loadMaterial 里的 servingSecretName），不会碰到用户
+	// 刚指过去的那个受害 Secret。
+	cert := existing
+	if !conflict {
+		cert = &cmapi.Certificate{ObjectMeta: metav1.ObjectMeta{Name: certManagerNameFor(ac), Namespace: ac.Namespace}}
+		op, err := controllerutil.CreateOrUpdate(ctx, r.Client, cert, func() error {
+			cert.Spec = desiredCertificateSpec(ac, issuer)
+			if cert.Labels == nil {
+				cert.Labels = map[string]string{}
+			}
+			cert.Labels[certsv1alpha1.LabelManaged] = "true"
+			return controllerutil.SetControllerReference(ac, cert, r.Scheme)
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("同步 cert-manager Certificate 失败: %w", err)
 		}
-		cert.Labels[certsv1alpha1.LabelManaged] = "true"
-		return controllerutil.SetControllerReference(ac, cert, r.Scheme)
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("同步 cert-manager Certificate 失败: %w", err)
+		if op != controllerutil.OperationResultNone {
+			log.Info("cert-manager Certificate synced", "operation", op)
+		}
+		if op == controllerutil.OperationResultCreated && ac.Status.CertManagerCertificateName != "" {
+			// 之前已经创建过一次又不见了：重建会消耗 LE 配额，必须可观测
+			certManagerCertRecreatedTotal.WithLabelValues(ac.Namespace, ac.Name).Inc()
+			r.Recorder.Event(ac, corev1.EventTypeWarning, "CertificateRecreated", "cert-manager Certificate was recreated")
+		}
+		ac.Status.CertManagerCertificateName = cert.Name
+		// 这一行是 secretNameGuardHolding 的全部依据：status.secretName 只在这里被赋值，
+		// 冲突时走不到，于是它与 spec 分叉，aggregateReady 据此一票否决 Ready。
+		ac.Status.SecretName = cert.Spec.SecretName
 	}
-	if op != controllerutil.OperationResultNone {
-		log.Info("cert-manager Certificate synced", "operation", op)
-	}
-	if op == controllerutil.OperationResultCreated && ac.Status.CertManagerCertificateName != "" {
-		// 之前已经创建过一次又不见了：重建会消耗 LE 配额，必须可观测
-		certManagerCertRecreatedTotal.WithLabelValues(ac.Namespace, ac.Name).Inc()
-		r.Recorder.Event(ac, corev1.EventTypeWarning, "CertificateRecreated", "cert-manager Certificate was recreated")
-	}
-	ac.Status.CertManagerCertificateName = cert.Name
-	ac.Status.SecretName = cert.Spec.SecretName
 
 	// 4. 镜像 cert-manager status；未 Ready 则等 watch
 	mirrorIssuance(ac, cert)
@@ -328,7 +341,17 @@ func (r *AliyunCertificateReconciler) setUploadedCondition(ac *certsv1alpha1.Ali
 }
 
 // aggregateReady：Ready = Issued && (Uploaded || !uploadToCAS)。IssuerDefaultDiverged 不参与。
+//
+// secretName 冲突一票否决。冲突期间 operator 照常维护在役证书，Issued 与 Uploaded 都会
+// 正常变成 True——它们描述的是「在役的那张证书好不好」，而那张确实是好的。但用户要的
+// 状态并没有达成：他改了 spec.secretName，operator 拒绝执行。Ready 是对外的那一句话，
+// 必须说实话。
 func (r *AliyunCertificateReconciler) aggregateReady(ac *certsv1alpha1.AliyunCertificate) {
+	if secretNameGuardHolding(ac) {
+		setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse,
+			certsv1alpha1.ReasonSecretNameConflict, secretNameConflictMessage(ac))
+		return
+	}
 	issued := condTrue(ac, certsv1alpha1.ConditionIssued)
 	uploadedOK := !ac.Spec.Aliyun.UploadEnabled() || condTrue(ac, certsv1alpha1.ConditionUploaded)
 	if issued && uploadedOK {
