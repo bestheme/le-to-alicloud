@@ -136,7 +136,11 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 		// 受害 Secret 逐字节不变。用布尔断言而不是直接比对 map：失败时不该把字节倒进日志。
 		got := &corev1.Secret{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "victim-tls"}, got)).To(Succeed())
-		Expect(len(got.Data)).To(Equal(len(victimData)), "受害 Secret 的 data key 集合不该变")
+		gotKeys := make([]string, 0, len(got.Data))
+		for k := range got.Data {
+			gotKeys = append(gotKeys, k)
+		}
+		Expect(gotKeys).To(ConsistOf(corev1.TLSCertKey, corev1.TLSPrivateKeyKey), "受害 Secret 的 data key 集合不该变")
 		for k, want := range victimData {
 			Expect(bytes.Equal(got.Data[k], want)).To(BeTrue(), "受害 Secret 的 data[%s] 不该被改写", k)
 		}

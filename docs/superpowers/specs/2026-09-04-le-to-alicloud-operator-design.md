@@ -343,8 +343,13 @@ const (
 ```
  0. deletionTimestamp != nil → §5.6 清理分支
  1. 解析 issuerRef（§5.3）；无法解析 → Ready=False/NoIssuer，不 requeue（等 spec 变更）
- 2. 首次创建前检查 spec.secretName 对应的 Secret：已存在且不是我们 Certificate 的产物
-    → Ready=False/SecretNameConflict，不 requeue
+ 2. 检查 spec.secretName 对应的 Secret：已存在且不是我们 Certificate 的产物
+    → Ready=False/SecretNameConflict，按 resync 周期重排（占用者被删掉后自愈）
+    - 首次创建前跑一次；**此后每当 spec.secretName 与 Certificate 上的当前值不同就重跑**，
+      且必须在步骤 3 的 update 之前——spec.secretName 可变，护栏若只在首次创建时跑，
+      改指到别人的 Secret 会让 cert-manager 用本证书覆写它（§5.6 步骤 d 的复核挡不住：
+      那时注解已被改成指向本 CR）
+    - 冲突时保持 Certificate 上的旧 secretName 不动，绝不 update
  3. CreateOrUpdate cmapi.Certificate（ownerRef 指向自己）
     - 期望态比对后才 update，避免无谓写入（LE 速率限制护栏）
     - 绝不因为「Secret 内容不对」删除并重建 Certificate
@@ -412,8 +417,10 @@ const (
       Block   → 保持 finalizer，持续重试
  c. 显式删除 cmapi.Certificate，**等待其 NotFound**（ownerRef 级联是异步的；
     若 Secret 先删而 Certificate 还在，cert-manager 会立刻重签并重建 Secret）
- d. 删除 Secret
- e. 摘 finalizer
+ d. 删除 Secret，**但只删注解 cert-manager.io/certificate-name 指向本 CR 的那一个**
+    → 不匹配（含无注解的手工 Secret）则跳过删除 + Info 日志 + Warning event
+      SecretNameConflict；NotFound 视为已删。主防线是 §5.2 步骤 2 的护栏，这里是兜底
+ e. 摘 finalizer（d 跳过与否都照常摘）
 ```
 
 CAS 放在 Certificate 之前只是就近安排，无正确性差异；唯一硬约束是 **Certificate 必须先于 Secret 死**。

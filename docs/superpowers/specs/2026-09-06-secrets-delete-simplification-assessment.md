@@ -274,7 +274,7 @@ GC 的规则是「所有 owner 都消失才删 dependent」（**推断**，来�
 
 真正的护栏必须在步骤 2 之后仍然生效：把 `secretNameConflict` 移出 `existing == nil` 分支，在 `spec.secretName` 变更时、**更新 Certificate 之前**重新执行；或者干脆把 `spec.secretName` 定为不可变。删前复核只能作为兜底，单独做是无效修复。
 
-**现有 envtest 完全没有覆盖这条路径。** `reconcile_basic_test.go:151-176` 那个 `SecretNameConflict` 用例是**创建期**场景（先建裸 Secret 再建 CR，`:158-162`），占用者不带任何 cert-manager 注解；全仓库没有任何用例修改过一个已存在 CR 的 `spec.secretName`。顺带确认兜底那一半是低风险的：envtest 的 Secret 由 `upload_test.go:49-54` 的 `writeTLSSecret` 造出，名字 `<name>-tls`、注解 `cert-manager.io/certificate-name: <name>`，与 `certManagerNameFor` 一致，加复核不会打破现有用例。
+**（写作时）现有 envtest 完全没有覆盖这条路径**——Task 9 已补上两个用例，见 `internal/controller/secret_name_guard_test.go`。 `reconcile_basic_test.go:151-176` 那个 `SecretNameConflict` 用例是**创建期**场景（先建裸 Secret 再建 CR，`:158-162`），占用者不带任何 cert-manager 注解；全仓库没有任何用例修改过一个已存在 CR 的 `spec.secretName`。顺带确认兜底那一半是低风险的：envtest 的 Secret 由 `upload_test.go:49-54` 的 `writeTLSSecret` 造出，名字 `<name>-tls`、注解 `cert-manager.io/certificate-name: <name>`，与 `certManagerNameFor` 一致，加复核不会打破现有用例。
 
 **建议作为独立条目处理，不要与本评估的取舍绑定**，优先级中：它需要用户对 CR 有写权限并主动改 `secretName`，不构成外部攻击面；但 GitOps 场景下一次模板误改就能触发，后果是覆写加删除他人 Secret，且不可逆。验收见 Task 9。
 
@@ -382,7 +382,9 @@ _, err = s.secretClient.Secrets(secret.Namespace).Apply(ctx, applyCnf, applyOpts
 **Task 8：spec 与决策表更新**
 验收：§5.6 步骤表去掉 d；§8.1 RBAC 代码块与行内注释更新；D12 行（`:894`）改写为「Certificate 先于 Secret 死」的新实现方式；§12.3 #6 行补一句指向 #15/#16 的交叉引用；§2.4 的 envtest 无 GC 那行补注「删除语义已外移至集群探针」。
 
-**Task 9（独立，可先做）：堵住 `spec.secretName` 变更导致的覆写与误删**
+**Task 9（独立，可先做）：堵住 `spec.secretName` 变更导致的覆写与误删** — **已实现（commit `b100b9f`，测试见 `a70c79e`）**
+
+两条都已落地：(a) 护栏改成「首次创建，或 desired 与 `existing.Spec.SecretName` 不同」时执行，位置仍在 `CreateOrUpdate` 之前；(b) 删除步骤 d 先 `Get` 再按注解复核归属，不匹配则跳过删除并发 Warning event。归属判定抽成纯函数 `secretOwnedByUs`（`desired.go`），创建期与删除期共用同一份判断。两个新 envtest 用例在 `internal/controller/secret_name_guard_test.go`。
 
 验收是**两条并列，缺一不可**（只做 (b) 是无效修复，理由见 §4.6）：
 
