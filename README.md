@@ -197,7 +197,7 @@ make install                                   # 只装 CRD
 make deploy IMG=ghcr.io/bestheme/le-to-alicloud:v0.1.0
 ```
 
-> **这条路径一条告警都没有。** `config/default/kustomization.yaml` 里 `- ../prometheus` 是注释掉的，所以 `make deploy` 装出来的东西**不含 `PrometheusRule` 与 `ServiceMonitor`**——包括「已知限制」里点名**必须配**的 `AliyunCertificateCleanupAbandoned`（没有它，`Abandon` 留下的孤儿会静默吃满账号配额）。要告警请改用 `config/overlays/openshift`（`kubectl apply -k config/overlays/openshift`，需先装 Prometheus Operator；它接了 `../prometheus`）。**不要直接 apply `config/prometheus`**：那一层没有 namespace 变换器，对象会落在字面量 `namespace: system` 里。那个 `system` 是 kubebuilder 脚手架的占位、不是真实 namespace——引用它的入口（目前只有 `config/overlays/openshift`；`config/default` 未引用）会用 namespace 变换器把它改写成 `le-to-alicloud-system`，所以只有从该入口渲染才落对地方。
+> **这条路径一条告警都没有。** `config/default/kustomization.yaml` 里 `- ../prometheus` 是注释掉的，所以 `make deploy` 装出来的东西**不含 `PrometheusRule` 与 `ServiceMonitor`**——包括「已知限制」里点名**必须配**的两条：`AliyunCertificateCleanupAbandoned`（没有它，`Abandon` 留下的孤儿会静默吃满账号配额）与 `AliyunCertificateSecretDeletionSkipped`（没有它，删 CR 时被跳过的那份私钥会无声无息地留在集群里）。要告警请改用 `config/overlays/openshift`（`kubectl apply -k config/overlays/openshift`，需先装 Prometheus Operator；它接了 `../prometheus`）。**不要直接 apply `config/prometheus`**：那一层没有 namespace 变换器，对象会落在字面量 `namespace: system` 里。那个 `system` 是 kubebuilder 脚手架的占位、不是真实 namespace——引用它的入口（目前只有 `config/overlays/openshift`；`config/default` 未引用）会用 namespace 变换器把它改写成 `le-to-alicloud-system`，所以只有从该入口渲染才落对地方。
 
 确认 operator 起来了：
 
@@ -532,7 +532,7 @@ kubectl delete clusterrolebinding metrics-peek
 
 ### 告警
 
-`config/prometheus/prometheusrule.yaml` 里四条，覆盖四种彼此独立的失败模式，删掉任何一条都会留下盲区。
+`config/prometheus/prometheusrule.yaml` 里五条，覆盖五种彼此独立的失败模式，删掉任何一条都会留下盲区。
 
 | alert | 表达式 | for | severity |
 |---|---|---|---|
@@ -540,18 +540,21 @@ kubectl delete clusterrolebinding metrics-peek
 | `AliyunCertificateBindingStale` | `aliyuncert_binding_applied_age_seconds > 86400` | `1h` | critical |
 | `AliyunCertificateManagerCertRecreated` | `increase(aliyuncert_certmanager_certificate_recreated_total[1d]) > 0` | — | warning |
 | `AliyunCertificateCleanupAbandoned` | `increase(aliyuncert_cleanup_abandoned_total[1d]) > 0` | — | warning |
+| `AliyunCertificateSecretDeletionSkipped` | `increase(aliyuncert_secret_deletion_skipped_total[1h]) > 0` | — | warning |
 
 **前两条为什么缺一不可。** 到期告警只看证书本身还有多久过期，它对「续期成功了但没推到线上」是沉默的：CAS 上的新证书好好的，`not_after` 一直很远，而 FC3 域名上挂的仍是旧的那张。新鲜度告警只看目标落后了多久，它对「根本没续上」是沉默的：一张压根没换代的证书，滞后恒为 0。两条各自覆盖对方的盲区。
 
 **`AliyunCertificateBindingStale` 刻意没有 `and on (namespace, name) aliyuncert_certificate_ready == 1` 这个守卫。** 两个指标的 `namespace` / `name` 指的不是同一个对象——前者是 Binding 的，后者是 `AliyunCertificate` 的。仓库自带样例就是证书 `timehorse-api` 配 Binding `timehorse-api-fc3`，`on` 匹配不上，加上守卫整条表达式恒为空，这条必配的告警会静默失效。去掉它是安全的：滞后时长在证书尚未签发（`status.current` 为 nil 或 fingerprint 为空）时直接是 0，产生不了非零 lag。**看到「少了个守卫」不要把它加回来。**
 
-离线核对四条规则在位：
+**最后一条的窗口为什么是 1h 而不是 1d。** 其余计数类告警统计的是「云上多了一件要收拾的东西」，一天一看足够。这一条触发通常意味着某个 CR 的 `spec.secretName` 指歪了，而 GitOps 场景里指歪的往往是一份被多个 CR 共用的模板——早一点看到，才可能赶在它波及更多 CR 之前拦住。
+
+离线核对五条规则在位：
 
 ```bash
 make kustomize && ./bin/kustomize build config/overlays/openshift | grep -c "alert:"
 ```
 
-应输出 `4`。
+应输出 `5`。
 
 ### OpenShift user-workload monitoring
 
@@ -662,7 +665,7 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 
 11. **`--watch-namespaces` 生效时，跨 namespace 仲裁退化为跨已 watch namespace 仲裁。** 「同一个目标只能有一个 Binding 生效」这条约束靠 controller 自己看到的全量 Binding 列表来判定（`binding_conflict.go` 走的是带 cache 的 List）。限定 watch 范围之后，范围外的 Binding 看不见也就不参与仲裁，两个不同 namespace 的 Binding 可能同时认为自己是赢家、互相覆盖目标上的证书。怎么发现：`aliyuncert_binding_conflict` 恒为 0，而 FC3 域名上的证书在两代之间来回翻，`aliyuncert_binding_drift_detected_total` 两边都在涨。用 `--watch-namespaces` 时必须自己保证同一个 FC3 域名不被范围外的 Binding 引用。
 
-12. **`spec.secretName` 被合法改名后，旧 Secret 成为孤儿。** 删除时 operator 只按 `spec.secretName` **当前**的值去找 Secret，改名之后旧的那个（默认是 `<CR名>-tls`）不再被任何代码路径引用，删 CR 时也不会被删——它带着一份仍然有效的私钥留在集群里，需要人工清理。怎么发现：namespace 里有名字形如 `<CR名>-tls`、注解 `cert-manager.io/certificate-name` 指向一个已存在的 CR、但那个 CR 的 `status.secretName` 是别的名字的 Secret。彻底修法要在 status 里记住历史 secretName 再逐个按归属删，尚未做。
+12. **`spec.secretName` 被合法改名后，旧 Secret 成为孤儿。** 删除时 operator 只按**在役**的那个名字去找 Secret，改名生效之后旧的那个（默认是 `<CR名>-tls`）不再被任何代码路径引用，删 CR 时也不会被删——它带着一份仍然有效的私钥留在集群里，需要人工清理。改名被 `SecretNameConflict` 拦住的情形**不在此列**：那时在役的仍是旧名字，删 CR 会正常删掉它。怎么发现：namespace 里有名字形如 `<CR名>-tls`、注解 `cert-manager.io/certificate-name` 指向一个已存在的 CR、但那个 CR 的 `status.secretName` 是别的名字的 Secret。彻底修法要在 status 里记住历史 secretName 再逐个按归属删，尚未做。
 
 13. **删 CR 时不属于本 CR 的 Secret 会被跳过，不会被删。** 这是有意的保守选择（宁可漏删，不可误删），判据是 `cert-manager.io/certificate-name` 注解。触发时会发 `Warning SecretNameConflict` 事件并让 `aliyuncert_secret_deletion_skipped_total` 涨 1，**必须配告警**。处置：确认那个 Secret 的真实归属，属于别的 `Certificate` 就不用管，确实是遗留就手工删。
 

@@ -425,7 +425,8 @@ const (
       Block   → 保持 finalizer，持续重试
  c. 显式删除 cmapi.Certificate，**等待其 NotFound**（ownerRef 级联是异步的；
     若 Secret 先删而 Certificate 还在，cert-manager 会立刻重签并重建 Secret）
- d. 删除 Secret，**但只删注解 cert-manager.io/certificate-name 指向本 CR 的那一个**
+ d. 删除 Secret，**按在役名字**（`status.secretName`，不是 `spec.secretName`）查找，
+    **且只删注解 cert-manager.io/certificate-name 指向本 CR 的那一个**
     → 不匹配（含无注解的手工 Secret）则跳过删除 + Info 日志 + Warning event
       SecretNameConflict；NotFound 视为已删。主防线是 §5.2 步骤 2 的护栏，这里是兜底
  e. 摘 finalizer（d 跳过与否都照常摘）；跳过删除的三样痕迹（Info 日志、Warning event、
@@ -435,7 +436,7 @@ const (
 
 CAS 放在 Certificate 之前只是就近安排，无正确性差异；唯一硬约束是 **Certificate 必须先于 Secret 死**。
 
-**已知限制：`spec.secretName` 被合法改名后，旧 Secret 成为孤儿。** 步骤 d 只 `Get` 一个名字——`secretNameFor(ac)`，也就是**当前**的那个。改名之后旧的 `<name>-tls` 不再被任何代码路径引用，删 CR 时也不会被删，需要人工清理。彻底修法是在 status 里记住历史 secretName（例如 `status.retiredSecretNames`）、删除期逐个按归属删；那是一个新的状态字段，尚未做。
+**已知限制：`spec.secretName` 被合法改名后，旧 Secret 成为孤儿。** 步骤 d 只 `Get` 一个名字——在役的那一个。合法改名生效之后，旧的那个不再被任何代码路径引用，删 CR 时也不会被删，需要人工清理。（**改名被护栏拦住**的情形不在此列：那时在役的仍是旧名字，步骤 d 找的就是它，会被正常删除。）彻底修法是在 status 里记住历史 secretName（例如 `status.retiredSecretNames`）、删除期逐个按归属删；那是一个新的状态字段，尚未做。
 
 部署文档约束：凭证 Secret 应放在与 CR **不同的 Argo CD Application**，避免 prune 时先于 CR 消失。
 
