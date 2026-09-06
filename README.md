@@ -785,7 +785,7 @@ kubectl get events --field-selector "involvedObject.name=$NAME"
 
 `.github/workflows/image.yml` 用 buildx 构建 `linux/amd64,linux/arm64` 双架构镜像并推到 `ghcr.io/bestheme/le-to-alicloud`。push 到 `main`、push `v*` tag 时推送；pull request 只构建不推送（fork 的 PR 拿不到 `packages: write`）。
 
-产出的 tag：`sha-<短 SHA>`（每次构建都有）、分支名（如 `main`）、`vX.Y.Z` 与 `X.Y`（打 `v*` tag 时），以及 `latest`（只在默认分支上）。
+产出的 tag：`sha-<短 SHA>`（每次构建都有）、分支名如 `main`（push 分支时）、`latest`（只在默认分支上）。打 `v0.1.0` 这样的 tag 时另外产出三个：`v0.1.0`（tag 名原样）、`0.1.0` 与 `0.1`（semver 归一化会剥掉前导 `v`）。Argo 钉的是带 `v` 的那个。
 
 ```bash
 docker pull ghcr.io/bestheme/le-to-alicloud:main

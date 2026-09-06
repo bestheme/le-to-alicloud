@@ -2587,7 +2587,7 @@ spec:
     kustomize:
       images:
         # 部署前替换成真实镜像；tag 请用不可变 tag 或 digest。
-        - controller=registry.dev.bestheme.ac.cn/infra/le-to-alicloud:v0.1.0
+        - controller=ghcr.io/bestheme/le-to-alicloud:v0.1.0
   destination:
     server: https://kubernetes.default.svc
     namespace: le-to-alicloud-system
@@ -2815,9 +2815,9 @@ kubectl 路径：
 ### kubectl（开发与验证）
 
 ```bash
-make docker-build docker-push IMG=registry.example.com/le-to-alicloud:v0.1.0
+make docker-build docker-push IMG=ghcr.io/bestheme/le-to-alicloud:v0.1.0
 make install                                   # 只装 CRD
-make deploy IMG=registry.example.com/le-to-alicloud:v0.1.0
+make deploy IMG=ghcr.io/bestheme/le-to-alicloud:v0.1.0
 kubectl -n le-to-alicloud-system get deploy
 ```
 

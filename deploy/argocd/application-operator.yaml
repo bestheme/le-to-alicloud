@@ -16,8 +16,9 @@ spec:
     path: config/overlays/openshift
     kustomize:
       images:
-        # 部署前替换成真实镜像；tag 请用不可变 tag 或 digest。
-        # 下面这个 v0.1.0 tag 由打 `v0.1.0` git tag 触发 .github/workflows/image.yml 发布，
+        # tag 请用不可变 tag 或 digest。下面这个 v0.1.0 由打 `v0.1.0` git tag 触发
+        # .github/workflows/image.yml 发布（靠其中的 type=ref,event=tag 规则原样输出
+        # tag 名；同一条 workflow 的 semver 规则另外会产出剥掉 v 的 0.1.0 与 0.1）。
         # 发布前请先 `git tag v0.1.0 && git push --tags`，否则 Argo 同步出来的 Deployment
         # 会因为镜像不存在而 ImagePullBackOff。
         - controller=ghcr.io/bestheme/le-to-alicloud:v0.1.0

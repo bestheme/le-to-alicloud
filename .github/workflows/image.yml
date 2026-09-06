@@ -44,9 +44,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # semver 类型会做归一化、剥掉前导 v：git tag v0.1.0 只产出 0.1.0 与 0.1。
+          # 所以另加 type=ref,event=tag 原样输出 ref 名，把 v0.1.0 本身也发出来——
+          # deploy/argocd/application-operator.yaml 钉的就是带 v 的那个。
+          # 注意这几行注释必须留在 tags 块外：块标量 | 里的 # 不是 YAML 注释，
+          # 会被当成 tag 规则原样喂给 metadata-action。
           tags: |
             type=sha
             type=ref,event=branch
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
@@ -61,4 +67,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 写缓存也对 PR 关掉：Actions 的 cache 服务对 fork 发来的 PR 只读，
+          # cache export 会 403，而 BuildKit 的导出是 solve 的一部分，会连带让整个
+          # build step 失败。读缓存保留，PR 仍能命中 main 上写好的层。
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
