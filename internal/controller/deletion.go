@@ -164,6 +164,7 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 		// 给运维定位；事件面向用户；计数器是唯一活得比 namespace 长的那一份，配告警用它。
 		log.Info("secret is not owned by this certificate, skipping deletion", "secret", s.Name)
 		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict, secretDeletionSkippedMessage)
+		secretDeletionSkippedTotal.WithLabelValues(ac.Namespace).Inc()
 	case !apierrors.IsNotFound(err):
 		return ctrl.Result{}, err
 	}
