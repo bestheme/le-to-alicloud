@@ -464,6 +464,7 @@ kubectl -n le-to-alicloud-system get deploy le-to-alicloud-controller-manager \
 | `aliyuncert_cas_delete_total` | counter | `result` | CAS 删除尝试；`NotFound` 记为 `success`（删除的目的已经达到） |
 | `aliyuncert_certmanager_certificate_recreated_total` | counter | `namespace`, `name` | cert-manager `Certificate` 在首次创建之后又被创建了一次。**应恒为 0**：重建会消耗 ACME 配额 |
 | `aliyuncert_cleanup_abandoned_total` | counter | `region`, `reason` | 超出 `--cleanup-grace-period` 后放弃云侧清理的次数。**必须配告警**：每一次都意味着云上多一件需要人工收拾的孤儿。两个 controller 共用这一个计数器，`reason` 上跑着两套词表，见「已知限制」 |
+| `aliyuncert_secret_deletion_skipped_total` | counter | `namespace` | 删 CR 时目标 Secret 的 `cert-manager.io/certificate-name` 指向别的 `Certificate`，operator 跳过了删除。**必须配告警**：每一次都意味着集群里留下一份没人再管的私钥，且多半说明某个 CR 的 `spec.secretName` 指歪了。label 不带 `name`：counter 要活得比 CR 长，按 CR 名打 label 会留下永不消失的 series |
 | `aliyuncert_aliyun_api_requests_total` | counter | `service`, `action`, `code` | 阿里云 OpenAPI 调用计数。`service` 取 `cas` / `fc` |
 | `aliyuncert_aliyun_api_duration_seconds` | histogram | `service`, `action` | 同上的时延，默认 bucket |
 
@@ -661,7 +662,11 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 
 11. **`--watch-namespaces` 生效时，跨 namespace 仲裁退化为跨已 watch namespace 仲裁。** 「同一个目标只能有一个 Binding 生效」这条约束靠 controller 自己看到的全量 Binding 列表来判定（`binding_conflict.go` 走的是带 cache 的 List）。限定 watch 范围之后，范围外的 Binding 看不见也就不参与仲裁，两个不同 namespace 的 Binding 可能同时认为自己是赢家、互相覆盖目标上的证书。怎么发现：`aliyuncert_binding_conflict` 恒为 0，而 FC3 域名上的证书在两代之间来回翻，`aliyuncert_binding_drift_detected_total` 两边都在涨。用 `--watch-namespaces` 时必须自己保证同一个 FC3 域名不被范围外的 Binding 引用。
 
-12. **`aliyuncert_cleanup_abandoned_total{reason}` 混用两套词表。** 两个 controller 共用这一个计数器：证书侧放弃清理时填的是 `aliyun.ErrClass`（`Permanent` / `Retryable` / `Auth` / `NotFound`），绑定侧填的是 `provider.Code*`（`TargetNotFound` / `Auth` / `Throttled` / `Retryable` / `Permanent` / `InvalidClient` / `InvalidTarget`）。同一个 label 上出现两套取值，其中 `Auth` / `Retryable` / `Permanent` 三个字面量还是重合的。按 `reason` 做聚合或告警时要把两套都列举出来，**不能假定它是一个封闭枚举**，也不能从 `reason` 反推是哪个 controller 放弃的——要区分请看 `region` 之外的上下文（事件与日志）。
+12. **`spec.secretName` 被合法改名后，旧 Secret 成为孤儿。** 删除时 operator 只按 `spec.secretName` **当前**的值去找 Secret，改名之后旧的那个（默认是 `<CR名>-tls`）不再被任何代码路径引用，删 CR 时也不会被删——它带着一份仍然有效的私钥留在集群里，需要人工清理。怎么发现：namespace 里有名字形如 `<CR名>-tls`、注解 `cert-manager.io/certificate-name` 指向一个已存在的 CR、但那个 CR 的 `status.secretName` 是别的名字的 Secret。彻底修法要在 status 里记住历史 secretName 再逐个按归属删，尚未做。
+
+13. **删 CR 时不属于本 CR 的 Secret 会被跳过，不会被删。** 这是有意的保守选择（宁可漏删，不可误删），判据是 `cert-manager.io/certificate-name` 注解。触发时会发 `Warning SecretNameConflict` 事件并让 `aliyuncert_secret_deletion_skipped_total` 涨 1，**必须配告警**。处置：确认那个 Secret 的真实归属，属于别的 `Certificate` 就不用管，确实是遗留就手工删。
+
+14. **`aliyuncert_cleanup_abandoned_total{reason}` 混用两套词表。** 两个 controller 共用这一个计数器：证书侧放弃清理时填的是 `aliyun.ErrClass`（`Permanent` / `Retryable` / `Auth` / `NotFound`），绑定侧填的是 `provider.Code*`（`TargetNotFound` / `Auth` / `Throttled` / `Retryable` / `Permanent` / `InvalidClient` / `InvalidTarget`）。同一个 label 上出现两套取值，其中 `Auth` / `Retryable` / `Permanent` 三个字面量还是重合的。按 `reason` 做聚合或告警时要把两套都列举出来，**不能假定它是一个封闭枚举**，也不能从 `reason` 反推是哪个 controller 放弃的——要区分请看 `region` 之外的上下文（事件与日志）。
 
 ## 故障排查
 
@@ -723,7 +728,7 @@ jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 | Warning | `CASCertificateMissing` | 探测发现 `current.certId` 已不在 CAS，将重新上传 |
 | Warning | `DeletionBlockedByBindings` | 删除被存活的 Binding 阻塞 |
 | Warning | `CleanupAbandoned` | 有界清理超时且策略为 `Abandon`，CAS 侧留下孤儿证书 |
-| Warning | `SecretNameConflict` | 删除时发现目标 Secret 不属于本 CR，跳过删除（Secret 留在集群里，其余清理与摘 finalizer 照常） |
+| Warning | `SecretNameConflict` | 删除时发现目标 Secret 不属于本 CR，跳过删除（Secret 留在集群里，其余清理与摘 finalizer 照常）。同时 `aliyuncert_secret_deletion_skipped_total` +1 |
 | Normal | `Reclaimed` | 一代旧证书被回收 |
 | Normal | `Uploaded` | 新代次上传成功 |
 

@@ -1,4 +1,4 @@
-# operator 的告警规则。四条覆盖四种彼此独立的失败模式，删掉任何一条都会留下盲区。
+# operator 的告警规则。五条覆盖五种彼此独立的失败模式，删掉任何一条都会留下盲区。
 #
 # aliyuncert_binding_applied_age_seconds 由绑定 controller 注册；
 # 该指标尚未出现时，AliyunCertificateBindingStale 对空 series 求值为空，不会误报。
@@ -68,3 +68,13 @@ spec:
             severity: warning
           annotations:
             summary: "region {{ $labels.region }} 放弃了 CAS 清理，存在需人工删除的孤儿证书"
+        # 删 CR 时目标 Secret 的 cert-manager.io/certificate-name 指向别的 Certificate，
+        # operator 保守地没删它——集群里因此留下一份没人再管的私钥，需要人工确认归属。
+        # 窗口取 1h 而不是 1d：这条一旦触发，多半意味着某个 CR 的 spec.secretName 指歪了，
+        # 越早看到越可能在更多 CR 被同一份模板波及之前拦住。
+        - alert: AliyunCertificateSecretDeletionSkipped
+          expr: increase(aliyuncert_secret_deletion_skipped_total[1h]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "namespace {{ $labels.namespace }} 里有 Secret 因不属于被删的 AliyunCertificate 而被跳过删除，需人工确认归属"

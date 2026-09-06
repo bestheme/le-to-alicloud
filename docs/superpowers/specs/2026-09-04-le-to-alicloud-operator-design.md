@@ -350,6 +350,12 @@ const (
       改指到别人的 Secret 会让 cert-manager 用本证书覆写它（§5.6 步骤 d 的复核挡不住：
       那时注解已被改成指向本 CR）
     - 冲突时保持 Certificate 上的旧 secretName 不动，绝不 update
+    - **本轮到此为止**：探测 CAS 存在性、按保留策略回收、复读 Secret、上传新代次全部
+      暂停，直到冲突解除。这与步骤 4「签发停滞绝不结束本轮」的原则**相反**，是有意为之：
+      §5.4 之后的每一步都以 spec.secretName 为准（loadBundle 读的就是它），继续往下走
+      等于去读受害 Secret 的私钥并把它传上 CAS——比暂停维护糟得多。代价是冲突挂得久的
+      话，服役中的证书可能在无人续传的情况下静默过期，所以这条路径必须靠
+      Ready=False/SecretNameConflict 与 aliyuncert_certificate_ready 告警被看见
  3. CreateOrUpdate cmapi.Certificate（ownerRef 指向自己）
     - 期望态比对后才 update，避免无谓写入（LE 速率限制护栏）
     - 绝不因为「Secret 内容不对」删除并重建 Certificate
@@ -424,6 +430,8 @@ const (
 ```
 
 CAS 放在 Certificate 之前只是就近安排，无正确性差异；唯一硬约束是 **Certificate 必须先于 Secret 死**。
+
+**已知限制：`spec.secretName` 被合法改名后，旧 Secret 成为孤儿。** 步骤 d 只 `Get` 一个名字——`secretNameFor(ac)`，也就是**当前**的那个。改名之后旧的 `<name>-tls` 不再被任何代码路径引用，删 CR 时也不会被删，需要人工清理。彻底修法是在 status 里记住历史 secretName（例如 `status.retiredSecretNames`）、删除期逐个按归属删；那是一个新的状态字段，尚未做。
 
 部署文档约束：凭证 Secret 应放在与 CR **不同的 Argo CD Application**，避免 prune 时先于 CR 消失。
 
@@ -701,6 +709,7 @@ aliyuncert_cas_delete_total{result}                                    counter
 aliyuncert_binding_apply_total{provider,result}                        counter
 aliyuncert_binding_drift_detected_total{provider}                      counter
 aliyuncert_cleanup_abandoned_total{region,reason}                      counter
+aliyuncert_secret_deletion_skipped_total{namespace}                    counter  # 删 CR 时 Secret 不属于本 CR，跳过删除；集群里留下一份没人管的私钥。必须告警
 aliyuncert_certmanager_certificate_recreated_total{namespace,name}     counter  # 应恒为 0（LE 速率限制护栏）
 
 # API
@@ -766,7 +775,9 @@ Reason+Message 完全相同的事件）。下表是证书 controller 实际发�
 
   去掉守卫是安全的：它本来就是冗余而非承重。`appliedLag`（`internal/controller/binding_status.go:139-141`）在证书 `status.current` 为 nil 或 `fingerprint` 为空时直接返回 0，未签发的证书产生不了非零 lag。更完备的做法是给 `bindingAppliedAge` 加一个 `certificate` label 再用 `group_left` 关联回 `aliyuncert_certificate_ready`，那要改 `metrics.go`，尚未做。**不要因为「少了个守卫」把 `on (namespace, name)` 加回来**——那会让这条告警重新变成恒空。
 
-以及 `increase(aliyuncert_certmanager_certificate_recreated_total[1d]) > 0`、`increase(aliyuncert_cleanup_abandoned_total[1d]) > 0`。
+以及 `increase(aliyuncert_certmanager_certificate_recreated_total[1d]) > 0`、`increase(aliyuncert_cleanup_abandoned_total[1d]) > 0`，再加一条：
+
+- `increase(aliyuncert_secret_deletion_skipped_total[1h]) > 0`（删 CR 时 Secret 不属于本 CR，跳过了删除）。与 `cleanup_abandoned` 同一类后果——「留下了需要人工收拾的东西」，这里留下的是一份没人再管的私钥。窗口取 1h 而不是 1d：触发它通常意味着某个 CR 的 `spec.secretName` 指歪了，越早看到越可能赶在同一份 GitOps 模板波及更多 CR 之前拦住。
 
 ---
 
