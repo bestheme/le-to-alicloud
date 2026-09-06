@@ -30,10 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
@@ -57,9 +59,8 @@ type ProviderFactory func(ctx context.Context, b *certsv1alpha1.AliyunCertificat
 // AliyunCertificateBindingReconciler 实现 spec §6 的绑定 controller。
 type AliyunCertificateBindingReconciler struct {
 	client.Client
-	// APIReader 是绕过 informer cache 的直读口子。目前**没有调用点**：留着是给已被推迟的
-	// 「删除分支改用直读」那一步用的（见 binding_deletion_test.go 里关于删除会多跑一轮的
-	// 实测记录），接线两处都已就位，改动落地时不必再动 main.go。
+	// APIReader 是绕过 informer cache 的直读口子。Reconcile 用它读本对象——理由见那里，
+	// 一句话：status patch 的差量基准必须是 API server 上的真值，不能是落后一拍的 cache。
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Recorder  record.EventRecorder
@@ -101,8 +102,23 @@ func (r *AliyunCertificateBindingReconciler) now() time.Time {
 
 // Reconcile 实现 spec §6.2 的步骤。
 func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// 本对象走 APIReader（绕过 informer cache）直读，其余读取照旧走 cache。
+	//
+	// 这不是洁癖，是 status patch 的正确性前提：patchBinding 发的是
+	// MergeFrom(rd.orig) 算出来的差量，而 rd.orig 就是这一次读到的那份。cache 落后一拍时
+	// 「上一轮写下的 ObserveFailed」在这份副本里还不存在，本轮把 reason 写回 Applied 算出来的
+	// 差量因此是**空的**——API server 上那个 ObserveFailed 就再也没人擦得掉，一个健康的
+	// Binding 会一直挂着它到下一次漂移检查（1 小时）。
+	//
+	// 这条竞态一直都在（retryable 失败的重试排在 5ms 后，informer 常常还没追上），
+	// 从前被自唤醒循环盖住了：那个循环会一轮一轮地重来，总有一轮读到的是新的。
+	// 谓词把多余的轮次去掉之后，重试就只剩一轮，读到旧的就等于把更新丢了。
+	// 直读把「差量的基准」钉成 API server 上的真值，整类丢更新就此消失。
+	//
+	// 代价是每轮多一次不走 cache 的 GET。绑定 controller 的轮次本来就稀（漂移周期 1 小时，
+	// 外加证书变化与 spec 变化），这点读放大远小于它换来的确定性。
 	b := &certsv1alpha1.AliyunCertificateBinding{}
-	if err := r.Get(ctx, req.NamespacedName, b); err != nil {
+	if err := r.APIReader.Get(ctx, req.NamespacedName, b); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	rd := newBindingRound(b)
@@ -119,8 +135,16 @@ func (r *AliyunCertificateBindingReconciler) Reconcile(ctx context.Context, req 
 		if err := r.Update(ctx, b); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Update 会触发本对象的 watch 事件，不需要显式 requeue
-		return ctrl.Result{}, nil
+		// **不能**在这里 return：加 finalizer 只动 metadata.finalizers，既不推进
+		// generation 也不碰 annotation / label，bindingMeaningfulChange 会把这次 Update
+		// 事件整条滤掉——早先那句「Update 会触发本对象的 watch 事件，不需要显式 requeue」
+		// 从加上谓词那一刻起就成了假话，照着写下去每一个新建的 Binding 都会卡在
+		// 「有 finalizer、没 status」上，直到有人手动推它一下。
+		//
+		// 就地接着往下跑，而不是补一个 requeue：r.Update 已经把服务端那一份（含新的
+		// resourceVersion 与 finalizers）写回 b，本轮手里的对象是最新的。rd.orig 要跟着
+		// 重取，否则后面的 status patch 会把 finalizers 也算进 diff。
+		rd = newBindingRound(b)
 	}
 
 	b.Status.ObservedGeneration = b.Generation
@@ -329,12 +353,39 @@ func bindingRequests(list *certsv1alpha1.AliyunCertificateBindingList) []reconci
 	return out
 }
 
+// bindingMeaningfulChange 是**所有**对 AliyunCertificateBinding 的 watch 共用的谓词：
+// 只有 spec / annotation / label 变了才算一次值得跑的变化，status-only 的 patch 不算。
+//
+// 没有它，这个 controller 会被自己唤醒：每一轮成功观测都写一次 status.lastObservedTime
+// （binding_observe.go 的 noteObserved），而 metav1.Time 序列化到整秒——生产上一轮
+// ≈ 两次云调用 ≈ 1 秒，相邻两轮几乎总落在不同秒，于是 写 status → 自己的 watch 事件 →
+// 下一轮 → 再写，循环到偶然两轮撞进同一秒才停。2026-09-06 的现场实测是每个 5 分钟的
+// credentialsRequeue 周期里对 FC3 打了约 30 次 UpdateCustomDomain。
+//
+// 删除仍然触发：CR 的 metadata.generation 在 spec 变化时递增，而 apiserver 在给对象盖
+// deletionTimestamp 时也会递增一次（registry.markAsDeleting / rest.BeforeDelete），
+// 那一次 Update 因此过得了 GenerationChangedPredicate；finalizer 摘除之后的真删除是
+// Delete 事件，三个谓词都只覆写 Update，Delete 一律放行。
+//
+// annotation / label 也算：kubectl annotate 是运维手动推一轮 reconcile 的通用手法，
+// 而套件里多条用例正是靠它把一个已经稳定的对象再唤醒一次。
+var bindingMeaningfulChange = predicate.Or(
+	predicate.GenerationChangedPredicate{},
+	predicate.AnnotationChangedPredicate{},
+	predicate.LabelChangedPredicate{},
+)
+
 // SetupWithManager 注册 watch：主资源，外加证书变化与同目标 peer 的反查。
 func (r *AliyunCertificateBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&certsv1alpha1.AliyunCertificateBinding{}).
+		For(&certsv1alpha1.AliyunCertificateBinding{}, builder.WithPredicates(bindingMeaningfulChange)).
 		// 证书的 status.current 一变就要唤醒引用它的全部 Binding。用 field index 反查，
 		// 而不是遍历：一个 namespace 里可能有几百个 Binding。
+		//
+		// 这条 watch **刻意不加** bindingMeaningfulChange：它守的正是「证书续期了，
+		// 新的一代要推到线上」，而那个信号只存在于 AliyunCertificate 的 status.current 里。
+		// generation 谓词会把它整条滤掉，续期从此只能等 DriftCheckInterval——
+		// 与 Binding 侧的自唤醒不同，这里的 status 变化来自**另一个**对象，不成环。
 		Watches(&certsv1alpha1.AliyunCertificate{}, handler.EnqueueRequestsFromMapFunc(
 			func(ctx context.Context, o client.Object) []reconcile.Request {
 				list := &certsv1alpha1.AliyunCertificateBindingList{}
@@ -350,8 +401,12 @@ func (r *AliyunCertificateBindingReconciler) SetupWithManager(mgr ctrl.Manager) 
 				return bindingRequests(list)
 			})).
 		// 同目标的 peer 变化要唤醒**其余**候选者，见 bindingPeerRequests。
+		// 仲裁只看 creationTimestamp / UID / deletionTimestamp，peer 的 status 怎么变都
+		// 改不了胜负，所以这条同样只响应有意义的变化——否则一个 Binding 的自唤醒会被
+		// 放大成同目标全体的自唤醒。
 		Watches(&certsv1alpha1.AliyunCertificateBinding{},
-			handler.EnqueueRequestsFromMapFunc(bindingPeerRequests(mgr.GetClient()))).
+			handler.EnqueueRequestsFromMapFunc(bindingPeerRequests(mgr.GetClient())),
+			builder.WithPredicates(bindingMeaningfulChange)).
 		Named("aliyuncertificatebinding").
 		Complete(r)
 }

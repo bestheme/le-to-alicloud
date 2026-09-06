@@ -117,10 +117,13 @@ func (r *AliyunCertificateBindingReconciler) handleObserveError(
 // noteObserved 记下本轮的观测时刻，但**只在秒级取值真的会变时**才写。
 //
 // status.lastObservedTime 是 metav1.Time，序列化到整秒。同一秒内的两轮之间无条件重写，
-// 写进去的是一个在 API server 上完全等价的值；而这个字段是每一轮成功观测都会碰的唯一
-// 一处 status，一旦让 patch 变成非空，就会触发本 controller 自己的 watch，多跑一轮
-// reconcile、多打一次云读——而 FC3 这条通道被刻意限到 5 QPS。不是死循环（跨秒之后
-// 下一轮就收敛），但在一个刻意收紧的配额上没必要白花。
+// 写进去的是一个在 API server 上完全等价的值——一次不改变任何东西的 PATCH，没必要发。
+//
+// 这道守卫**不是**自唤醒的防线，别再把它当成防线：它曾经附着一句「不是死循环，跨秒之后
+// 下一轮就收敛」，而那句话是错的。生产上一轮 reconcile ≈ 两次云调用 ≈ 1 秒，相邻两轮几乎
+// 总落在不同秒，于是每一轮都写、每一次写都把自己唤醒，2026-09-06 的现场实测是一个 5 分钟的
+// 失败周期里对 FC3 打了约 30 次 UpdateCustomDomain。真正的防线是 SetupWithManager 里的
+// bindingMeaningfulChange：status-only 的 patch 根本进不了队列。
 //
 // 判据取 rd.orig（本轮开始前 API server 上的那一份），与 eventOnReasonChange 同一套写法。
 func (r *AliyunCertificateBindingReconciler) noteObserved(rd *bindingRound) {

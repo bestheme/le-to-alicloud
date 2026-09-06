@@ -90,14 +90,18 @@ var _ = Describe("绑定 controller：status 写入不自唤醒", func() {
 			return c.Status == metav1.ConditionFalse && c.Reason == certsv1alpha1.ReasonCredentialsInvalid
 		})
 
-		// 这才是缺陷本身：凭证类失败的重试节奏是 credentialsRequeue（5 分钟），所以在
-		// 一个 15 秒的窗口里 FC3 上应当**一次写都不再发生**。上界给到 2 是留给外部唤醒
-		// ——证书 CR 的 status 在建对象前后还会动一两次，那条 watch 按设计没有谓词。
-		// 修复前这里是几十次：每一轮的 status patch 都把自己再唤醒一遍。
+		// 基线取在「已经落进 credentialsRequeue（5 分钟）」这个终态之后，而不是写死一个
+		// 绝对上界：建对象前后证书 CR 的 status 还会动几次，而对 AliyunCertificate 的那条
+		// watch 按设计没有谓词，被它唤醒几轮取决于机器快慢（-race 下实测比不带 race 多一轮），
+		// 那是**设置阶段**的噪声，不是本用例要钉的东西。
+		//
+		// 要钉的是终态之后的增长：5 分钟的窗口里一轮都不该再有。容差 +1 留给基线那一刻
+		// 可能正在飞的那一轮。修复前这里不是 +1 而是每秒好几轮，一路涨到窗口结束。
+		updates, gets := currentFC3().UpdateCallsFor(domain), currentFC3().GetCallsFor(domain)
 		Consistently(func() int { return currentFC3().UpdateCallsFor(domain) },
-			"15s", "250ms").Should(BeNumerically("<=", 2),
+			"15s", "250ms").Should(BeNumerically("<=", updates+1),
 			"status 写入不该把自己唤醒——一个 5 分钟的失败周期只该打一次云")
-		Expect(currentFC3().GetCallsFor(domain)).To(BeNumerically("<=", 3),
+		Expect(currentFC3().GetCallsFor(domain)).To(BeNumerically("<=", gets+1),
 			"Observe 的次数同样受轮次约束")
 	})
 

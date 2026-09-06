@@ -138,7 +138,9 @@ func TestReconcile_CertificateTerminalStatesRequeueOnDriftInterval(t *testing.T)
 		c := crfake.NewClientBuilder().WithScheme(factoryScheme(t)).
 			WithObjects(append([]client.Object{b}, objs...)...).
 			WithStatusSubresource(&certsv1alpha1.AliyunCertificateBinding{}).Build()
-		return &AliyunCertificateBindingReconciler{Client: c, DriftCheckInterval: drift}
+		// APIReader 与 Client 同指一个 fake：Reconcile 用 APIReader 直读本对象
+		// （见那里关于差量基准的注释），生产里两者背后也是同一个 API server。
+		return &AliyunCertificateBindingReconciler{Client: c, APIReader: c, DriftCheckInterval: drift}
 	}
 	readyReason := func(t *testing.T, r *AliyunCertificateBindingReconciler) string {
 		t.Helper()

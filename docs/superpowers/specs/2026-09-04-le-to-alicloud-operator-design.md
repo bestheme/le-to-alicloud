@@ -334,7 +334,7 @@ const (
 
 - 主资源：`AliyunCertificate`
 - Owns：`cmapi.Certificate`（cert-manager 每次签发 / 续期都会推进 `status.revision` 与 `notAfter`，这是我们读 Secret 的触发信号）
-- Watches：`AliyunCertificateBinding` → 映射到其 `spec.certificateRef`（用于回收守卫及时生效、以及删除阻塞及时解除）
+- Watches：`AliyunCertificateBinding` → 映射到其 `spec.certificateRef`（用于回收守卫及时生效、以及删除阻塞及时解除）。与绑定 controller 侧同一道谓词：只响应 generation / annotation / label 变化，Binding 的 status 写入不再唤醒证书。代价是 `status.appliedFingerprint` 变化要等下一次 resync 才进入回收判断，而那道守卫只会更保守（§5.7）
 - **不 watch、不缓存任何 Secret**。TLS Secret 与凭证 Secret 都走普通的 `mgr.GetClient()`（`material.go` / `cas_factory.go` / `provider_factory.go`），之所以不缓存是因为 manager 的 `client.CacheOptions.DisableFor` 里列了 `&corev1.Secret{}`（`cmd/main.go`）——被 DisableFor 的类型上，`Client.Get` 等同直读 API server。**不是**通过 `mgr.GetAPIReader()`（那个只用在 live list Binding 与 refreshUploadState 上）。收益：内存中无 Secret 副本、RBAC 上 secrets 不需要 `list`/`watch`。代价：周期 resync 成为 Secret 漂移检测的承重通道，定为 1h（`--certificate-resync-interval`）。
 - 每次成功 reconcile 返回 `RequeueAfter: certificate-resync-interval`。
 
@@ -460,6 +460,9 @@ CAS 放在 Certificate 之前只是就近安排，无正确性差异；唯一硬
 
 - 主资源：`AliyunCertificateBinding`
 - Watches：`AliyunCertificate` → field index `spec.certificateRef.name`（同 namespace）反查引用它的 Binding，证书 `status.current` 变化即唤醒
+- Watches：同目标 peer `AliyunCertificateBinding` → 唤醒其余候选者（仲裁，§6.2 步骤 2）
+- **对 `AliyunCertificateBinding` 的每一条 watch（主资源、peer、以及证书 controller 那一条）都只响应 generation / annotation / label 变化**，status 写入不自唤醒。绑定 controller 每一轮成功观测都会写 `status.lastObservedTime`，没有这道谓词，那次 patch 会触发它自己的 watch、再跑一轮、再写一次——2026-09-06 的现场是每个 5 分钟的失败周期里对 FC3 打了约 30 次 `UpdateCustomDomain`。删除仍然触发：apiserver 盖 `deletionTimestamp` 时会递增 `metadata.generation`，finalizer 摘除后的真删除则是 Delete 事件。反过来，对 `AliyunCertificate` 的那条 watch **刻意不加**谓词——续期信号只存在于证书的 `status.current` 里
+- **Binding 本体走 `APIReader` 直读，不读 informer cache**。status 是用 `MergeFrom(本轮开始时读到的那一份)` 算差量 patch 出去的，基准落后一拍就会把「上一轮刚写下的 reason」当成不存在，于是把它改回去算出来的差量是空的、更新被静默丢掉（实测：retryable 的 Observe 失败重试排在 5ms 后，informer 常常还没追上，`ObserveFailed` 会一直挂在一个健康对象上到下一次漂移检查）。其余读取（证书 CR、仲裁用的 Binding 列表）照旧走 cache
 - 每次成功 reconcile 返回 `RequeueAfter: --drift-check-interval`（默认 1h）
 
 ### 6.2 Reconcile 步骤

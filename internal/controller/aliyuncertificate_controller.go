@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -476,6 +477,14 @@ func (r *AliyunCertificateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&certsv1alpha1.AliyunCertificate{}).
 		Owns(&cmapi.Certificate{}).
+		// 与绑定 controller 的三条 watch 共用 bindingMeaningfulChange：Binding 每一轮都
+		// 会写一次 status.lastObservedTime，不加谓词的话那些 patch 会把**证书**也一并
+		// 唤醒——绑定侧的自唤醒因此还额外拖着证书 controller 空跑一遍。
+		//
+		// 代价是 status.appliedFingerprint 的变化不再唤醒保留策略（retention.go 护栏 3）。
+		// 可以接受：那条护栏在每一次证书 reconcile 里都会重新 List 一遍 Binding 现值，
+		// 少的只是「立刻重算」，ResyncInterval 一到就补上；而它是一道**只会更保守**的闸
+		// ——晚一点看到某一代仍被引用，只会推迟回收，不会提前删掉在服役的那一代。
 		Watches(&certsv1alpha1.AliyunCertificateBinding{}, handler.EnqueueRequestsFromMapFunc(
 			func(_ context.Context, o client.Object) []reconcile.Request {
 				b, ok := o.(*certsv1alpha1.AliyunCertificateBinding)
@@ -483,7 +492,7 @@ func (r *AliyunCertificateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					return nil
 				}
 				return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.CertificateRef.Name}}}
-			})).
+			}), builder.WithPredicates(bindingMeaningfulChange)).
 		Named("aliyuncertificate").
 		Complete(r)
 }
