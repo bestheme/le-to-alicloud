@@ -34,7 +34,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://git.dev.bestheme.ac.cn/infra/le-to-alicloud.git
+    repoURL: https://github.com/bestheme/le-to-alicloud.git
     targetRevision: main
     path: config/crd
   destination:
