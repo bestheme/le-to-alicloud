@@ -203,8 +203,12 @@ var _ = Describe("Manager", Ordered, func() {
 				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("controller-runtime.metrics\tServing metrics server"),
-					"Metrics server not yet started")
+				// manager.yaml 以 --zap-devel=false 运行，日志是 JSON 编码；脚手架原断言的
+				// "logger<TAB>msg" 只在 console 编码下成立。这里分别匹配 logger 与 msg，两种编码都能过。
+				g.Expect(output).To(And(
+					ContainSubstring("controller-runtime.metrics"),
+					ContainSubstring("Serving metrics server"),
+				), "Metrics server not yet started")
 			}
 			Eventually(verifyMetricsServerStarted).Should(Succeed())
 
