@@ -152,6 +152,7 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	// 按名字无条件删是不安全的：spec.secretName 可以在 CR 生命周期里被改指到别人的
 	// Secret 上。变更期的护栏（aliyuncertificate_controller.go 第 2 步）是主防线，这里
 	// 是兜底，挡住护栏上线之前就已经指歪了的存量对象。注解缺失的手工 Secret 同样不删。
+	skippedSecret := ""
 	s := &corev1.Secret{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: secretNameFor(ac)}, s)
 	switch {
@@ -160,11 +161,8 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 			return ctrl.Result{}, derr
 		}
 	case err == nil:
-		// 私钥留在集群里这件事不能无声无息。三样痕迹各有各的读者：日志带 Secret 名，
-		// 给运维定位；事件面向用户；计数器是唯一活得比 namespace 长的那一份，配告警用它。
-		log.Info("secret is not owned by this certificate, skipping deletion", "secret", s.Name)
-		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict, secretDeletionSkippedMessage)
-		secretDeletionSkippedTotal.WithLabelValues(ac.Namespace).Inc()
+		// 痕迹不在这里留，见下面步骤 e 之后那一段。
+		skippedSecret = s.Name
 	case !apierrors.IsNotFound(err):
 		return ctrl.Result{}, err
 	}
@@ -178,6 +176,19 @@ func (r *AliyunCertificateReconciler) reconcileDelete(ctx context.Context, ac, o
 	controllerutil.RemoveFinalizer(ac, certsv1alpha1.FinalizerName)
 	if err := client.IgnoreNotFound(r.Update(ctx, ac)); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// 「私钥留在集群里」这件事不能无声无息。三样痕迹各有各的读者：日志带 Secret 名，给
+	// 运维定位；事件面向用户；计数器是唯一活得比 namespace 长的那一份，配告警用它。
+	//
+	// 留在摘 finalizer **之后**：上面那次 Update 撞 Conflict 会让整轮返回 error，下一轮
+	// 从头重跑步骤 d，放在前面等于每重试一次就多发一条事件、多涨一次计数。计数器是拿来
+	// 回答「有几个 Secret 被留下了」的，虚高就等于读不得。走到这里说明删除已经收尾，
+	// 成功路径恰好经过一次。
+	if skippedSecret != "" {
+		log.Info("secret is not owned by this certificate, skipping deletion", "secret", skippedSecret)
+		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonSecretNameConflict, secretDeletionSkippedMessage)
+		secretDeletionSkippedTotal.WithLabelValues(ac.Namespace).Inc()
 	}
 	// 对象没了，它的 gauge 也必须跟着消失：留下来的那条 Ready=0 会一直告警下去。
 	clearCertMetrics(ac.Namespace, ac.Name)

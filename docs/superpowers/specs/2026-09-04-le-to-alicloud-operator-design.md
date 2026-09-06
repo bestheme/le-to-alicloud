@@ -428,7 +428,9 @@ const (
  d. 删除 Secret，**但只删注解 cert-manager.io/certificate-name 指向本 CR 的那一个**
     → 不匹配（含无注解的手工 Secret）则跳过删除 + Info 日志 + Warning event
       SecretNameConflict；NotFound 视为已删。主防线是 §5.2 步骤 2 的护栏，这里是兜底
- e. 摘 finalizer（d 跳过与否都照常摘）
+ e. 摘 finalizer（d 跳过与否都照常摘）；跳过删除的三样痕迹（Info 日志、Warning event、
+    aliyuncert_secret_deletion_skipped_total）在这一步**成功之后**才留下——摘 finalizer
+    撞 Conflict 会让整轮重跑步骤 d，发在前面就会按重试次数重复计数
 ```
 
 CAS 放在 Certificate 之前只是就近安排，无正确性差异；唯一硬约束是 **Certificate 必须先于 Secret 死**。

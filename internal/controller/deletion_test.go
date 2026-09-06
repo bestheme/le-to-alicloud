@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake" // fake 已归 pkg/aliyun/fake
@@ -160,6 +161,81 @@ func TestReconcileDelete_IgnoresNotFoundOnFinalizerRemoval(t *testing.T) {
 	}
 	if res != (ctrl.Result{}) {
 		t.Errorf("删除收尾不该要求重排: %+v", res)
+	}
+}
+
+// 摘 finalizer 撞 Conflict 会让整轮返回 error，下一轮从头重跑步骤 d。跳过删除的痕迹
+// （Warning event + 计数器）若发在摘 finalizer 之前，每重试一次就多一条事件、多涨一次
+// 计数——而这个计数器是要拿来配告警的，虚高就意味着「有几个 Secret 被留下了」这个数
+// 读不得。所以痕迹必须留在成功路径上，恰好一次。
+func TestReconcileDelete_ForeignSecretTraceOnlyOnceAcrossRetries(t *testing.T) {
+	ctx := context.Background()
+	const ns = "m4-conflict-ns"
+
+	s := factoryScheme(t)
+	if err := cmapi.AddToScheme(s); err != nil {
+		t.Fatalf("cmapi.AddToScheme: %v", err)
+	}
+	ac := &certsv1alpha1.AliyunCertificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: "c1",
+			Finalizers:        []string{certsv1alpha1.FinalizerName},
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+		},
+	}
+	// 名字撞上、注解指向别人：正是「不属于本 CR，跳过删除」那条分支。
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace: ns, Name: "c1-tls",
+		Annotations: map[string]string{certManagerCertificateNameAnnotation: "someone-else"},
+	}}
+
+	var updates int
+	c := crfake.NewClientBuilder().WithScheme(s).WithObjects(ac.DeepCopy(), foreign).
+		WithStatusSubresource(&certsv1alpha1.AliyunCertificate{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+				opts ...client.UpdateOption) error {
+				if _, ok := obj.(*certsv1alpha1.AliyunCertificate); ok {
+					updates++
+					if updates == 1 {
+						return apierrors.NewConflict(
+							schema.GroupResource{Group: certsv1alpha1.GroupVersion.Group, Resource: "aliyuncertificates"},
+							obj.GetName(), errors.New("object was modified"))
+					}
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).Build()
+
+	rec := record.NewFakeRecorder(8)
+	r := &AliyunCertificateReconciler{Client: c, APIReader: c, Recorder: rec}
+	before := promtestutil.ToFloat64(secretDeletionSkippedTotal.WithLabelValues(ns))
+
+	key := types.NamespacedName{Namespace: ns, Name: "c1"}
+	round := func() error {
+		got := &certsv1alpha1.AliyunCertificate{}
+		if err := c.Get(ctx, key, got); err != nil {
+			return err
+		}
+		_, err := r.reconcileDelete(ctx, got, got.DeepCopy())
+		return err
+	}
+
+	if err := round(); err == nil {
+		t.Fatal("第一轮摘 finalizer 撞 Conflict，应当把错误抛上去")
+	}
+	if err := round(); err != nil {
+		t.Fatalf("第二轮应当摘掉 finalizer 并成功收尾: %v", err)
+	}
+
+	if got := len(rec.Events); got != 1 {
+		t.Errorf("跳过删除应恰好发一条事件，得到 %d 条", got)
+	}
+	if got := promtestutil.ToFloat64(secretDeletionSkippedTotal.WithLabelValues(ns)) - before; got != 1 {
+		t.Errorf("计数器应恰好涨 1，得到 %v", got)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "c1-tls"}, &corev1.Secret{}); err != nil {
+		t.Errorf("不属于本 CR 的 Secret 不该被删: %v", err)
 	}
 }
 
