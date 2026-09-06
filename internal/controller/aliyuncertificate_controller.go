@@ -409,7 +409,7 @@ func (r *AliyunCertificateReconciler) secretNameConflict(ctx context.Context, ac
 		return false, err
 	}
 	// cert-manager 会在它写的 Secret 上标注来源 Certificate；同名即视为我们的
-	return s.Annotations["cert-manager.io/certificate-name"] != certManagerNameFor(ac), nil
+	return !secretOwnedByUs(s, ac), nil
 }
 
 // SetupWithManager 注册 watch：主资源、owned Certificate、以及引用本证书的 Binding。
