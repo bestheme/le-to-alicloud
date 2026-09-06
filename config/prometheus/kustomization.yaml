@@ -1,5 +1,6 @@
 # 本目录 YAML 里的 `namespace: system` 是 kubebuilder 脚手架的占位，不是真实 namespace。
-# `config/default` 与 `config/overlays/openshift` 的 namespace 变换器会把它改写成 `le-to-alicloud-system`。
+# 引用本目录的入口（目前只有 `config/overlays/openshift`；`config/default` 里的 `- ../prometheus` 是注释掉的）
+# 会用 kustomize 的 namespace 变换器把它改写成 `le-to-alicloud-system`。
 # 因此本目录**不能单独 apply**（那样对象会真的落进字面量 `system`），只能作为上面两个入口的组成部分渲染。
 
 resources:

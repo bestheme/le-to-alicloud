@@ -197,7 +197,7 @@ make install                                   # 只装 CRD
 make deploy IMG=registry.example.com/le-to-alicloud:v0.1.0
 ```
 
-> **这条路径一条告警都没有。** `config/default/kustomization.yaml` 里 `- ../prometheus` 是注释掉的，所以 `make deploy` 装出来的东西**不含 `PrometheusRule` 与 `ServiceMonitor`**——包括「已知限制」里点名**必须配**的 `AliyunCertificateCleanupAbandoned`（没有它，`Abandon` 留下的孤儿会静默吃满账号配额）。要告警请改用 `config/overlays/openshift`（`kubectl apply -k config/overlays/openshift`，需先装 Prometheus Operator；它接了 `../prometheus`）。**不要直接 apply `config/prometheus`**：那一层没有 `namespace` 前缀转换，对象会落在字面量 `namespace: system` 里。那个 `system` 是 kubebuilder 脚手架的占位、不是真实 namespace——`config/default` 与 `config/overlays/openshift` 的 namespace 变换器会把它改写成 `le-to-alicloud-system`，所以只有从这两个入口渲染才落对地方。
+> **这条路径一条告警都没有。** `config/default/kustomization.yaml` 里 `- ../prometheus` 是注释掉的，所以 `make deploy` 装出来的东西**不含 `PrometheusRule` 与 `ServiceMonitor`**——包括「已知限制」里点名**必须配**的 `AliyunCertificateCleanupAbandoned`（没有它，`Abandon` 留下的孤儿会静默吃满账号配额）。要告警请改用 `config/overlays/openshift`（`kubectl apply -k config/overlays/openshift`，需先装 Prometheus Operator；它接了 `../prometheus`）。**不要直接 apply `config/prometheus`**：那一层没有 namespace 变换器，对象会落在字面量 `namespace: system` 里。那个 `system` 是 kubebuilder 脚手架的占位、不是真实 namespace——引用它的入口（目前只有 `config/overlays/openshift`；`config/default` 未引用）会用 namespace 变换器把它改写成 `le-to-alicloud-system`，所以只有从该入口渲染才落对地方。
 
 确认 operator 起来了：
 
