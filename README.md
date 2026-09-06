@@ -226,7 +226,7 @@ make undeploy-safe    # 1) 删全部 CR → 2) 闸门确认无残留 → 3) 才�
 make uninstall        # 只删 CRD；undeploy-safe 已经带 CRD 了，通常不必再跑
 ```
 
-闸门是 **fail-closed** 的：`kubectl` 查不动（集群不可达、上下文错、没有 list 权限）时它**不会**当作「已清空」放行，而是 `exit 1` 停住。`--cleanup-grace-period` 默认 `15m` 而删除的等待默认 `5m`，云侧清理慢时闸门会先拦下来——这时把超时调大再跑一次即可，别改用 `make undeploy` 绕过去：
+闸门是 **fail-closed** 的：`kubectl` 查不动（集群不可达、上下文错、没有 list 权限）时它**不会**当作「已清空」放行，而是 `exit 1` 停住。删除的等待 `CLEANUP_TIMEOUT` 默认 `16m`，是照着 operator 的 `--cleanup-grace-period`（默认 `15m`）推出来的：**等待必须 ≥ grace period**，否则 finalizer 的云侧清理还在 grace period 内跑着，`kubectl` 就已经等不下去返回，闸门会把「还没做完」误读成「清不动」。多出来的 1m 是留给 API 往返与 finalizer 摘除的余量。改大 operator 的 grace period 时，这个超时要跟着一起调大；云侧确实清理得更慢时同样把它调大再跑一次即可，别改用 `make undeploy` 绕过去：
 
 ```bash
 make undeploy-safe CLEANUP_TIMEOUT=20m
@@ -237,11 +237,11 @@ make undeploy-safe CLEANUP_TIMEOUT=20m
 ```bash
 # 第 1 步：删 CR（operator 仍在运行，finalizer 会去清理云侧）
 # oc
-oc delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=5m
-oc delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=5m
+oc delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=16m
+oc delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=16m
 # kubectl
-kubectl delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=5m
-kubectl delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=5m
+kubectl delete aliyuncertificatebindings.certs.bestheme.ac.cn --all -A --wait --timeout=16m
+kubectl delete aliyuncertificates.certs.bestheme.ac.cn        --all -A --wait --timeout=16m
 ```
 
 **第 2 步：确认 finalizer 真的跑完了，而不是放弃了。这一步必须在 `make undeploy` 之前做**——`undeploy` 会删掉 Deployment，指标端点随之消失，下面那条指标判据事后就抓不到了。

@@ -241,7 +241,13 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 #
 # 唯一安全的顺序是：operator 还活着的时候先删 CR、等 finalizer 把云侧清理跑完，再拆 operator。
 # 第 2 步的残留检查是硬闸：CR 没删干净就 exit 1，绝不带着孤儿风险往下走。
-CLEANUP_TIMEOUT ?= 5m
+#
+# 这个超时**必须 ≥ operator 的 `--cleanup-grace-period`（默认 15m）**，否则闸门会在
+# operator 放弃之前就先超时：finalizer 里的云侧清理还在 grace period 内正常跑着，
+# kubectl 却已经等不下去返回了，闸门于是把「还没做完」误读成「清不动」而拦下。
+# 默认 16m = 15m grace period + 1m 余量（留给 API 往返与 finalizer 摘除）。
+# 改动 operator 的 `--cleanup-grace-period` 时，这里要跟着一起调。
+CLEANUP_TIMEOUT ?= 16m
 
 # 一行一个类型，**刻意不用逗号连写**：`kubectl get a,b` 只要其中一个类型未知就整体报错，
 # 而且**不打印已知那个类型的行**。两个 CRD 只装了一个时，逗号写法既拿不到数据、又分不清
