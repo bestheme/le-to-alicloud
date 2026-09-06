@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
@@ -29,6 +31,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/pki/testutil"
@@ -113,6 +118,78 @@ func TestSecretNameGuardHolding(t *testing.T) {
 				t.Errorf("secretNameGuardHolding = %v, 期望 %v", got, c.want)
 			}
 		})
+	}
+}
+
+// 冲突挂着、而 Certificate 迟迟不 Ready（CertificateRequest 永久失败，Issuing 已回落
+// False 所以停滞检测也不触发）时，步骤 4 按设计返回空 Result 等 Owns watch。可是这条路上
+// 唤醒源根本不存在：占用者是一个 Secret，而 Secret 刻意不进 cache 也不 watch。删掉占用者
+// 也不会自愈，直到有别的什么事件碰它——而 README 与 spec 都承诺「每个 resync 周期自动重试」。
+func TestReconcile_ConflictWithUnreadyCertificateStillRequeues(t *testing.T) {
+	ctx := context.Background()
+	const ns = "i4-ns"
+
+	sch := factoryScheme(t)
+	if err := cmapi.AddToScheme(sch); err != nil {
+		t.Fatalf("cmapi.AddToScheme: %v", err)
+	}
+
+	ac := &certsv1alpha1.AliyunCertificate{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "c1", Finalizers: []string{certsv1alpha1.FinalizerName}},
+		Spec: certsv1alpha1.AliyunCertificateSpec{
+			SecretName: "victim-tls",
+			CertificateTemplate: certsv1alpha1.CertificateTemplate{
+				DNSNames:  []string{"api.example.com"},
+				IssuerRef: &cmmeta.IssuerReference{Name: "letsencrypt-prod", Kind: "ClusterIssuer"},
+			},
+			Aliyun: certsv1alpha1.AliyunSpec{
+				CredentialsRef: certsv1alpha1.LocalSecretReference{Name: "aliyun"},
+				Region:         "cn-hangzhou",
+			},
+		},
+		// 在役的是 c1-tls，用户想要的是 victim-tls：护栏正拦着。
+		Status: certsv1alpha1.AliyunCertificateStatus{SecretName: "c1-tls"},
+	}
+	// Certificate 存在但没有任何 condition：既不 Ready 也不 Issuing，停滞检测不会触发。
+	cert := &cmapi.Certificate{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "c1"},
+		Spec:       cmapi.CertificateSpec{SecretName: "c1-tls", DNSNames: []string{"api.example.com"}},
+	}
+	victim := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace: ns, Name: "victim-tls",
+		Annotations: map[string]string{certManagerCertificateNameAnnotation: "someone-else"},
+	}}
+
+	c := crfake.NewClientBuilder().WithScheme(sch).WithObjects(ac, cert, victim).
+		WithStatusSubresource(&certsv1alpha1.AliyunCertificate{}).Build()
+
+	r := &AliyunCertificateReconciler{
+		Client: c, APIReader: c, Scheme: sch,
+		Recorder:       record.NewFakeRecorder(8),
+		ResyncInterval: 42 * time.Minute,
+	}
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "c1"}})
+	if err != nil {
+		t.Fatalf("这一轮不该报错: %v", err)
+	}
+	if res.RequeueAfter != r.resyncInterval() {
+		t.Errorf("冲突挂着时必须按 resync 周期重排，得到 RequeueAfter=%v", res.RequeueAfter)
+	}
+
+	got := &certsv1alpha1.AliyunCertificate{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "c1"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if r := condReason(got, certsv1alpha1.ConditionReady); r != certsv1alpha1.ReasonSecretNameConflict {
+		t.Errorf("Ready 的 reason = %q，期望 SecretNameConflict", r)
+	}
+	// Certificate 的 secretName 一个字都不许动。
+	gotCert := &cmapi.Certificate{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "c1"}, gotCert); err != nil {
+		t.Fatal(err)
+	}
+	if gotCert.Spec.SecretName != "c1-tls" {
+		t.Errorf("Certificate 的 secretName 被改成了 %q", gotCert.Spec.SecretName)
 	}
 }
 
@@ -262,6 +339,58 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 		eventually(func() bool { return condTrue(getAC(ctx, ns, "keep"), certsv1alpha1.ConditionReady) })
 	})
 
+	// 集群里先躺着一个与 CR 同名的 Certificate（人工建的，或上一次删 CR 时残留），而新建的
+	// CR 的 spec.secretName 指着别人的 Secret。护栏从第一轮起就在拦，于是步骤 3 一次都没跑过。
+	// Ready 的否决判据若依赖「步骤 3 曾经写过 status.secretName」，这条路上它永远为空，
+	// Ready 会被聚合成 True——用户的变更其实被拒绝了，对外却说一切正常。
+	It("Certificate 预先存在且 spec 指向他人 Secret 时也必须 Ready=False/SecretNameConflict", func() {
+		ns := newNamespace(ctx)
+
+		victim := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "victim3-tls", Namespace: ns,
+				Annotations: map[string]string{certManagerCertificateNameAnnotation: "someone-else"}},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       []byte("victim-cert-placeholder"),
+				corev1.TLSPrivateKeyKey: []byte("victim-key-placeholder"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, victim)).To(Succeed())
+
+		// 残留的 Certificate：名字与 CR 相同，secretName 指着它自己的那个在役 Secret。
+		stale := &cmapi.Certificate{
+			ObjectMeta: metav1.ObjectMeta{Name: "pre", Namespace: ns},
+			Spec: cmapi.CertificateSpec{
+				SecretName: "pre-tls",
+				DNSNames:   []string{"api.example.com"},
+				IssuerRef:  cmmeta.IssuerReference{Name: "letsencrypt-prod", Kind: "ClusterIssuer", Group: "cert-manager.io"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, stale)).To(Succeed())
+
+		// 在役 Secret 里放一张真证书，好让步骤 5–10 全都走得通——否则 Issued 会因为
+		// SecretNotFound 而为 False，Ready 就算不被否决也是 False，用例证明不了什么。
+		crt, key := testutil.IssueLeaf(GinkgoT(), ca, "api.example.com")
+		writeTLSSecret(ctx, ns, "pre", crt, key)
+		setCertificateStatus(ctx, ns, "pre", 1, cmmeta.ConditionFalse)
+
+		ac := baseAC(ns, "pre")
+		ac.Spec.SecretName = "victim3-tls"
+		Expect(k8sClient.Create(ctx, ac)).To(Succeed())
+
+		// 在役证书照常被维护到底（Issued=True 且已上传），但 Ready 必须诚实。
+		eventually(func() bool {
+			a := getAC(ctx, ns, "pre")
+			return a.Status.Current != nil && a.Status.Current.CertID != nil
+		})
+		Expect(condTrue(getAC(ctx, ns, "pre"), certsv1alpha1.ConditionIssued)).To(BeTrue())
+		Expect(condReason(getAC(ctx, ns, "pre"), certsv1alpha1.ConditionReady)).
+			To(Equal(certsv1alpha1.ReasonSecretNameConflict))
+		// Certificate 上的 secretName 一个字都不许动。
+		got, err := getCert(ctx, ns, "pre")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.Spec.SecretName).To(Equal("pre-tls"))
+	})
+
 	// 删除期复核：Secret 在 CR 生命周期里被别的 Certificate 接管之后，删 CR 不能顺手把它删掉。
 	It("删除时跳过不属于本 CR 的 Secret，finalizer 照常摘除", func() {
 		ns := newNamespace(ctx)
@@ -286,7 +415,10 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 		Expect(acWarningEventMessage(ctx, ns, "foreign", certsv1alpha1.ReasonSecretNameConflict)).
 			To(Equal(secretDeletionSkippedMessage))
 		// 事件会随 namespace 一起过期，指标才是能长期告警的那一份痕迹（同 CleanupAbandoned）。
+		// Equal 而不是 >=：label 是 namespace，而每个用例都用一个新建的 namespace，所以
+		// 这个 counter 在本用例里只可能被本用例涨。收紧到恰好 1 才能覆盖单测覆盖不到的
+		// 那条重放路径（对象已真正删除，cache 里带 finalizer 的旧版本又唤起一轮）。
 		Expect(promtestutil.ToFloat64(secretDeletionSkippedTotal.WithLabelValues(ns))).
-			To(BeNumerically(">=", 1))
+			To(Equal(float64(1)))
 	})
 })
