@@ -22,7 +22,12 @@ jobs:
         with:
           version: v2.13.2
 
-      # README 的「RAM 权限」一节内联了完整策略 JSON，docs/ram/ 下还有三份文件版。
-      # 副本之间的漂移会直接变成线上权限配错，所以由门禁盯着，而不是靠人记得同步。
+      # README 的「RAM 权限」一节与 spec §8.3 都内联了完整策略 JSON，docs/ram/ 下还有
+      # 三份文件版。副本之间的漂移会直接变成线上权限配错，所以由门禁盯着，而不是靠人
+      # 记得同步。
+      #
+      # always()：策略漂移与 Go 代码的 lint 是两件无关的事，上一步红了不该把这条结论
+      # 一起藏掉——那正好是「改文档顺手也改了代码」的 PR 最需要看到它的时候。
       - name: Verify the RAM policy copies agree
+        if: always()
         run: make verify-ram-policy

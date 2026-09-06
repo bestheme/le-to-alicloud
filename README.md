@@ -646,7 +646,7 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
 | `fc:GetCustomDomain` | 绑定的每一轮 Observe（漂移检测，`--drift-check-interval` 默认 1h）、Apply 前 read-modify-write 的读取、`deletionPolicy: Unbind` 解绑前的读取 | `Ready=False`，reason `CredentialsInvalid`；**`Applied` 一个字节都不动**——一次读被拒绝说不出目标上那张证书还在不在服役。**不发事件**，固定 5 分钟 requeue。漂移检测就此停摆：证书换代不会被应用，你只会看到 `Ready=False` |
 | `fc:UpdateCustomDomain` | Apply 写入 `certConfig`：首次绑定、证书换代、漂移纠正；`deletionPolicy: Unbind` 时解绑清理 | `Applied=False` reason `CredentialsInvalid`，`Ready` 跟着 `False`；事件 reason 恒为 `ApplyFailed`（事件名与 condition 的 reason 刻意不同名），固定 5 分钟 requeue。域名上还挂着上一张证书，到期就断。解绑路径与 CAS 清理同构：`CleanupFailed` → `Abandon` 发 `CleanupAbandoned`、`Block` 卡 `Terminating` |
 
-`fc` 的两条动作只在 ARN 命中的域名上生效。**ARN 里少列一个域名，症状与完全没有 `fc:` 权限一模一样**——阿里云对两者返回同一个 `AccessDenied`。
+`fc` 的两条动作只在 ARN 命中的域名上生效。**ARN 里少列一个域名，症状大概率与完全没有 `fc:` 权限区分不开**：两者预计都是 `AccessDenied`。这一条**未实测**，出处是 `test/integration/fc3_test.go` 里的分析（探针撞上 `AccessDenied` 时就是因此拒绝下结论的）。
 
 ### 按你的部署裁剪
 
@@ -688,7 +688,7 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
 jq . docs/ram/full-policy.json docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
 ```
 
-**这四处副本（README 里那份 + 三个文件）的一致性由门禁盯着，不靠人记得同步**：`make verify-ram-policy` 断言 README 里的完整策略与 `full-policy.json` 逐字相等、且另两份的 `Statement` 合并后等于它的 `Statement` 列表，任一不等就打印 diff 并失败。CI 的 lint workflow 每次 push / PR 都会跑它。改任何一处策略之后，本地跑一遍再提交：
+**这五处副本（README 里那份、spec §8.3 里那份，加三个文件）的一致性由门禁盯着，不靠人记得同步**：`make verify-ram-policy` 断言 README 与 spec §8.3 里的完整策略都与 `full-policy.json` 逐字相等、且另两份的 `Statement` 合并后等于它的 `Statement` 列表，任一不等就打印 diff 并失败。CI 的 lint workflow 每次 push / PR 都会跑它，而且 `if: always()`——Go 那边的 lint 挂了也照样能看到策略有没有漂移。改任何一处策略之后，本地跑一遍再提交：
 
 ```bash
 make verify-ram-policy
