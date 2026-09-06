@@ -657,7 +657,7 @@ rules:
     {
       "Effect": "Allow",
       "Action": ["fc:GetCustomDomain", "fc:UpdateCustomDomain"],
-      "Resource": ["acs:fc:cn-hangzhou:<accountId>:custom-domains/api.timehorse.bestheme.ac.cn"]
+      "Resource": ["acs:fc:<fc3Region>:<accountId>:custom-domains/<domainName>"]
     }
   ]
 }
@@ -668,7 +668,7 @@ rules:
 要点：
 
 - `yundun-cert:*` **无法资源级收窄**——operator 的 AK 能删账号下任意上传证书。这是不可回避的爆炸半径，必须写进 README，并建议独立 RAM 子账号 + 独立 AK。这也是 `uploadToCAS` 开关存在的理由。
-- `fc` 支持逐域名 ARN 授权，必须用上。
+- `fc` 支持逐域名 ARN 授权，必须用上。ARN 里的 `<fc3Region>` 是**FC3 自定义域名所在的 region**（`spec.target.fc3CustomDomain.region`），**与 CAS 的 `spec.aliyun.region` / `casRegion` 无关**——两者取不同 region 是正常组合。
 - **不授 `yundun-cert:GetUserCertificateDetail`**（返回私钥，本设计不需要）。
 
 ---

@@ -1,0 +1,24 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "yundun-cert:UploadUserCertificate",
+        "yundun-cert:DeleteUserCertificate",
+        "yundun-cert:ListUserCertificateOrder"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "fc:GetCustomDomain",
+        "fc:UpdateCustomDomain"
+      ],
+      "Resource": [
+        "acs:fc:<fc3Region>:<accountId>:custom-domains/<domainName>"
+      ]
+    }
+  ]
+}

@@ -603,25 +603,102 @@ kubectl -n openshift-user-workload-monitoring get pods
 
 ## RAM 权限
 
-两份策略原文各自只有一个来源，**README 不复制它们的内容**——同一份策略抄两处迟早会漂移，而这类文件漂移的后果是线上权限配错。
+operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就是它需要的全部权限，没有一条是多余的。资源级收窄能做的地方都做了：`fc` 逐域名 ARN，`yundun-cert` 只能 `*`（原因见下面「为什么是这样授权」）。
 
-| 文件 | 给谁 | 内容 |
-|---|---|---|
-| `docs/ram/certificate-cas-policy.json` | 证书 controller（`spec.aliyun.uploadToCAS: true` 时需要） | `yundun-cert` 的 `UploadUserCertificate` / `DeleteUserCertificate` / `ListUserCertificateOrder` |
-| `docs/ram/binding-fc3-policy.json` | 绑定 controller | `fc:GetCustomDomain` / `fc:UpdateCustomDomain`，按域名 ARN 授权 |
-
-两份都需要时，把两个文件的 `Statement` 数组合并成一份策略，或者在 RAM 里给同一个用户挂两条自定义策略。`binding-fc3-policy.json` 里的 `cn-hangzhou`、`<accountId>` 与域名都是占位，按你的实际 region / 账号 / 域名替换。
-
-```bash
-jq . docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "yundun-cert:UploadUserCertificate",
+        "yundun-cert:DeleteUserCertificate",
+        "yundun-cert:ListUserCertificateOrder"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "fc:GetCustomDomain",
+        "fc:UpdateCustomDomain"
+      ],
+      "Resource": [
+        "acs:fc:<fc3Region>:<accountId>:custom-domains/<domainName>"
+      ]
+    }
+  ]
+}
 ```
 
-四点差异说明：
+`<fc3Region>` / `<accountId>` / `<domainName>` 是占位符，**带尖括号的原文不是合法 ARN**，创建策略前必须替换，怎么填见下面「把占位符填成真实值」。同一份内容也在 `docs/ram/full-policy.json`，那是可以直接喂给 `aliyun ram CreatePolicy` 的文件版。**这份 JSON 与 `docs/ram/full-policy.json` 是同一份内容的两处副本，改一处必须同步另一处。**
+
+### 每个 Action 用在哪、缺了会怎样
+
+「缺了会怎样」一栏里的 reason 与事件名都能在代码里找到出处：`api/v1alpha1/conditions.go` 是 reason 常量表，事件由各 controller 的 `Recorder.Event` 发出。阿里云对无权限的调用回 403 / `Forbidden.*` / `NoPermission.*`，`pkg/aliyun` 的 `classifyCode` 把它们一律归为 Auth 类，所以下面几条症状都以 Auth 分支的处置为准。
+
+| Action | 什么时候调 | 缺了会怎样 |
+|---|---|---|
+| `yundun-cert:UploadUserCertificate` | 首次签发与每次续期后上传新代次；write-ahead 记录先落盘，重试复用同一个 `clientToken` | `Uploaded=False`，reason `CredentialsInvalid`；`Ready` 聚合后也是 `False` 并沿用同一个 reason。**不发事件**，每 5 分钟重试一次。证书在集群里签出来了，云上一张都没有 |
+| `yundun-cert:DeleteUserCertificate` | 保留策略回收超出 `retention.keepLast` 的旧代次；删除 CR 时按 status 里记下的各代清理 | 回收路径：一条 Warning 事件 `ReclaimFailed`，**一个 condition 都不碰**（当前服役的那张没有任何问题），旧证书留在云上占额度。删除路径：`Ready=False` reason `CleanupFailed` 并重试；超过 `--cleanup-grace-period` 后按 `--cleanup-failure-policy` 处置——`Abandon` 发 `CleanupAbandoned` 事件、`aliyuncert_cleanup_abandoned_total` +1、照常摘 finalizer，`Block` 则一直卡在 `Terminating` |
+| `yundun-cert:ListUserCertificateOrder` | 三处：每 `--cas-probe-interval`（默认 12h）探测当前证书是否还在云上；上传撞上同名冲突时按名认领既有 `certId`（write-ahead 的崩溃恢复退化路径）；删除时认领 write-ahead 记录指向的那一张 | 探测路径：一条 Warning 事件 `ProbeFailed`，**condition 不动**（列不出清单说明不了服役中那张有问题），`status.casProbedAt` 不推进，所以每一轮 reconcile 都会重试。认领路径更疼：同名冲突后认不回 `certId`，`Uploaded=False` reason `UploadFailed` 并发 `UploadFailed` 事件；删除时认领失败走上面那条 `CleanupFailed` 处置，被 `Abandon` 放走的话那张证书就成了孤儿（日志里留 `pendingCASName` 供人工兜底） |
+| `fc:GetCustomDomain` | 绑定的每一轮 Observe（漂移检测，`--drift-check-interval` 默认 1h）、Apply 前 read-modify-write 的读取、`deletionPolicy: Unbind` 解绑前的读取 | `Ready=False`，reason `CredentialsInvalid`；**`Applied` 一个字节都不动**——一次读被拒绝说不出目标上那张证书还在不在服役。**不发事件**，固定 5 分钟 requeue。漂移检测就此停摆：证书换代不会被应用，你只会看到 `Ready=False` |
+| `fc:UpdateCustomDomain` | Apply 写入 `certConfig`：首次绑定、证书换代、漂移纠正；`deletionPolicy: Unbind` 时解绑清理 | `Applied=False` reason `CredentialsInvalid`，`Ready` 跟着 `False`；事件 reason 恒为 `ApplyFailed`（事件名与 condition 的 reason 刻意不同名），固定 5 分钟 requeue。域名上还挂着上一张证书，到期就断。解绑路径与 CAS 清理同构：`CleanupFailed` → `Abandon` 发 `CleanupAbandoned`、`Block` 卡 `Terminating` |
+
+`fc` 的两条动作只在 ARN 命中的域名上生效。**ARN 里少列一个域名，症状与完全没有 `fc:` 权限一模一样**——阿里云对两者返回同一个 `AccessDenied`。
+
+### 按你的部署裁剪
+
+- **`spec.aliyun.uploadToCAS: false`**：只留 `fc` 那条 Statement，`yundun-cert:*` 一个都不给。此时 operator 完全不碰 CAS（不上传、不回收、不探测），`Uploaded` condition 停在 `UploadDisabled` 且不参与 `Ready` 聚合。
+- **只建 `AliyunCertificate`、不建任何 Binding**：只留 `yundun-cert` 那条。证书会同步进 CAS 控制台，但没有任何 FC3 调用。
+- **多个绑定域名**：`Resource` 数组里逐个列 ARN，一个域名一条，不要图省事写 `custom-domains/*`。域名分布在不同 region 时，每条 ARN 各写各的 region。
+- **CAS 那条的 `"Resource": "*"` 改不了**，`yundun-cert` 不支持资源级授权，见下一节。
+
+### 把占位符填成真实值
+
+- **`<fc3Region>`** 取 Binding 的 `spec.target.fc3CustomDomain.region`，也就是**FC3 自定义域名所在的 region**。它与 `spec.aliyun.region` / `spec.aliyun.casRegion` **没有任何关系**：CAS 在一个 region、FC3 域名在另一个 region 是完全正常的组合，这里必须填后者。填错的症状同样是 `AccessDenied`，而且看不出是 region 错了。
+- **`<accountId>`** 是阿里云主账号 ID，一串纯数字。控制台右上角账号菜单里能看到；FC3 自定义域名的 CNAME 目标 `<uid>.<region>.fc.aliyuncs.com` 的第一段也是它。绑定成功之后 operator 会把观测到的账号固化进 `status.boundAccountId`，可以拿它反查：`kubectl get aliyuncertificatebinding <name> -o jsonpath='{.status.boundAccountId}'`。第一次配置时的顺手做法是先用 `custom-domains/*` 授权、跑通一次读出账号，再把 ARN 收窄到逐域名。
+- **`<domainName>`** 取 `spec.target.fc3CustomDomain.domainName`，就是 FC3 上那个自定义域名本身，不带协议、不带端口、不带路径。
+
+填完之后 `Resource` 这一行大致长这样（region、账号、域名都换成你自己的）：
+
+```json
+"acs:fc:cn-shanghai:100000000000000000:custom-domains/api.example.com"
+```
+
+### 为什么是这样授权
 
 - **`yundun-cert:*` 的资源类型是「全部资源」，无法资源级收窄。** 策略里的 `"Resource": "*"` 不是偷懒，是 CAS 只支持这一种写法。持有这个 AK 就能删掉账号下**任意**上传证书。这是不可回避的爆炸半径——**必须用一个独立的 RAM 子账号 + 独立 AK**，不要复用任何现有账号的凭证。
 - **`fc` 支持逐域名 ARN 授权**（`acs:fc:{regionId}:{accountId}:custom-domains/{domainName}`），必须用上，别偷懒写 `*`。多个域名就多列几条 ARN。
 - **不要授 `yundun-cert:GetUserCertificateDetail`。** 它的响应里带私钥，而 operator 完全不需要它——上传、删除、列举三个动作就够了。授出去只是白白扩大泄漏面。
-- **只用 FC3、不需要在 CAS 控制台里看到证书的用户**：设 `spec.aliyun.uploadToCAS: false`，只挂 `docs/ram/binding-fc3-policy.json`，`yundun-cert:*` 一个都不给。此时 operator 完全不碰 CAS（不上传、不回收、不探测），`Uploaded` condition 停在 `UploadDisabled` 且不参与 `Ready` 聚合。
+- **只用 FC3、不需要在 CAS 控制台里看到证书的用户**：设 `spec.aliyun.uploadToCAS: false`，只授 `fc` 那条，见上一节的裁剪规则。
+
+### 文件版
+
+三份 JSON 都是可以直接创建策略的原文，内容与本节完全一致：
+
+| 文件 | 内容 |
+|---|---|
+| `docs/ram/full-policy.json` | 上面那份完整策略，两条 Statement |
+| `docs/ram/certificate-cas-policy.json` | 只有 `yundun-cert` 那条（`spec.aliyun.uploadToCAS: true` 时需要） |
+| `docs/ram/binding-fc3-policy.json` | 只有 `fc` 那条，按域名 ARN 授权 |
+
+```bash
+jq . docs/ram/full-policy.json docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
+```
+
+替换掉占位符之后创建策略：
+
+```bash
+aliyun ram CreatePolicy --PolicyName le-to-alicloud --PolicyDocument "$(cat docs/ram/full-policy.json)"
+```
+
+### 集成测试的额外权限
+
+`test/integration/` 的探针会在真实账号上建删证书、并改写 `FC3_TEST_DOMAIN` 指定域名的 `certConfig`，用的就是上面这份策略，**没有额外的 Action 需要授**。
+
+唯一一处提到别的动作是排障建议：FC 的 `AccessDenied` 分不清「压根没有 `fc:` 权限」和「有权限但这个域名不在授权的 ARN 集合里」，要分辨就手工再调一次不针对具体域名的只读动作（例如 `fc:ListCustomDomains`），它也 `AccessDenied` 才说明是前者。探针自己不做这一步（`test/integration/fc3_test.go` 里写明了理由），所以 `fc:ListCustomDomains` 只是人工排障时可以临时加、查完就撤的一条，**operator 与自动化测试都不需要它**。
 
 ## 威胁模型
 
@@ -851,7 +928,7 @@ make kustomize && ./bin/kustomize build config/default | grep -c "^kind: CustomR
 
 `test/integration/` 下的探针会在**真实阿里云账号**上创建并删除证书，配了 `FC3_TEST_DOMAIN` 时还会真的改写那个域名的 `certConfig`。**不要用生产账号，不要用生产域名。**
 
-1. 建一个独立 RAM 子账号，只给「RAM 权限」一节的那两份策略，生成独立 AK。
+1. 建一个独立 RAM 子账号，只给「RAM 权限」一节的那份完整策略，生成独立 AK。
 2. 准备环境变量：
 
    ```bash
