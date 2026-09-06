@@ -154,9 +154,8 @@ var _ = Describe("证书 controller：Secret 归属护栏", func() {
 	// 覆写护栏：护栏只在首次创建时跑的话，这里的 Update 会把 Certificate 的 secretName
 	// 改到受害 Secret 上，cert-manager 随即用本证书覆写它（评估文档 §4.6 步骤 6）。
 	It("spec.secretName 改指到别人的 Secret 时不更新 Certificate，Ready=False/SecretNameConflict", func() {
-		// 这里刻意不动 reconciler.ResyncInterval：改 spec 本身就会触发一轮 reconcile，
-		// 冲突在那一轮里就判出来了，不需要等 requeue。而 ResyncInterval 是裸字段，
-		// manager 的 worker goroutine 正在读它，测试线程写它就是一条 -race 能抓到的竞态。
+		// 这里刻意不动 reconciler 的周期：改 spec 本身就会触发一轮 reconcile，冲突在那一轮
+		// 里就判出来了，不需要等 requeue。
 		ns := newNamespace(ctx)
 
 		// 受害 Secret：注解指向另一个 Certificate，内容是与本证书无关的占位字节。

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"testing"
 	"time"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -151,8 +152,8 @@ var _ = Describe("证书 controller：基础 reconcile", func() {
 	It("目标 Secret 已被占用时 Ready=False/SecretNameConflict", func() {
 		// 冲突分支没有 watch 能唤醒它，只能靠 RequeueAfter 自愈；requeue 的时长在冲突那一次
 		// reconcile 时就定死了，所以必须在创建 CR 之前把周期调短，否则要等满 1h。
-		reconciler.ResyncInterval = 500 * time.Millisecond
-		DeferCleanup(func() { reconciler.ResyncInterval = time.Hour })
+		reconciler.SetResyncInterval(500 * time.Millisecond)
+		DeferCleanup(func() { reconciler.SetResyncInterval(time.Hour) })
 
 		ns := newNamespace(ctx)
 		occupied := &corev1.Secret{
@@ -193,3 +194,21 @@ var _ = Describe("证书 controller：基础 reconcile", func() {
 		})
 	})
 })
+
+// TestResyncIntervalIsRaceFree 锁住 ResyncInterval 的并发契约：manager 跑起来之后每一轮
+// reconcile 都在读它，而用例会在运行中改它（上面那个 SecretNameConflict 用例就是）。
+// 把这两句换回裸字段读写，-race 立刻报 DATA RACE——这正是加存取器之前的状态。
+func TestResyncIntervalIsRaceFree(t *testing.T) {
+	r := &AliyunCertificateReconciler{ResyncInterval: time.Hour}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			r.SetResyncInterval(time.Duration(i) * time.Millisecond)
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		_ = r.resyncInterval()
+	}
+	<-done
+}

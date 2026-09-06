@@ -64,6 +64,9 @@ type AliyunCertificateReconciler struct {
 	// 只许经 SetNow 改（测试会在运行中推进假时钟，而每一轮 reconcile 都在读它）。
 	Now func() time.Time
 
+	// ResyncInterval 与 Now 一样是运行中会被改的字段（用例把它调短来验证自愈路径），
+	// 而每一轮 reconcile 的返回值都在读它。构造时可以直接赋值；manager 跑起来之后
+	// 只许经 SetResyncInterval 改，读只许经 resyncInterval()。
 	ResyncInterval         time.Duration
 	CASProbeInterval       time.Duration
 	IssuanceStallThreshold time.Duration
@@ -103,6 +106,21 @@ func (r *AliyunCertificateReconciler) now() time.Time {
 		return fn()
 	}
 	return time.Now()
+}
+
+// SetResyncInterval 线程安全地改周期。理由与 SetNow 逐字相同：用例在 manager 跑起来
+// 之后调短它来验证「靠 RequeueAfter 自愈」那几条路径，而那一刻很可能正有一轮 reconcile
+// 在读——裸赋值就是 -race 抓得到的数据竞争。
+func (r *AliyunCertificateReconciler) SetResyncInterval(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ResyncInterval = d
+}
+
+func (r *AliyunCertificateReconciler) resyncInterval() time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.ResyncInterval
 }
 
 // +kubebuilder:rbac:groups=certs.bestheme.ac.cn,resources=aliyuncertificates,verbs=get;list;watch;create;update;patch;delete
@@ -178,7 +196,7 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		// watch），占用者被删掉后只能靠定时重试自愈。
 		setCondition(ac, certsv1alpha1.ConditionReady, metav1.ConditionFalse,
 			certsv1alpha1.ReasonSecretNameConflict, secretNameConflictMessage(ac))
-		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+		return ctrl.Result{RequeueAfter: r.resyncInterval()}, r.patchStatus(ctx, ac, orig)
 	}
 
 	// 3. CreateOrUpdate cert-manager Certificate（只有 spec 真变了才会发出 Update）
@@ -240,7 +258,7 @@ func (r *AliyunCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if stalled {
 			// 首次签发就停滞：Certificate 还没 Ready，没有任何 watch 会因为「又过了一小时」
 			// 而唤醒我们，只能定时重来。
-			return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+			return ctrl.Result{RequeueAfter: r.resyncInterval()}, r.patchStatus(ctx, ac, orig)
 		}
 		return ctrl.Result{}, r.patchStatus(ctx, ac, orig)
 	}
@@ -263,7 +281,7 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 		}
 		r.aggregateReady(ac)
 		// 不清空 status.current：Secret 短暂异常不能被当成新代次
-		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+		return ctrl.Result{RequeueAfter: r.resyncInterval()}, r.patchStatus(ctx, ac, orig)
 	}
 	if !stalled {
 		setCondition(ac, certsv1alpha1.ConditionIssued, metav1.ConditionTrue, certsv1alpha1.ReasonReady, "Secret 通过校验")
@@ -306,7 +324,7 @@ func (r *AliyunCertificateReconciler) reconcileIssued(ctx context.Context, ac, o
 
 	// 10. 汇总 Ready 并落盘
 	r.aggregateReady(ac)
-	return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+	return ctrl.Result{RequeueAfter: r.resyncInterval()}, r.patchStatus(ctx, ac, orig)
 }
 
 // detectIssuerDivergence：已 Pin 且 flag 当前值不同 → 打一个不参与 Ready 的 condition，
@@ -396,7 +414,7 @@ func (r *AliyunCertificateReconciler) handleCloudError(ctx context.Context, ac, 
 		setCondition(ac, certsv1alpha1.ConditionUploaded, metav1.ConditionFalse, certsv1alpha1.ReasonUploadFailed, op+" 失败: "+err.Error())
 		r.Recorder.Event(ac, corev1.EventTypeWarning, certsv1alpha1.ReasonUploadFailed, op+" failed")
 		r.aggregateReady(ac)
-		return ctrl.Result{RequeueAfter: r.ResyncInterval}, r.patchStatus(ctx, ac, orig)
+		return ctrl.Result{RequeueAfter: r.resyncInterval()}, r.patchStatus(ctx, ac, orig)
 	}
 }
 
@@ -424,7 +442,7 @@ func (r *AliyunCertificateReconciler) handleNonFatalCloudError(
 	if aliyun.ClassOf(err) == aliyun.ClassRetryable {
 		return ctrl.Result{}, err // 交给 controller-runtime 指数退避
 	}
-	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+	return ctrl.Result{RequeueAfter: r.resyncInterval()}, nil
 }
 
 // secretNameConflict 判断目标 Secret 是否已被别人占用。
