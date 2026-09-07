@@ -97,12 +97,26 @@ func materialReader(t *testing.T, objs ...client.Object) client.Reader {
 }
 
 // materialCertificate 造一个只带 status.current 的证书 CR；名字固定，Secret 名随之定死。
+//
+// region 与 casRegion **刻意取不同的值**：材料里的 CASRegion 必须来自 casRegion，而写成
+// region 在两者相等时是看不出来的（真实集群里绝大多数证书不设 casRegion，于是
+// EffectiveCASRegion() 与 Region 恒等，一个写错的字段能一路绿到生产）。
+// 见 TestLoadBindingMaterial_CASRegionComesFromCASRegion。
 func materialCertificate(cur *certsv1alpha1.CertificateGeneration) *certsv1alpha1.AliyunCertificate {
 	return &certsv1alpha1.AliyunCertificate{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: "c1"},
-		Status:     certsv1alpha1.AliyunCertificateStatus{Current: cur},
+		Spec: certsv1alpha1.AliyunCertificateSpec{
+			Aliyun: certsv1alpha1.AliyunSpec{Region: materialRegion, CASRegion: materialCASRegion},
+		},
+		Status: certsv1alpha1.AliyunCertificateStatus{Current: cur},
 	}
 }
+
+// materialRegion / materialCASRegion 必须不相等，理由见 materialCertificate。
+const (
+	materialRegion    = "cn-hangzhou"
+	materialCASRegion = "cn-shanghai"
+)
 
 func tlsSecret(name string, certPEM, keyPEM []byte) *corev1.Secret {
 	return &corev1.Secret{
@@ -224,6 +238,36 @@ func TestLoadBindingMaterial_IdentityFromStatusOnlyWhenFingerprintMatches(t *tes
 			t.Errorf("casName 应按 Secret 的指纹重新派生: got %s, want %s", m.CASName, want)
 		}
 	})
+}
+
+// TestLoadBindingMaterial_CASRegionComesFromCASRegion 钉住材料里的 CASRegion 取自
+// spec.aliyun.casRegion（经 EffectiveCASRegion），而不是 spec.aliyun.region。
+//
+// 这条断言存在的唯一理由是那两个字段**通常相等**：casRegion 是可选的，缺省回落到 region，
+// 所以把 CASRegion 写成 ac.Spec.Aliyun.Region 在任何不设 casRegion 的 fixture 上都是绿的。
+// 只有显式设了一个不同的 casRegion 才分得开这两个表达式。
+//
+// 分不开的代价在生产侧是实的：CASRegion 与 certId 一起拼成 OSS 的 certRef
+// （CertMaterial.CASCertRef，"<certId>-<casRegion>"）。region 猜错时 certRef 指向的是
+// 另一个区域里一个并不存在的证书，OSS 侧只会回一个参数类错误，而域名上仍是旧证书。
+func TestLoadBindingMaterial_CASRegionComesFromCASRegion(t *testing.T) {
+	ca := testutil.NewCA(t)
+	certPEM, keyPEM := testutil.IssueLeaf(t, ca, "api.example.com")
+
+	// 本用例用自己的 Secret 名（经 status.secretName 指定），不蹭上面几个用例共用的
+	// "c1-tls"：与 binding_observe_test.go 立的那条规矩同源——fixture 名字真的各取各的，
+	// 失败信息里一眼看得出是哪个用例，unparam 的「always receives」也不再成立。
+	ac := materialCertificate(nil)
+	ac.Status.SecretName = "c1-casregion-tls"
+
+	m, me := loadBindingMaterial(context.Background(),
+		materialReader(t, tlsSecret(ac.Status.SecretName, certPEM, keyPEM)), ac)
+	if me != nil {
+		t.Fatalf("不该失败: %+v", me)
+	}
+	if m.CASRegion != materialCASRegion {
+		t.Errorf("CASRegion 应取 spec.aliyun.casRegion: got %q, want %q", m.CASRegion, materialCASRegion)
+	}
 }
 
 // TestCertificateGate 锁住闸门的判据：只有证书 CR 的 status.current 与 Secret 里的
