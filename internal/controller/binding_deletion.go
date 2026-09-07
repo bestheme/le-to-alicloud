@@ -115,9 +115,10 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingDelete(ctx context.
 
 // unbindTarget 只解绑属于自己的那一张证书（spec §6.5）。
 //
-// 指纹比对放在通用层而不是 provider：Cleanup 的签名里没有 appliedFingerprint，而
-// 「幂等判断的真相来源是 Observe」（spec §7 职责边界表）。先 Observe 再决定要不要
-// Cleanup，也让「目标已经不存在」和「上面是别人的证书」两种情形都以成功收场。
+// 身份比对（指纹或 certRef，见 identityOf）放在通用层而不是 provider：Cleanup 的签名里
+// 没有 appliedFingerprint，而「幂等判断的真相来源是 Observe」（spec §7 职责边界表）。
+// 先 Observe 再决定要不要 Cleanup，也让「目标已经不存在」和「上面是别人的证书」两种
+// 情形都以成功收场。
 func (r *AliyunCertificateBindingReconciler) unbindTarget(ctx context.Context, rd *bindingRound) error {
 	b := rd.b
 
@@ -168,11 +169,13 @@ func (r *AliyunCertificateBindingReconciler) unbindTarget(ctx context.Context, r
 			"domain", tg.Identifier)
 		return nil
 	}
-	if obs.CurrentFingerprint != b.Status.AppliedFingerprint {
+	// want 在这里没有意义（删除分支没有材料），只比 current 与 applied。
+	id := identityOf(b, obs, provider.CertMaterial{})
+	if id.current != id.applied {
 		// 目标上不是我们写的那张：可能是别的 Binding 接管了，也可能是人工换过。
 		// 动它等于替别人做主。
 		logf.FromContext(ctx).Info("目标上的证书不是本 Binding 写入的，跳过解绑",
-			"domain", tg.Identifier, "observed", shortFP(obs.CurrentFingerprint))
+			"domain", tg.Identifier, "observed", identityLabel(id, id.current))
 		return nil
 	}
 	return p.Cleanup(ctx, tg, cl, provider.DeletionPolicyUnbind)

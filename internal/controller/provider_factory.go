@@ -64,6 +64,17 @@ func targetOf(b *certsv1alpha1.AliyunCertificateBinding) (provider.Target, error
 			Identifier: fc.DomainName,
 			Spec:       fc,
 		}, nil
+	case certsv1alpha1.TargetTypeOSSCustomDomain:
+		o := b.Spec.Target.OSSCustomDomain
+		if o == nil {
+			return provider.Target{}, fmt.Errorf("target.type=%s 但缺少 ossCustomDomain", b.Spec.Target.Type)
+		}
+		return provider.Target{
+			Type:       b.Spec.Target.Type,
+			Region:     o.Region,
+			Identifier: o.DomainName,
+			Spec:       o,
+		}, nil
 	default:
 		return provider.Target{}, fmt.Errorf("未知的 target.type %q，已注册: %v", b.Spec.Target.Type, provider.Names())
 	}
