@@ -139,6 +139,7 @@ var (
 const (
 	serviceCAS = "cas"
 	serviceFC3 = "fc"
+	serviceOSS = "oss"
 )
 
 func init() {

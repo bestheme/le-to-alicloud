@@ -47,6 +47,7 @@ import (
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/internal/controller"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -317,14 +318,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	fc3Cache := aliyun.NewClientCache[aliyun.FC3Client]()
+	// FC3 与 OSS 的 client 共用一个按 (凭证, region, target.type) 分槽的缓存。
+	providerCache := aliyun.NewClientCache[provider.Client]()
 	bindingReconciler := &controller.AliyunCertificateBindingReconciler{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
 		Recorder:  mgr.GetEventRecorderFor("aliyuncertificatebinding"),
 		// Secret 已 DisableFor，mgr.GetClient() 对它就是直读。
-		ProviderFactory:      controller.NewProviderFactory(mgr.GetClient(), fc3Cache, limiters, opts.CloudCallTimeout),
+		ProviderFactory:      controller.NewProviderFactory(mgr.GetClient(), providerCache, limiters, opts.CloudCallTimeout),
 		DriftCheckInterval:   opts.DriftCheckInterval,
 		CleanupGracePeriod:   opts.CleanupGracePeriod,
 		CleanupFailurePolicy: opts.CleanupFailurePolicy,

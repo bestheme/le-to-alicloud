@@ -17,10 +17,13 @@ type ClientKey struct {
 	Region          string
 	Endpoint        string
 	ResourceGroupID string
+	// Type 是 provider client 的种类（target.type）。同一份凭证、同一个 region 下 FC3 与 OSS
+	// 的 client 是两个不同的对象，缺了它两者会串用。CAS 的缓存留空。
+	Type string
 }
 
 func (k ClientKey) identity() string {
-	return k.Namespace + "/" + k.Name + "/" + k.Region + "/" + k.Endpoint + "/" + k.ResourceGroupID
+	return k.Namespace + "/" + k.Name + "/" + k.Region + "/" + k.Endpoint + "/" + k.ResourceGroupID + "/" + k.Type
 }
 
 type entry[T any] struct {
@@ -28,7 +31,7 @@ type entry[T any] struct {
 	client T
 }
 
-// ClientCache 每个 (namespace, name, region, endpoint, resourceGroupId) 只保留最新
+// ClientCache 每个 (namespace, name, region, endpoint, resourceGroupId, type) 只保留最新
 // resourceVersion 的 client。
 //
 // 泛型是因为 CAS 与 FC3 的 client 类型不同，而两者的缓存规则完全一样：与其让缓存存

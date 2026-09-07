@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	credential "github.com/aliyun/credentials-go/credentials"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,9 +31,10 @@ import (
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
 
-	// 让 fc3 的 init() 把自己注册进 registry。除注册外本包不直接引用它——
+	// 让 fc3 / oss 的 init() 把自己注册进 registry。除注册外本包不直接引用它们——
 	// 这正是 provider 抽象的意义：新增 provider = 加一个包 + 一条 CEL，不动状态机。
 	_ "git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/fc3"
+	_ "git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/oss"
 )
 
 // credentialsSecretNameFor 实现凭证继承：Binding 自己的 credentialsRef 优先，
@@ -85,7 +87,7 @@ func targetOf(b *certsv1alpha1.AliyunCertificateBinding) (provider.Target, error
 // 与 NewCASFactory 同构：读同 namespace 的凭证 Secret（Secret 已从 cache 禁用，
 // mgr.GetClient() 对它就是直读），按 resourceVersion 缓存 client——否则轮换后的 AK
 // 直到 Pod 重启才生效。
-func NewProviderFactory(reader client.Reader, cache *aliyun.ClientCache[aliyun.FC3Client],
+func NewProviderFactory(reader client.Reader, cache *aliyun.ClientCache[provider.Client],
 	limiters *aliyun.Limiters, timeout time.Duration) ProviderFactory {
 	return func(ctx context.Context, b *certsv1alpha1.AliyunCertificateBinding,
 		ac *certsv1alpha1.AliyunCertificate) (provider.Provider, provider.Client, error) {
@@ -117,32 +119,49 @@ func NewProviderFactory(reader client.Reader, cache *aliyun.ClientCache[aliyun.F
 			return nil, nil, &credentialsError{certsv1alpha1.ReasonCredentialsInvalid, cerr}
 		}
 
-		// key 必须囊括 build 闭包里读到的每一个会改变 client 行为的字段。
-		// Endpoint 恒为空：AliyunCertificate 的 endpointOverride 是给 CAS 用的，
-		// 把它套到 FC3 上会把请求打到数字证书服务的地址去。FC3 的 endpoint 一律由
-		// SDK 按 region 选出（fcv3.<region>.aliyuncs.com）。
+		// key 必须囊括 build 闭包里读到的每一个会改变 client 行为的字段：Region 与 Type。
+		// Endpoint 恒为空：AliyunCertificate 的 endpointOverride 是给 CAS 用的，FC3 / OSS 的
+		// endpoint 一律由各自 SDK 按 region 选出。
 		key := aliyun.ClientKey{
 			Namespace: s.Namespace, Name: s.Name, ResourceVersion: s.ResourceVersion,
-			Region: tg.Region,
+			Region: tg.Region, Type: tg.Type,
 		}
-		cl, berr := cache.GetOrBuild(key, func() (aliyun.FC3Client, error) {
+		cl, berr := cache.GetOrBuild(key, func() (provider.Client, error) {
 			cred, err := creds.Build()
 			if err != nil {
 				return nil, &credentialsError{certsv1alpha1.ReasonCredentialsInvalid, err}
 			}
-			// 一律读 key 而不是 tg：缓存命中与否只由 key 决定，闭包里再从别处取值
-			// 就等于把没进 key 的字段偷偷带进 client。
-			return aliyun.NewFC3Client(cred, aliyun.FC3ClientConfig{
-				Region:     key.Region,
-				Timeout:    timeout,
-				Limiters:   limiters,
-				LimiterKey: creds.LimiterKey(),
-				OnCall:     aliyunAPICallRecorder(serviceFC3),
-			})
+			// 一律读 key 而不是 tg：缓存命中与否只由 key 决定。
+			return buildProviderClient(key.Type, key.Region, cred, creds.LimiterKey(), limiters, timeout)
 		})
 		if berr != nil {
 			return nil, nil, berr
 		}
 		return p, cl, nil
+	}
+}
+
+// buildProviderClient 按 target 类型构造对应的云 client。
+//
+// 分派只在这一处：provider 注册表是异构的（spec §7），client 的构造却要各自的 SDK 配置，
+// 所以由通用层按类型 switch，而不是让 Provider 接口多一个 NewClient 方法把 SDK 依赖
+// 带进 pkg/provider。
+func buildProviderClient(
+	typeName, region string, cred credential.Credential, limiterKey string,
+	limiters *aliyun.Limiters, timeout time.Duration,
+) (provider.Client, error) {
+	switch typeName {
+	case certsv1alpha1.TargetTypeFC3CustomDomain:
+		return aliyun.NewFC3Client(cred, aliyun.FC3ClientConfig{
+			Region: region, Timeout: timeout, Limiters: limiters, LimiterKey: limiterKey,
+			OnCall: aliyunAPICallRecorder(serviceFC3),
+		})
+	case certsv1alpha1.TargetTypeOSSCustomDomain:
+		return aliyun.NewOSSClient(cred, aliyun.OSSClientConfig{
+			Region: region, Timeout: timeout, Limiters: limiters, LimiterKey: limiterKey,
+			OnCall: aliyunAPICallRecorder(serviceOSS),
+		})
+	default:
+		return nil, fmt.Errorf("没有 target.type %q 的 client 构造器", typeName)
 	}
 }

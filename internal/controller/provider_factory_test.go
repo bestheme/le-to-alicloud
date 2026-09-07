@@ -129,7 +129,7 @@ func akSecret(name string) *corev1.Secret {
 type factoryFixture struct {
 	f     ProviderFactory
 	c     client.Client
-	cache *aliyun.ClientCache[aliyun.FC3Client]
+	cache *aliyun.ClientCache[provider.Client]
 	b     *certsv1alpha1.AliyunCertificateBinding
 	ac    *certsv1alpha1.AliyunCertificate
 }
@@ -137,7 +137,7 @@ type factoryFixture struct {
 func newFactoryFixture(t *testing.T, objs ...client.Object) *factoryFixture {
 	t.Helper()
 	c := fake.NewClientBuilder().WithScheme(factoryScheme(t)).WithObjects(objs...).Build()
-	cache := aliyun.NewClientCache[aliyun.FC3Client]()
+	cache := aliyun.NewClientCache[provider.Client]()
 	b := bindingWithDomain("api.example.com")
 	b.Namespace = "ns1"
 	b.Name = "b1"
@@ -315,6 +315,40 @@ func TestNewProviderFactory_UnknownTargetType(t *testing.T) {
 	var ce *credentialsError
 	if errors.As(err, &ce) {
 		t.Errorf("不该被归成凭证错误: %v", err)
+	}
+}
+
+func TestNewProviderFactory_OSSTargetBuildsOSSClient(t *testing.T) {
+	fx := newFactoryFixture(t, akSecret("cas-cred"))
+	fx.b = ossBinding("assets", "cdn.example.com")
+	fx.b.Namespace, fx.b.Name = "ns1", "b1"
+
+	p, cl, err := fx.call(t)
+	if err != nil {
+		t.Fatalf("OSS 目标应能构造 client: %v", err)
+	}
+	if p.Name() != certsv1alpha1.TargetTypeOSSCustomDomain {
+		t.Errorf("应取到 OSS provider: %s", p.Name())
+	}
+	if _, ok := cl.(aliyun.OSSClient); !ok {
+		t.Fatalf("OSS 目标应拿到 aliyun.OSSClient，得到 %T", cl)
+	}
+	if fx.cache.Len() != 1 {
+		t.Errorf("应缓存一个 client: %d", fx.cache.Len())
+	}
+
+	// 同一份凭证、同一 region 下再要一个 FC3 client：必须是另一个对象、另一个缓存槽。
+	fx.b = bindingWithDomain("api.example.com")
+	fx.b.Namespace, fx.b.Name = "ns1", "b1"
+	_, fcl, err := fx.call(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fcl.(aliyun.FC3Client); !ok {
+		t.Fatalf("FC3 目标应拿到 aliyun.FC3Client，得到 %T", fcl)
+	}
+	if fx.cache.Len() != 2 {
+		t.Errorf("FC3 与 OSS 的 client 不许串用一个缓存槽: %d", fx.cache.Len())
 	}
 }
 
