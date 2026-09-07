@@ -1,27 +1,27 @@
 # 真实云集成测试结论（spec §12.3）
 
-- 生成时间：2026-09-05T20:39:13Z
+- 生成时间：2026-09-07T11:49:12Z
 - region：`cn-hangzhou`；备用 CAS region：`ap-southeast-1`
 - 本文件由 `make test-integration` 生成，不要手改。
 
 | # | 待核实 | 结论 | 证据 |
 |---|---|---|---|
-| #1 | CAS 对 PKCS#1 / PKCS#8 / SEC1 私钥的接受情况（PKCS#1 RSA） | 接受 | 上传成功，certId=27081473 |
-| #1 | CAS 对 PKCS#1 / PKCS#8 / SEC1 私钥的接受情况（SEC1 EC） | 接受 | 上传成功，certId=27081474 |
-| #1 | CAS 对 PKCS#1 / PKCS#8 / SEC1 私钥的接受情况（PKCS#8） | 接受 | 上传成功，certId=27081475 |
+| #1 | CAS 对 PKCS#1 / PKCS#8 / SEC1 私钥的接受情况（PKCS#1 RSA） | 接受 | 上传成功，certId=27114221 |
+| #1 | CAS 对 PKCS#1 / PKCS#8 / SEC1 私钥的接受情况（SEC1 EC） | 接受 | 上传成功，certId=27114222 |
+| #1 | CAS 对 PKCS#1 / PKCS#8 / SEC1 私钥的接受情况（PKCS#8） | 接受 | 上传成功，certId=27114224 |
 | #1 | CAS 对 PKCS#1 / PKCS#8 / SEC1 私钥的接受情况（带 Proc-Type: 4,ENCRYPTED 头的私钥块） | 拒绝 | code=PrivateKeyFormatException class=Permanent |
 | #1 | FC3 CertConfig 对 PKCS#1 / PKCS#8 / SEC1 EC 私钥的接受情况 | 未实测 | 未实测：未设置 FC3_TEST_DOMAIN。本项要真的改写一个 FC3 自定义域名的 certConfig，没有可供改写的专用测试域名就无从测起 |
 | #2 | UpdateCustomDomain 是全量替换还是部分合并 | 未实测 | 未实测：未设置 FC3_TEST_DOMAIN。本项要真的改写一个 FC3 自定义域名的 certConfig，没有可供改写的专用测试域名就无从测起 |
-| #3 | CAS ClientToken 语义：同 token 重复上传返回同 certId 还是报错 | 同 token 重复上传报错 | code=NameRepeat class=Permanent first=27081481 |
-| #4 | CAS 证书 Name 是否接受 - 与 .（连字符） | 接受 | 上传成功，certId=27081483 云上存的名字=itest_596bfcbf56a5-hyphen |
-| #4 | CAS 证书 Name 是否接受 - 与 .（点号） | 接受 | 上传成功，certId=27081484 云上存的名字=itest_72e1450a7650.dot |
-| #5 | CAS 是否接受 leaf+intermediate（无 root）以及链顺序是否敏感（leaf + 其签发 CA，两块） | 接受 | 上传成功，certId=27081476 |
+| #3 | CAS ClientToken 语义：同 token 重复上传返回同 certId 还是报错 | 同 token 重复上传报错 | code=NameRepeat class=Permanent first=27114231 |
+| #4 | CAS 证书 Name 是否接受 - 与 .（连字符） | 接受 | 上传成功，certId=27114233 云上存的名字=itest_f73456c77ed5-hyphen |
+| #4 | CAS 证书 Name 是否接受 - 与 .（点号） | 接受 | 上传成功，certId=27114234 云上存的名字=itest_46cdc4ec0183.dot |
+| #5 | CAS 是否接受 leaf+intermediate（无 root）以及链顺序是否敏感（leaf + 其签发 CA，两块） | 接受 | 上传成功，certId=27114225 |
 | #5 | CAS 是否接受 leaf+intermediate（无 root）以及链顺序是否敏感（intermediate 在前） | 拒绝 | code=NotMatch.CertificateAndPrivateKey class=Permanent |
-| #5 | CAS 是否接受 leaf+intermediate（无 root）以及链顺序是否敏感（仅 leaf） | 接受 | 上传成功，certId=27081477 |
+| #5 | CAS 是否接受 leaf+intermediate（无 root）以及链顺序是否敏感（仅 leaf） | 接受 | 上传成功，certId=27114226 |
 | #6 | 给 TLS Secret 追加 ownerRef 后 cert-manager 的 SSA 是否保留它 | 保留：重签后 ownerRef 仍在 | cert-manager v1.20.3，SelfSigned Issuer，改 dnsNames 触发重签并已观测到新 SAN 生效 |
 | #7 | Secret 被替换为另一张合法证书时 cert-manager 是否重签并 bump revision | 重签并 bump revision：watch Certificate 即可发现 | 替换前 revision=1（已确认 status.revision 已就绪后才取基线） |
-| #8 | CAS 单账号已上传证书数量与配额余量 | 空 Keyword 列举返回 0 张已上传证书（Status 留空，按 SDK 枚举语义**推导**应不含已过期证书；配了 ALIYUN_RESOURCE_GROUP_ID 时仅限该资源组——这两条是范围限定，非本探针的观测），其中 Keyword=it.integration.invalid 命中 0 张 | 哨兵证书上传后可见（条数 0 → 1），说明空 Keyword 至少不是「匹配不到任何东西」；但这只证明列举包含哨兵，不足以证明它是账号全集。itest_ 前缀的残留 0 张。配额上限本探针刻意不实测（撞上限会污染账号），这是有意划下的边界、不是待办；要看账号总量与上限，去控制台「数字证书管理服务 → 证书管理 → 上传证书」页 |
-| #9 | 同账号在不同 CAS endpoint 上传的证书是否互相可见 | 不可见：两个 endpoint 的证书集合互相隔离（双向验证） | 同一份 PEM，上传于 cn-hangzhou 得 certId=27081479、上传于 ap-southeast-1 另得 certId=584626（两个 ID 不在同一量级，是两套独立 ID 空间而非复制延迟）；前者在 ap-southeast-1 列举不可见，后者在本地可见、在 cn-hangzhou 同样不可见 |
+| #8 | CAS 单账号已上传证书数量与配额余量 | 空 Keyword 列举返回 1 张已上传证书（Status 留空，按 SDK 枚举语义**推导**应不含已过期证书；配了 ALIYUN_RESOURCE_GROUP_ID 时仅限该资源组——这两条是范围限定，非本探针的观测），其中 Keyword=it.integration.invalid 命中 0 张 | 哨兵证书上传后可见（条数 1 → 2），说明空 Keyword 至少不是「匹配不到任何东西」；但这只证明列举包含哨兵，不足以证明它是账号全集。itest_ 前缀的残留 0 张。配额上限本探针刻意不实测（撞上限会污染账号），这是有意划下的边界、不是待办；要看账号总量与上限，去控制台「数字证书管理服务 → 证书管理 → 上传证书」页 |
+| #9 | 同账号在不同 CAS endpoint 上传的证书是否互相可见 | 不可见：两个 endpoint 的证书集合互相隔离（双向验证） | 同一份 PEM，上传于 cn-hangzhou 得 certId=27114228、上传于 ap-southeast-1 另得 certId=585579（两个 ID 不在同一量级，是两套独立 ID 空间而非复制延迟）；前者在 ap-southeast-1 列举不可见，后者在本地可见、在 cn-hangzhou 同样不可见 |
 | #10 | FC3 API 账号级频控阈值与 Throttling 错误码 | 未实测 | 未实测（刻意）：触发账号级频控需要对真实云连续打满请求，会影响同账号的其它调用，违反探针「不污染账号」的纪律；且 pkg/aliyun 的 LimitFC3 客户端限流是 5 QPS / burst 1，探针先被自己限住，摸不到云侧阈值。阈值需查官方文档或提工单确认；错误码是否以 Throttling 开头，由只读探针偶遇限流时记录（本轮未偶遇）。**若 RESULTS.md 里另有一行 #10 记录了真实错误码，以那一行为准**——那是 TestFC3GetCustomDomainNotFound 偶遇限流时写下的真实观测，本行只说明「阈值」这一半没测 |
 | #11 | cert-manager 打在 Secret 上的注解是否稳定存在 | 四个注解全部存在，可作为 SecretNameConflict 的判定依据 | cert-manager.io/certificate-name=probe |
 | #12 | CAS Keyword 对通配符域名（*.example.com）的匹配行为（Keyword=*.it.integration.invalid） | 能匹配到 | 证书 SAN=*.it.integration.invalid，本次列举共返回 1 条 |
@@ -30,4 +30,10 @@
 | #12 | CAS Keyword 对通配符域名（*.example.com）的匹配行为（Keyword=integration） | 能匹配到 | 证书 SAN=*.it.integration.invalid，本次列举共返回 1 条 |
 | #12 | CAS Keyword 对通配符域名（*.example.com）的匹配行为（Keyword=ntegratio） | 能匹配到 | 证书 SAN=*.it.integration.invalid，本次列举共返回 1 条 |
 | #13 | CAS 同名不同 token 上传返回的错误码 | 错误码=NameRepeat | class=Permanent |
-| #14 | FC3 GetCustomDomain 对不存在域名的错误码与 HTTP 状态 | 错误码=DomainNameNotFound class=NotFound | code=DomainNameNotFound class=NotFound，sdk error code=DomainNameNotFound status=404；查询的域名=it-absent-b73a0c8f07e2.example.com；对照名（it-absent-c7a962243765.integration.invalid）返回同一个码，说明该码与域名格式无关 |
+| #14 | FC3 GetCustomDomain 对不存在域名的错误码与 HTTP 状态 | 错误码=DomainNameNotFound class=NotFound | code=DomainNameNotFound class=NotFound，sdk error code=DomainNameNotFound status=404；查询的域名=it-absent-7ceb2043487f.example.com；对照名（it-absent-41cc4665c054.integration.invalid）返回同一个码，说明该码与域名格式无关 |
+| #15 | OSS PutCname 带 CertId + Force=true 的首绑与换绑是否都成功（T-OSS1） | 未实测 | 未实测：未设置 OSS_TEST_BUCKET / OSS_TEST_DOMAIN。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24） |
+| #16 | OSS CertId 区域后缀取 CAS 区域还是 bucket 区域（T-OSS2） | 未实测 | 未实测：未设置 OSS_TEST_BUCKET / OSS_TEST_DOMAIN。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24） |
+| #17 | ListCname 回报的 CertId 是否与写入字符串逐字相同（T-OSS3） | 未实测 | 未实测：未设置 OSS_TEST_BUCKET / OSS_TEST_DOMAIN。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24） |
+| #18 | DeleteCertificate=true 后 CNAME 记录是否保留（T-OSS4） | 未实测 | 未实测：未设置 OSS_TEST_BUCKET / OSS_TEST_DOMAIN。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24） |
+| #19 | CAS 删除被 OSS 引用的证书是否被拒、错误码（T-OSS5） | 未实测 | 未实测：未设置 OSS_TEST_BUCKET / OSS_TEST_DOMAIN。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24） |
+| #20 | 缺 oss:PutCname 权限时的错误码与 HTTP 状态（T-OSS6） | 未实测 | 未实测：未设置 OSS_TEST_BUCKET / OSS_TEST_DOMAIN。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24） |
