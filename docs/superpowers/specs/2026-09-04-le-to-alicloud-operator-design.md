@@ -659,7 +659,7 @@ rules:
 
 ### 8.3 阿里云 RAM 最小权限
 
-三段 Statement：CAS、FC3、OSS；按部署裁剪见 README。
+四段 Statement：CAS、FC3、OSS，以及 OSS 绑证书时 CAS 侧要求的那三个动作（与 OSS 段同进同出）；按部署裁剪见 README。
 
 **含 CAS（uploadToCAS=true）**：
 
@@ -685,6 +685,15 @@ rules:
       "Effect": "Allow",
       "Action": ["oss:ListCname", "oss:PutCname"],
       "Resource": ["acs:oss:*:<accountId>:<bucket>"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "yundun-cert:DescribeSSLCertificatePrivateKey",
+        "yundun-cert:DescribeSSLCertificatePublicKeyDetail",
+        "yundun-cert:CreateSSLCertificate"
+      ],
+      "Resource": "*"
     }
   ]
 }
@@ -697,7 +706,8 @@ rules:
 - `yundun-cert:*` **无法资源级收窄**——operator 的 AK 能删账号下任意上传证书。这是不可回避的爆炸半径，必须写进 README，并建议独立 RAM 子账号 + 独立 AK。这也是 `uploadToCAS` 开关存在的理由。
 - `fc` 支持逐域名 ARN 授权，必须用上。ARN 里的 `<fc3Region>` 是**FC3 自定义域名所在的 region**（`spec.target.fc3CustomDomain.region`），**与 CAS 的 `spec.aliyun.region` / `casRegion` 无关**——两者取不同 region 是正常组合。
 - `oss` 支持 bucket 级 ARN（`acs:oss:*:<accountId>:<bucket>`），region 位写 `*`；OSS Binding 依赖 CAS certId，不能与 `uploadToCAS: false` 搭配。
-- **不授 `yundun-cert:GetUserCertificateDetail`**（返回私钥，本设计不需要）。
+- **OSS 绑证书还要三个 CAS 动作**：`yundun-cert:DescribeSSLCertificatePrivateKey` / `DescribeSSLCertificatePublicKeyDetail` / `CreateSSLCertificate`。`oss:PutCname` 带 `CertId` 时，OSS 以调用方身份去 CAS 取证书，缺则 `AccessDenied`（2026-09-07 实测：只授 OSS 段的策略下 `ListCname` 通、`PutCname` 拒）。operator 自己从不调这三个，但 `DescribeSSLCertificatePrivateKey` 意味着这个 AK 能读出证书私钥——爆炸半径比只用 FC3 时更大，只用 FC3 的部署不要授。
+- **不授 `yundun-cert:GetUserCertificateDetail`**（返回私钥，本设计不需要）。与上一条的三个动作是不同 action，上一条绕不开、这一条能不授就不授。
 
 ---
 

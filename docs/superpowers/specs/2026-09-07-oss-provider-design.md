@@ -22,7 +22,7 @@
 | O4 | `DeleteCertificate=true` 只摘证书，CNAME 记录保留 | Unbind 语义天然成立 |
 | O5 | `ListCname` 返回 `Bucket`、`Owner`（账号）与每个 `Cname{Domain, LastModified, Status, Certificate{Type(CAS/Upload), CertId, Status, CreationDate, Fingerprint, ValidStartDate, ValidEndDate}, IsWildCard}` | `Owner` 供账号 fencing；`CertId` 供幂等与漂移判断 |
 | O6 | `ListCname.Certificate.Fingerprint` 文档只说「证书签名」，示例为冒号分隔十六进制且打码，算法未标明 | **不用它做幂等判断**（见 §16 决策 D22） |
-| O7 | RAM action 为 `oss:PutCname`、`oss:ListCname`；bucket 级资源 ARN `acs:oss:*:<accountId>:<bucket>` | §6 策略 |
+| O7 | RAM action 为 `oss:PutCname`、`oss:ListCname`；bucket 级资源 ARN `acs:oss:*:<accountId>:<bucket>`。绑定证书时另需 `yundun-cert:DescribeSSLCertificatePrivateKey`、`yundun-cert:DescribeSSLCertificatePublicKeyDetail`、`yundun-cert:CreateSSLCertificate`（PutCname 文档明载；`yundun-cert` 无资源级授权，只能 `*`）——2026-09-07 实测补正：不授这三条时 `ListCname` 通而 `PutCname` 回 `AccessDenied` | §9 策略 |
 | O8 | SDK v2 凭证接口为单方法 `credentials.CredentialsProvider.GetCredentials(ctx) (Credentials{AccessKeyID, AccessKeySecret, SecurityToken, Expires}, error)`；client 用 `oss.NewClient(oss.LoadDefaultConfig().WithRegion(r).WithCredentialsProvider(p)...)` | 现有 `aliyun.Credentials.Build()` 的产物套一层适配器即可 |
 | O9 | SDK v2 错误为 `*oss.ServiceError{Code, Message, RequestID, EC, StatusCode, Snapshot, …}` | 只取 `Code` / `StatusCode` 进分类，丢弃其余（主 spec §6.4 私钥保护、§13） |
 | O10 | 主 spec §2.2 #9：CAS 不同 endpoint 的证书集合互相隔离 | certId 的区域后缀必须与上传时的 CAS 区域一致；后缀语义见 §8 待实测 T-OSS2 |
@@ -299,12 +299,23 @@ func (p ossCredentialsProvider) GetCredentials(ctx context.Context) (credentials
       "Effect": "Allow",
       "Action": ["oss:ListCname", "oss:PutCname"],
       "Resource": ["acs:oss:*:<accountId>:<bucket>"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "yundun-cert:DescribeSSLCertificatePrivateKey",
+        "yundun-cert:DescribeSSLCertificatePublicKeyDetail",
+        "yundun-cert:CreateSSLCertificate"
+      ],
+      "Resource": "*"
     }
   ]
 }
 ```
 
-- `full-policy.json` = CAS + FC3 + OSS 三段按序拼接；`hack/verify-ram-policy.py` 的合并校验改为三份。
+第二条 Statement 是 O7 的实测补正：`PutCname` 带 `CertId` 时由 OSS 以调用方身份去 CAS 取证书，这三个动作是那一步的权限要求，operator 自己从不调；它与 OSS 段同进同出，所以放在同一个文件里。
+
+- `full-policy.json` = CAS + FC3 + OSS 三段按序拼接（OSS 段本身含上面两条 Statement）；`hack/verify-ram-policy.py` 的合并校验改为三份。
 - README「RAM 权限」：完整策略 JSON 同步；「每个 Action 用在哪、缺了会怎样」加 `oss:ListCname`（Observe 与 Unbind 前读取；缺则 `Ready=False/CredentialsInvalid`，`Applied` 不动）与 `oss:PutCname`（Apply 与 Unbind；缺则 `Applied=False/CredentialsInvalid`，事件 `ApplyFailed`）两行；「按你的部署裁剪」加「不用 OSS 就删第三段」与「OSS Binding 必须保留 CAS 段」；「把占位符填成真实值」加 `<bucket>` 取 `spec.target.ossCustomDomain.bucket`，OSS ARN 的 region 位写 `*`。开头的「5 个 OpenAPI 动作」改为 7。
 - 主 spec 更新：§2 加 OSS 事实（引用本文 §1）、§4.2 加 OSS 样例与 status 新字段、§6.2 加步骤 3c、新增 §6.6「OSS provider 的 Apply」、§7 契约代码块同步、§8.3 加第三段、§12.3 加 T-OSS 行、§16 加 D21–D23。
 - README 用法一节加 OSS Binding 示例。
@@ -351,6 +362,7 @@ v0.2.0。CRD 新增字段与 status 字段皆可选，旧对象无需迁移；CR
 - 私钥不再经 OSS 链路；`PutCname` 请求体只有 certId。
 - `ServiceError.Snapshot`（响应体）与 `Message` 不进错误链、日志、事件、status（O9）。
 - `oss:PutCname` 能改 bucket 上任意 CNAME 的证书；ARN 收窄到 bucket 级是 OSS 允许的最细粒度，README 明示。
+- OSS 绑定要求的 `yundun-cert:DescribeSSLCertificatePrivateKey`（O7）让这个 AK 能读出账号下证书的私钥，只能授在 `*` 上，绕不开——私钥不经 operator 这条链路，但 RAM 层面的泄漏面确实比只用 FC3 时大，README 与主 spec §8.3 都明示，并要求独立 RAM 子账号 + 独立 AK。
 - 账号 fencing 由 `ListCname.Owner` 支撑，与 FC3 同一套闸门。
 
 ## 13. 已知限制
