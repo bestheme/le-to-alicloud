@@ -46,6 +46,7 @@ func TestClientCache_DistinguishesNonCredentialComponents(t *testing.T) {
 		"ResourceGroupID": func(k *aliyun.ClientKey) { k.ResourceGroupID = "rg-other" },
 		"Region":          func(k *aliyun.ClientKey) { k.Region = "cn-shanghai" },
 		"Endpoint":        func(k *aliyun.ClientKey) { k.Endpoint = "cas.vpc.example.com" },
+		"Type":            func(k *aliyun.ClientKey) { k.Type = "OSSCustomDomain" },
 	}
 	for name, mutate := range variants {
 		t.Run(name, func(t *testing.T) {

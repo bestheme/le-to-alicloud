@@ -21,10 +21,6 @@ import (
 
 	certsv1alpha1 "git.dev.bestheme.ac.cn/infra/le-to-alicloud/api/v1alpha1"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
-
-	// 注册表里要有两个 provider，capabilitiesOf 才有东西可查。provider_factory.go 已经
-	// 空导入了 fc3；oss 在 Task 8 之前还没接进生产代码，这里先由测试导入。
-	_ "git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/oss"
 )
 
 func ossBinding(bucket, domain string) *certsv1alpha1.AliyunCertificateBinding {
