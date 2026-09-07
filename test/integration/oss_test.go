@@ -37,6 +37,9 @@ var ossQuestions = map[string]string{
 // 单编号、且后面什么都不跟的场合仍然用 RecordSkip。
 func skipRest(t *testing.T, why string, ids ...string) {
 	t.Helper()
+	// 与 RecordSkip 同一口径：why 会经 t.Skip 进测试日志，而 Makefile 的 test-integration
+	// 带 -v，日志与 RESULTS.md 是同一档约束。recordSkipNoStop 自己也 scrub，重复一次无害。
+	why = scrub(why)
 	for _, id := range ids {
 		if !recorded(id) {
 			recordSkipNoStop(t, id, ossQuestions[id], why)
@@ -118,6 +121,13 @@ func noteAuth(t *testing.T, err error) {
 // 回读比对 → 尝试删被引用的证书 → 摘证书 → 还原。串成一条是因为它们共享同一个 CNAME 的
 // 状态，拆开跑会互相踩。
 func TestOSSBindByCertID(t *testing.T) {
+	// 先自己查一遍 CAS 凭证。requireCAS 内部走 RecordSkip，只记下 #15 就 t.Skip，而
+	// writeResults 是整文件覆盖——「没有云凭证、但集群侧探针照跑」的那一轮会把 #16–#20
+	// 从 RESULTS.md 里整段抹掉。理由与 skipRest 的注释相同。
+	if env(EnvAccessKeyID) == "" || env(EnvAccessKeySecret) == "" || env(EnvRegion) == "" {
+		skipRest(t, "未实测：缺少 "+EnvAccessKeyID+" / "+EnvAccessKeySecret+" / "+EnvRegion,
+			ossProbeIDs...)
+	}
 	cred, region := requireCAS(t, "#15", q15oss)
 	bucket, domain := requireOSSTarget(t)
 	cas := newCAS(t, cred, region)
@@ -177,10 +187,15 @@ func TestOSSBindByCertID(t *testing.T) {
 	}
 	Record(t, "#15", q15oss+"（首绑）", "成功", "certRef="+ref1)
 
-	// boundRef / boundID 跟踪「此刻 CNAME 真正引用的是哪一张证书」，两者永远成对更新。
-	// #19 要删的必须是**被引用**的那一张：换绑或 alt 回绑失败时那张不是 ref2，删 id2 只是
-	// 删掉一张没人引用的证书，据此写下「允许删除被引用的证书」是彻头彻尾的假结论。
-	boundRef, boundID := ref1, id1
+	// 这四个变量跟踪「此刻 CNAME 真正引用的是哪一张证书」，永远一起更新。
+	//
+	// ref / id：#19 要删的必须是**被引用**的那一张。换绑或 alt 回绑失败时那张不是 ref2，
+	// 删 id2 只是删掉一张没人引用的证书，据此写下「允许删除被引用的证书」是假结论。
+	//
+	// region / cas：certId 是**逐 CAS 区域**的独立 ID 空间（#9），删证书必须用它自己那个
+	// 区域的 client。alt 绑定被接受而回绑 ref2 又失败时，被引用的 id3 在 alt 区，拿主区
+	// 的 cas 去删它轻则得到一个假的「被拒 NotFound」，重则删掉主区一张同号的无关证书。
+	boundRef, boundID, boundRegion, boundCAS := ref1, id1, region, cas
 
 	// #17 回读逐字比对
 	got, err := oss.GetCname(ctx, bucket, domain)
@@ -198,7 +213,7 @@ func TestOSSBindByCertID(t *testing.T) {
 		Record(t, "#15", q15oss+"（换绑）", "拒绝", sdkSummary(err))
 	} else {
 		Record(t, "#15", q15oss+"（换绑）", "成功", "certRef "+ref1+" → "+ref2)
-		boundRef, boundID = ref2, id2
+		boundRef, boundID, boundRegion, boundCAS = ref2, id2, region, cas
 	}
 
 	// #16 区域后缀：两者同区域时只能证明「同区域可行」；有备用 CAS 区域时再试一次跨区。
@@ -218,13 +233,13 @@ func TestOSSBindByCertID(t *testing.T) {
 				Record(t, "#16", q16oss+"（alt）", "拒绝：跨区引用不可用，certRef 后缀须与 bucket 区域一致或证书须在同区 CAS", sdkSummary(perr))
 			} else {
 				Record(t, "#16", q16oss+"（alt）", "接受：后缀取 **CAS 区域**（证书在 "+alt+"，bucket 在 "+region+"）", "certRef="+ref3)
-				boundRef, boundID = ref3, id3
+				boundRef, boundID, boundRegion, boundCAS = ref3, id3, alt, altCAS
 				// 回到 ref2，让后面的 #19 / #18 建立在确定的状态上。回不去也不能只 t.Logf：
 				// 那会让 CNAME 停在一个非预期状态而 RESULTS 里一个字都没有。
 				if rerr := oss.PutCnameCert(ctx, bucket, domain, ref2); rerr != nil {
 					Record(t, "#16", q16oss+"（alt 回绑）", "回绑 ref2 失败，后续 #19/#18 基于 ref3", sdkSummary(rerr))
 				} else {
-					boundRef, boundID = ref2, id2
+					boundRef, boundID, boundRegion, boundCAS = ref2, id2, region, cas
 				}
 			}
 		}
@@ -232,12 +247,13 @@ func TestOSSBindByCertID(t *testing.T) {
 
 	// #19 删被引用的证书：删的是 boundRef 那一张，不是想当然的 ref2。这条编号问的正是
 	// 「删一张**正在被引用**的证书会怎样」，删错对象得到的「允许」什么都没证明。
-	if derr := deleteForTest(t, cas, boundID); derr != nil {
+	if derr := deleteForTest(t, boundCAS, boundID); derr != nil {
 		Record(t, "#19", q19oss, "被拒：错误码="+errCode(derr)+" class="+aliyun.ClassOf(derr).String(),
-			sdkSummary(derr)+"；删的是 CNAME 此刻引用的 certRef="+boundRef)
+			sdkSummary(derr)+"；删的是 CNAME 此刻引用的 certRef="+boundRef+"（证书位于 "+boundRegion+"）")
 	} else {
 		after, gerr := oss.GetCname(ctx, bucket, domain)
-		detail := "DeleteUserCertificate 成功；删的是 CNAME 此刻引用的 certRef=" + boundRef
+		detail := "DeleteUserCertificate 成功；删的是 CNAME 此刻引用的 certRef=" + boundRef +
+			"（证书位于 " + boundRegion + "）"
 		if gerr == nil {
 			detail += "；随后 ListCname 回报 CertId=" + after.CertRef + " Type=" + after.CertType
 		}
