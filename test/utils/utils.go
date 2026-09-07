@@ -107,14 +107,15 @@ func IsPrometheusCRDsInstalled() bool {
 	return false
 }
 
-// UninstallCertManager uninstalls the cert manager
-func UninstallCertManager() {
+// UninstallCertManager uninstalls the cert manager.
+// 返回 error 而不是只打一行 warning：这一步失败会在集群上留下拆了一半的 cert-manager，
+// 后续运行会以看不出原因的方式失败，所以收尾的失败必须能让调用方断言到。
+func UninstallCertManager() error {
 	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
 	//nolint:gosec // G204: url 由本包的常量模板与版本号拼出，不来自外部输入
 	cmd := exec.Command("kubectl", "delete", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		warnError(err)
-	}
+	_, err := Run(cmd)
+	return err
 }
 
 // InstallCertManager installs the cert manager bundle.
@@ -139,7 +140,9 @@ func InstallCertManager() error {
 
 // IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed
 // by verifying the existence of key CRDs related to Cert Manager.
-func IsCertManagerCRDsInstalled() bool {
+// kubectl 出错时返回 error 而不是 false：把「问不出来」当成「没装」会让调用方以为
+// cert-manager 是自己装的，从而在收尾时去卸载一份本来就在集群上的 cert-manager。
+func IsCertManagerCRDsInstalled() (bool, error) {
 	// List of common Cert Manager CRDs
 	certManagerCRDs := []string{
 		"certificates.cert-manager.io",
@@ -154,7 +157,7 @@ func IsCertManagerCRDsInstalled() bool {
 	cmd := exec.Command("kubectl", "get", "crds")
 	output, err := Run(cmd)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	// Check if any of the Cert Manager CRDs are present
@@ -162,12 +165,12 @@ func IsCertManagerCRDsInstalled() bool {
 	for _, crd := range certManagerCRDs {
 		for _, line := range crdList {
 			if strings.Contains(line, crd) {
-				return true
+				return true, nil
 			}
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // LoadImageToKindClusterWithName loads a local docker image to the kind cluster

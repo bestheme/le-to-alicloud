@@ -906,9 +906,9 @@ kubectl get events --field-selector "involvedObject.name=$NAME"
 | `make build` | `manifests generate fmt vet` 之后 `go build -o bin/manager cmd/main.go` |
 | `make test` | `setup-envtest` + 全量单测，写 `cover.out`（不含 `test/e2e`） |
 | `make test-race` | 同上，开竞态检测，不写覆盖率 |
-| `make lint` | golangci-lint v2.13.2；`.golangci.yml` 里配了 `integration` build tag，所以集成测试文件也在 lint 范围内 |
+| `make lint` | golangci-lint v2.13.2；`.golangci.yml` 里配了 `integration` 与 `e2e` build tag，所以集成测试与 e2e 文件也在 lint 范围内 |
 | `make test-integration` | 真实云集成测试（见下）；**缺凭证时全部 skip，不 fail** |
-| `make test-e2e` | Kind 集群上的 e2e，需要预装 kind |
+| `make test-e2e` | Kind 集群上的 e2e（`go test -tags=e2e`），需要预装 kind；见下「e2e 的集群闸门」 |
 | `make install` / `make uninstall` | 装 / 卸 CRD（`config/crd`） |
 | `make deploy` / `make undeploy` | 部署 / 卸载 operator（`config/default`） |
 | `make docker-buildx` | 多架构镜像，`PLATFORMS` 默认 `linux/amd64,linux/arm64` |
@@ -1013,6 +1013,14 @@ make kustomize && ./bin/kustomize build config/default | grep -c "^kind: CustomR
    ```
 
    如果这个集群**同时装了本 operator**，删除会卡一阵：探针在 namespace 里建的 `probe-owner` 这个 `AliyunCertificate` 带 finalizer，而它的 `credentialsRef` 指向一个并不存在的 Secret，operator 拿不到凭证就没法完成云侧清理，于是不断重试，namespace 会在 `Terminating` 停留一个宽限期（`--cleanup-grace-period`，默认 15 分钟）后才随 `Abandon` 策略放行。这是预期行为，等一等即可——**不要手工摘 finalizer**，那会跳过清理逻辑。策略配成 `Block` 的集群上它会一直卡住，需要人工介入。
+
+### e2e 的集群闸门
+
+`test/e2e/` 那套脚手架会在集群上**安装并卸载 cert-manager**（cluster-scoped：一个 `cert-manager` namespace + 6 个 CRD），所以它只能跑在一次性的 Kind 集群上。三道闸门：
+
+1. **build tag。** `test/e2e/` 下每个文件都带 `//go:build e2e`，因此 `go test ./...`、`go vet ./...` 都编译不到它，只有 `make test-e2e`（`go test -tags=e2e`）会跑。**不要**去掉这个 tag。
+2. **集群身份检查。** `BeforeSuite` 的第一件事是读 `kubectl config current-context`，context 名不是 `kind-` 开头就直接失败，此时还没有对集群做过任何写操作。要在别的集群上跑，得显式设 `E2E_ALLOW_NON_KIND=1`——设之前先确认那个集群上的 cert-manager 丢了不要紧。
+3. **只拆自己装的。** 卸载只在本套件真的执行过安装之后才发生（`certManagerInstalledByUs`）。脚手架原来的写法是反过来的「没检测到已装就拆」，而那个标志在 `BeforeSuite` 提前失败时是零值 `false`，Ginkgo 又照样会跑 `AfterSuite`——2026-09-05 与 2026-09-06 两次把生产 OpenShift 上的 cert-manager 删掉，就是这条路径。
 
 ## License
 
