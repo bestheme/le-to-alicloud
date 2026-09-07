@@ -7,6 +7,7 @@ package provider
 
 import (
 	"context"
+	"strconv"
 	"time"
 )
 
@@ -29,10 +30,25 @@ type CertMaterial struct {
 	Fingerprint string // SHA-256(leaf DER)，小写 hex
 	CertPEM     []byte // leaf + intermediates
 	KeyPEM      []byte // PKCS#1 / SEC1
-	CertID      *int64 // CAS certId；ReferencesCertByID=false 的 provider 忽略
+	CertID      *int64 // CAS certId；ReferencesCertByID=false 的 provider 忽略，=true 的 provider 经 CASCertRef() 使用
 	CASName     string // 云侧证书名；FC3 用作 certConfig.certName
 	NotAfter    time.Time
 	DNSNames    []string
+	// CASRegion 是证书上传所在的 CAS 区域（AliyunSpec.EffectiveCASRegion()）。只用来拼
+	// CASCertRef；内联 PEM 的 provider 忽略它。
+	CASRegion string
+}
+
+// CASCertRef 返回按 ID 引用证书的目标（OSS）使用的字符串 "<certId>-<casRegion>"。
+// CertID 为 nil 或 CASRegion 为空时返回 ""——那两种情况都还没有一个可引用的云侧证书。
+//
+// 这是该字符串**唯一**的拼装点：通用层的对账、provider 的写入、测试的断言全部从这里取值，
+// 免得三处各拼一套、某一处少个连字符就永远短路不了。
+func (m CertMaterial) CASCertRef() string {
+	if m.CertID == nil || m.CASRegion == "" {
+		return ""
+	}
+	return strconv.FormatInt(*m.CertID, 10) + "-" + m.CASRegion
 }
 
 // ObservedState 是 Observe 的结论，也是幂等判断唯一的真相来源。
@@ -41,7 +57,8 @@ type CertMaterial struct {
 // 观测结果——Observe 返回 nil error 就已经意味着目标在。留一个恒为 true 的布尔只会让
 // 下一个 provider 以为自己可以用它表达别的意思。
 type ObservedState struct {
-	CurrentFingerprint string // 目标上实际证书的指纹；"" = 目标上没有证书
+	CurrentFingerprint string // 内联 PEM 的目标：实际证书指纹；"" = 无证书。OSS 恒为 ""
+	CurrentCertRef     string // 按 ID 引用的目标：实际引用的 certRef；"" = 无证书。FC3 恒为 ""
 	Protocol           string
 	AccountID          string // 账号 fencing 用
 }
