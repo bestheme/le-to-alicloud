@@ -103,9 +103,32 @@ spec:
                     - domainName
                     - region
                     type: object
+                  ossCustomDomain:
+                    description: |-
+                      OSSCustomDomainTarget 指向一个 OSS bucket 上已绑定、已通过所有权验证的自定义域名。
+
+                      没有 ensureHTTPSProtocol：OSS CNAME 没有协议开关。
+                    properties:
+                      bucket:
+                        pattern: ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$
+                        type: string
+                      domainName:
+                        minLength: 1
+                        type: string
+                      region:
+                        description: bucket 所在 region，如 cn-hangzhou。决定 OSS endpoint，与
+                          CAS 区域无关。
+                        minLength: 1
+                        type: string
+                    required:
+                    - bucket
+                    - domainName
+                    - region
+                    type: object
                   type:
                     enum:
                     - FC3CustomDomain
+                    - OSSCustomDomain
                     type: string
                 required:
                 - type
@@ -116,6 +139,9 @@ spec:
                 - message: fc3CustomDomain 必须且只能在 type=FC3CustomDomain 时设置
                   rule: 'self.type == ''FC3CustomDomain'' ? has(self.fc3CustomDomain)
                     : !has(self.fc3CustomDomain)'
+                - message: ossCustomDomain 必须且只能在 type=OSSCustomDomain 时设置
+                  rule: 'self.type == ''OSSCustomDomain'' ? has(self.ossCustomDomain)
+                    : !has(self.ossCustomDomain)'
             required:
             - certificateRef
             - target
@@ -123,6 +149,12 @@ spec:
           status:
             description: AliyunCertificateBindingStatus 定义观测状态。
             properties:
+              appliedCertRef:
+                description: |-
+                  目标上实际引用的 CAS certId 字符串（形如 27087165-cn-hangzhou）。
+                  只有按 certId 引用证书的 provider（OSS）写；FC3 恒为空。appliedFingerprint 照旧写入，
+                  证书 controller 的保留护栏 3 只认它。
+                type: string
               appliedFingerprint:
                 description: 目标上实际生效的证书指纹。
                 type: string
@@ -192,6 +224,9 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              driftedCertRef:
+                description: 上一轮观测到的「漂移 certRef」，语义与 driftedFingerprint 逐条对应。
+                type: string
               driftedFingerprint:
                 description: |-
                   上一轮观测到的「漂移证书」指纹：既不是我们上次写的、也不是当前该写的那一张。
