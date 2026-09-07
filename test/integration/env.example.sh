@@ -22,6 +22,11 @@ export ALIYUN_RESOURCE_GROUP_ID=
 # 可选：FC3 自定义域名（§12.3 #2 / #10 会真的改它的 certConfig，别用生产域名）
 export FC3_TEST_DOMAIN=
 
+# 可选：OSS bucket 及其上一条已验证所有权的自定义域名（§12.3 #15–#20 会真的换绑它的证书，
+# 结束时还原原来的 certId；别用生产域名）。两者必须同时设置。
+export OSS_TEST_BUCKET=
+export OSS_TEST_DOMAIN=
+
 # 可选：跑集群侧用例（§12.3 #6 / #7 / #11）所需的 kubeconfig。留空则跳过。
 export INTEGRATION_KUBECONFIG=
 

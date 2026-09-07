@@ -33,6 +33,8 @@ const (
 	EnvCASRegionAlt    = "ALIYUN_CAS_REGION_ALT"
 	EnvResourceGroupID = "ALIYUN_RESOURCE_GROUP_ID"
 	EnvFC3TestDomain   = "FC3_TEST_DOMAIN"
+	EnvOSSTestBucket   = "OSS_TEST_BUCKET"
+	EnvOSSTestDomain   = "OSS_TEST_DOMAIN"
 	EnvKubeconfig      = "INTEGRATION_KUBECONFIG"
 	EnvKeepUploaded    = "INTEGRATION_KEEP_UPLOADED"
 )
