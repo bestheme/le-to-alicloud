@@ -45,6 +45,7 @@ import (
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/aliyun/fake"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider"
 	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/fc3"
+	"git.dev.bestheme.ac.cn/infra/le-to-alicloud/pkg/provider/oss"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -162,15 +163,19 @@ var _ = BeforeSuite(func() {
 	Expect(reconciler.SetupWithManager(k8sManager)).To(Succeed())
 
 	resetFC3()
+	resetOSS()
 	bindingReconciler = &AliyunCertificateBindingReconciler{
 		Client:    k8sManager.GetClient(),
 		APIReader: k8sManager.GetAPIReader(),
 		Scheme:    k8sManager.GetScheme(),
 		Recorder:  k8sManager.GetEventRecorderFor("aliyuncertificatebinding"),
-		ProviderFactory: func(context.Context, *certsv1alpha1.AliyunCertificateBinding,
-			*certsv1alpha1.AliyunCertificate) (provider.Provider, provider.Client, error) {
+		ProviderFactory: func(_ context.Context, b *certsv1alpha1.AliyunCertificateBinding,
+			_ *certsv1alpha1.AliyunCertificate) (provider.Provider, provider.Client, error) {
 			if err := currentFC3FactoryErr(); err != nil {
 				return nil, nil, err
+			}
+			if b.Spec.Target.Type == certsv1alpha1.TargetTypeOSSCustomDomain {
+				return &oss.Provider{}, currentOSS(), nil
 			}
 			return &fc3.Provider{}, currentFC3(), nil
 		},

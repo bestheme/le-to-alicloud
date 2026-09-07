@@ -69,3 +69,34 @@ func ensureHTTPSOf(b *certsv1alpha1.AliyunCertificateBinding) bool {
 	}
 	return false
 }
+
+// 步骤 3c 的两条固定文案。Message 不含变量（spec §10.2），变量只进日志。
+const (
+	casUploadRequiredMessage = "目标类型要求证书上传到 CAS，请把 AliyunCertificate 的 spec.aliyun.uploadToCAS 设为 true"
+	casCertIDPendingMessage  = "证书尚未取得 CAS certId"
+)
+
+// casUploadGate 是 spec 2026-09-07 §5.2 的步骤 3c：按 certId 引用证书的 provider
+// （RequiresCASUpload）在两种情形下不能写云。
+//
+//   - 证书关掉了上传：这是配置错误，Binding 不替证书开上传（D21），报 CASUploadRequired
+//     等人改证书 spec。
+//   - 这一代还没传完 CAS：m.CertID 只在 status.current 的指纹与 Secret 一致**且**上传成功
+//     后才非 nil（loadBindingMaterial），所以这里同时覆盖了「续期后新代次已进 Secret、
+//     CAS 还没传完」的窗口。沿用 CertificateNotReady，与 certificateGate 同一节奏重试。
+//
+// reason 为空表示放行。两条早退都不碰 appliedFingerprint（失败与旁路早退不写 applied）。
+func casUploadGate(
+	caps provider.Capabilities, ac *certsv1alpha1.AliyunCertificate, m provider.CertMaterial,
+) (reason, message string) {
+	if !caps.RequiresCASUpload {
+		return "", ""
+	}
+	if !ac.Spec.Aliyun.UploadEnabled() {
+		return certsv1alpha1.ReasonCASUploadRequired, casUploadRequiredMessage
+	}
+	if m.CertID == nil {
+		return certsv1alpha1.ReasonCertificateNotReady, casCertIDPendingMessage
+	}
+	return "", ""
+}

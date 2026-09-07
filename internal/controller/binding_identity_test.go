@@ -115,3 +115,42 @@ func TestTargetHelpers_OSS(t *testing.T) {
 		t.Error("内嵌块缺失时不得 panic")
 	}
 }
+
+// TestCASUploadGate 锁住步骤 3c 的判据：按 certId 引用证书的目标，在证书关掉 CAS 上传
+// 或这一代还没拿到 certId 时都不能写云。
+func TestCASUploadGate(t *testing.T) {
+	on, off := true, false
+	id := int64(7)
+	withID := provider.CertMaterial{Fingerprint: "ffff", CertID: &id, CASRegion: "cn-hangzhou"}
+	noID := provider.CertMaterial{Fingerprint: "ffff", CASRegion: "cn-hangzhou"}
+	acWith := func(u *bool) *certsv1alpha1.AliyunCertificate {
+		return &certsv1alpha1.AliyunCertificate{Spec: certsv1alpha1.AliyunCertificateSpec{
+			Aliyun: certsv1alpha1.AliyunSpec{Region: "cn-hangzhou", UploadToCAS: u},
+		}}
+	}
+	byRef := provider.Capabilities{ReferencesCertByID: true, RequiresCASUpload: true}
+
+	cases := []struct {
+		name   string
+		caps   provider.Capabilities
+		ac     *certsv1alpha1.AliyunCertificate
+		m      provider.CertMaterial
+		reason string
+	}{
+		{"FC3 不要求上传，certId 为 nil 也放行", provider.Capabilities{}, acWith(&off), noID, ""},
+		{"OSS + uploadToCAS=false → CASUploadRequired", byRef, acWith(&off), withID, certsv1alpha1.ReasonCASUploadRequired},
+		{"OSS + 默认上传 + certId 未就位 → CertificateNotReady", byRef, acWith(nil), noID, certsv1alpha1.ReasonCertificateNotReady},
+		{"OSS + 显式上传 + certId 就位 → 放行", byRef, acWith(&on), withID, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, msg := casUploadGate(tc.caps, tc.ac, tc.m)
+			if reason != tc.reason {
+				t.Errorf("reason = %q, want %q", reason, tc.reason)
+			}
+			if (reason == "") != (msg == "") {
+				t.Errorf("reason 与 message 必须同空同非空: %q / %q", reason, msg)
+			}
+		})
+	}
+}
