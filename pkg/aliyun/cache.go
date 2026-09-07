@@ -34,8 +34,9 @@ type entry[T any] struct {
 // ClientCache 每个 (namespace, name, region, endpoint, resourceGroupId, type) 只保留最新
 // resourceVersion 的 client。
 //
-// 泛型是因为 CAS 与 FC3 的 client 类型不同，而两者的缓存规则完全一样：与其让缓存存
-// any 再到处断言，不如让每个服务各持一份类型确定的缓存。
+// 泛型是因为两处实例化的 client 类型不同——一处缓存 CAS client，一处缓存 provider.Client
+// （FC3 与 OSS 按 ClientKey.Type 分槽共用同一份缓存）——而缓存规则完全一样：与其让缓存存
+// any 再到处断言，不如让每种 client 各持一份类型确定的缓存。
 type ClientCache[T any] struct {
 	mu sync.Mutex
 	m  map[string]entry[T]

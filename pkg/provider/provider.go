@@ -67,7 +67,7 @@ type ObservedState struct {
 type Capabilities struct {
 	ReferencesCertByID     bool // true = 目标存 certId（CDN/CLB）；false = 内联 PEM（FC3）
 	SupportsProtocolSwitch bool
-	RequiresCASUpload      bool // true ⇒ 强制 uploadToCAS，用户不可关
+	RequiresCASUpload      bool // true ⇒ 证书必须已上传 CAS，否则 Binding 报 CASUploadRequired，不替证书开上传（D21）
 }
 
 // ApplyOptions 是本次写入的调节项。

@@ -1,3 +1,10 @@
+// Package oss 是第二个 provider：把证书装到 OSS bucket 的自定义域名（CNAME）上。
+//
+// 证书归属于 bucket 下的某个 domain（spec 2026-09-07 §5.2），bucket + domain 一起才是
+// 主键；同一个 bucket 上的其它域名与本次绑定无关，Apply 只动这一条 CNAME 记录。
+//
+// RAM：oss 支持资源级授权，必须用上——逐 bucket 的 acs:oss:*:{accountId}:{bucket}，
+// 动作只要 ListCname / PutCname。样例见 docs/ram/binding-oss-policy.json。
 package oss
 
 import (
