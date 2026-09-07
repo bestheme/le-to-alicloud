@@ -80,6 +80,10 @@
 | envtest 没有 GC controller，ownerRef 级联删除不会发生。 | 影响测试设计 |
 | controller-runtime 默认 workqueue 限速是每对象指数退避 + 全局约 10 QPS 令牌桶，**不约束出站 HTTP**。 | 出站限流需自建 |
 
+### 2.6 阿里云 OSS（自定义域名证书）
+
+已核实事实与来源见 `docs/superpowers/specs/2026-09-07-oss-provider-design.md` §1（O1–O10）。要点：`PutCname` 的 `CertificateConfiguration` 支持按 CAS `CertId`（形如 `493****-cn-hangzhou`）引用，不带 `PreviousCertId` 时必须 `Force=true`，`DeleteCertificate=true` 只摘证书不删 CNAME；`ListCname` 返回 `Owner` 与每条 CNAME 的 `Certificate.CertId`；RAM action `oss:ListCname` / `oss:PutCname`，资源 `acs:oss:*:<accountId>:<bucket>`。
+
 ### 2.5 未核实项（必测）
 
 见 §12.3。**截至 2026-09-05 的进度**：CAS 侧的 #1 / #3 / #4 / #5 / #9 / #12 / #13 已核实（依据 `test/integration/RESULTS.md`），
@@ -227,7 +231,8 @@ metadata:
 spec:
   certificateRef: { name: timehorse-api }     # 同 namespace
   target:                                     # 不可变
-    type: FC3CustomDomain                     # discriminated union 判别字段
+    # 或 type: OSSCustomDomain + ossCustomDomain: {region, bucket, domainName}（2026-09-07 起）
+    type: FC3CustomDomain                     # discriminated union 判别字段（`FC3CustomDomain` | `OSSCustomDomain`）
     fc3CustomDomain:
       region: cn-hangzhou
       domainName: api.timehorse.bestheme.ac.cn
@@ -246,6 +251,8 @@ status:
                                               # 之前每一轮都还在，没有这条痕迹事件就会
                                               # 随重试节奏一轮一轮重发（§10.2「只在状态
                                               # 跃迁时发」）
+  appliedCertRef: "27087165-cn-hangzhou"      # OSS 目标：实际引用的 CAS certId；FC3 为空
+  driftedCertRef: ""
   lastAppliedTime: "…"
   lastObservedTime: "…"                       # 最近一次 Observe 的时间（drift 检测）
   boundAccountId: "1234567890"                # 首次成功 Apply 时固化，用于账号 fencing
@@ -258,7 +265,7 @@ status:
 **CRD 校验**：
 
 - `target` 整体不可变：`self == oldSelf`（transition rule）
-- union 一致性：`self.type == 'FC3CustomDomain' ? has(self.fc3CustomDomain) : true`，并禁止出现与 `type` 不匹配的内嵌块
+- union 一致性：每个内嵌块各一条 `self.type == '<T>' ? has(self.<block>) : !has(self.<block>)`
 - `deletionPolicy` enum `Orphan | Unbind`
 - printcolumns：`READY`、`APPLIED`、`CONFLICT`、`TARGET`、`AGE`
 
@@ -476,18 +483,22 @@ CAS 放在 Certificate 之前只是就近安排，无正确性差异；唯一硬
     - cache 短暂不一致时，这个确定性规则保证最终收敛到唯一胜者
  3. **域名覆盖校验**：leaf SANs（RFC 6125 通配符规则）覆盖 target.domainName？
     否 → Ready=False/DomainNotCovered，不 Apply，不快速重试（硬失败）
+ 3c. **CAS 上传门**（按 certId 引用证书的 provider，见 2026-09-07 spec §5.2）：
+    - 证书 uploadToCAS=false → Applied=False/CASUploadRequired，不写云，return
+    - status.current.certId 尚未就位 → Applied=False/CertificateNotReady，30s requeue
  4. 解析凭证（Binding.credentialsRef > 证书.aliyun.credentialsRef），构造 provider client
  5. Provider.Observe(target)：
     - TargetNotFound → Ready=False，固定长 requeue 5m（域名可能由 Terraform 稍后创建）
     - **账号 fencing**：status.boundAccountId 非空且 ≠ observed.AccountID
       → Conflict=True/AccountMismatch，不写，return
+    （比对走身份三元组：内联 PEM 的目标比指纹，按 certId 引用的目标比 `<certId>-<casRegion>`）
     - observed.CurrentFingerprint == 证书 current 指纹 且 protocol 满足要求
       → 更新 lastObservedTime，Applied=True，return（短路只跳过写，不跳过 Observe）
     - observed.CurrentFingerprint == appliedFingerprint ≠ current → 正常轮换
     - observed.CurrentFingerprint ∉ {appliedFingerprint, current} → drift，
       记 counter + Warning event DriftCorrected，继续 Apply
  6. Provider.Apply(target, material)
- 7. 成功 → appliedFingerprint = current，boundAccountId 首次固化，lastAppliedTime，Applied=True
+ 7. 成功 → appliedFingerprint = current；按 certId 引用的目标另写 appliedCertRef，boundAccountId 首次固化，lastAppliedTime，Applied=True
     失败 → Applied=False/ApplyFailed，按错误分类退避
  8. Ready = Applied && !Conflict
 ```
@@ -510,6 +521,10 @@ read-modify-write 在「全量替换」和「部分合并」两种语义下都�
 
 - `GetCustomDomain` 响应含明文私钥。SDK 之上的 `FC3Client` 层负责 redact：日志、error wrapping、event、status 中**绝不出现 PEM 片段**，只出现 `domainName` + 指纹前 8 位。
 - 最高日志级别也不打印 request / response body。
+
+### 6.6 OSS provider 的 Apply
+
+`PutCname{CertId: "<certId>-<casRegion>", Force: true}`，不做 read-modify-write（`CertificateConfiguration` 只碰证书配置）。`Unbind` 走 `PutCname{DeleteCertificate: true}`，CNAME 记录保留。私钥不经 OSS 链路。完整设计见 `docs/superpowers/specs/2026-09-07-oss-provider-design.md` §6–§7。
 
 ### 6.5 清理分支（finalizer）
 
@@ -540,12 +555,16 @@ type CertMaterial struct {
     CASName     string
     NotAfter    time.Time
     DNSNames    []string
+    CASRegion   string   // 证书上传所在的 CAS 区域；CASCertRef() 用
 }
+
+func (m CertMaterial) CASCertRef() string // "<certId>-<casRegion>"，CertID 为 nil 时 ""
 
 // 刻意没有 Exists 字段：「目标不存在」是一个错误（CodeTargetNotFound），不是一种观测
 // 结果——Observe 返回 nil error 就已经意味着目标在。
 type ObservedState struct {
     CurrentFingerprint string // 目标实际证书的指纹；"" = 无证书
+    CurrentCertRef     string // 按 ID 引用的目标：实际引用的 certRef；"" = 无证书
     Protocol           string
     AccountID          string // fencing
 }
@@ -553,7 +572,7 @@ type ObservedState struct {
 type Capabilities struct {
     ReferencesCertByID     bool // true = 目标存 certId（CDN/CLB）；false = 内联 PEM（FC3）
     SupportsProtocolSwitch bool
-    RequiresCASUpload      bool // true ⇒ 强制 uploadToCAS，用户不可关
+    RequiresCASUpload      bool // true ⇒ 证书必须已上传 CAS，否则 Binding 报 CASUploadRequired（D21）
 }
 
 // Client 是通用层构造好、交给 provider 使用的云客户端；具体类型由 provider 自行断言
@@ -589,7 +608,7 @@ type ProviderError struct {
 | 幂等判断的真相来源 | `Observe`（provider） |
 | 幂等快路径短路 | 通用层 status 比对，但被 `drift-check-interval` 周期性打破 |
 | SANs 覆盖校验 | 通用层 |
-| CAS 上传 | 通用层；`RequiresCASUpload` ⇒ 强制 |
+| CAS 上传 | 通用层；`RequiresCASUpload` ⇒ 未上传时 Binding 停在 `CASUploadRequired`（D21） |
 | 重试 / 退避 / status / event | 通用层；provider 只返回分类过的 error |
 | 凭证与 client 构造 | 通用层；provider 收到已构造的 client |
 
@@ -597,7 +616,7 @@ type ProviderError struct {
 
 **注册**：`init()` 中 `provider.Register(&fc3.Provider{})`，通用层 `map[string]Provider`。新增 provider = 一个包 + 一个 CRD 内嵌字段 + 一条 CEL 规则，不动状态机。新增 provider 需 CRD 与 operator 同版本发布（sync-wave 已覆盖）。
 
-**`uploadToCAS` 与 provider 的关系**：`RequiresCASUpload=true` 的 provider 出现时，即便 spec 写了 `uploadToCAS: false` 也强制上传，并在 condition 中说明。
+**`uploadToCAS` 与 provider 的关系**：`RequiresCASUpload=true` 的 provider 遇到 `uploadToCAS: false` 的证书时，Binding 报 `Applied=False/CASUploadRequired` 等用户改证书 spec，**不替证书开上传**（D21，2026-09-07；原文「强制上传」作废：Binding 不拥有证书 CR，反向依赖会把两个 controller 缠在一起）。
 
 ---
 
@@ -640,7 +659,7 @@ rules:
 
 ### 8.3 阿里云 RAM 最小权限
 
-两份策略，对应 `uploadToCAS` 两态。
+三段 Statement：CAS、FC3、OSS；按部署裁剪见 README。
 
 **含 CAS（uploadToCAS=true）**：
 
@@ -661,6 +680,11 @@ rules:
       "Effect": "Allow",
       "Action": ["fc:GetCustomDomain", "fc:UpdateCustomDomain"],
       "Resource": ["acs:fc:<fc3Region>:<accountId>:custom-domains/<domainName>"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["oss:ListCname", "oss:PutCname"],
+      "Resource": ["acs:oss:*:<accountId>:<bucket>"]
     }
   ]
 }
@@ -672,6 +696,7 @@ rules:
 
 - `yundun-cert:*` **无法资源级收窄**——operator 的 AK 能删账号下任意上传证书。这是不可回避的爆炸半径，必须写进 README，并建议独立 RAM 子账号 + 独立 AK。这也是 `uploadToCAS` 开关存在的理由。
 - `fc` 支持逐域名 ARN 授权，必须用上。ARN 里的 `<fc3Region>` 是**FC3 自定义域名所在的 region**（`spec.target.fc3CustomDomain.region`），**与 CAS 的 `spec.aliyun.region` / `casRegion` 无关**——两者取不同 region 是正常组合。
+- `oss` 支持 bucket 级 ARN（`acs:oss:*:<accountId>:<bucket>`），region 位写 `*`；OSS Binding 依赖 CAS certId，不能与 `uploadToCAS: false` 搭配。
 - **不授 `yundun-cert:GetUserCertificateDetail`**（返回私钥，本设计不需要）。
 
 ---
@@ -864,6 +889,14 @@ type FC3Client interface {
 | 12 | ~~CAS `Keyword` 对通配符域名（`*.example.com`）的匹配行为~~ **已核实**：`Keyword` 对证书域名字符串做**任意子串匹配**，且**不做 DNS 通配符展开**。SAN 为 `*.it.integration.invalid` 的证书，用 `*.it.integration.invalid`、`it.integration.invalid`、`integration`、甚至非标签边界的 `ntegratio` 都能查到，而通配符本应覆盖的 `probe.it.integration.invalid` **查不到**。这同时排除了 DNS 通配符语义、后缀匹配、前缀匹配、按标签对齐的包含四种候选规则 | 通配符证书的首个 SAN 会被原样当 Keyword 传给 `ListUserCertificateOrder`；匹配不到就会让存在性探测持续误判「证书丢了」并反复重传。结论是安全的：原样传 SAN 一定能命中自己 |
 | 13 | ~~CAS 同名不同 `ClientToken` 上传返回的真实错误码~~ **已核实**：`NameRepeat`（Permanent）。**不在**生产代码原先猜的三个候选码里，已追加进 `internal/controller/upload.go` 的 `isDuplicateName` | 认错则 `DuplicateName → findByName` 的认领路径失效，write-ahead 崩溃恢复会退化成反复失败的上传 |
 | 14 | ~~FC3 `GetCustomDomain` 对**不存在的域名**返回的错误码与 HTTP 状态~~ **已核实**：错误码 `DomainNameNotFound`、HTTP **404**（实测于 2026-09-05（UTC，`RESULTS.md` 生成时间见文件头），见 `RESULTS.md` #14）。`aliyun.ClassOf` 据此把它归为 `ClassNotFound`，因此 `pkg/aliyun/errors.go` 的 `classifyCode` **无需修改**，绑定 controller 的「域名不存在 → 5m 定时重试」分支按预期工作。对照名 `it-absent-c7a962243765.integration.invalid`（`.invalid` 是保留顶级域，不可能是真实域名）返回**同一个码**，说明该码不依赖域名是否形如可注册域名 | 绑定 controller 的 Observe 靠 `ClassNotFound` 区分「目标不存在」与「调用失败」；分错会把不存在的域名当成可重试故障无限重试。已核实认得出：`classifyCode` 现有的 `Contains(code, "NotFound")` 与 `status == 404` 两条规则都命中，不必为 FC3 追加任何条件性分支 |
+| 15 | OSS `PutCname` 带 `CertId` + `Force=true` 的首绑与换绑是否都成功（T-OSS1） | 换绑被拒 ⇒ 续期永远 ApplyFailed |
+| 16 | OSS `CertId` 区域后缀取 CAS 区域还是 bucket 区域（T-OSS2；两者同为 cn-hangzhou 时只能证明「同区域可行」） | 跨区组合下 Apply 被拒 |
+| 17 | `ListCname` 回报的 `CertId` 是否与写入字符串逐字相同（T-OSS3） | 短路永不命中 ⇒ 每小时一次无谓 PutCname 并误报漂移 |
+| 18 | `DeleteCertificate=true` 后 CNAME 记录是否保留（T-OSS4） | Unbind 打断线上访问 |
+| 19 | CAS 删除被 OSS 引用的证书是否被拒、错误码（T-OSS5） | 回收路径持续 ReclaimFailed |
+| 20 | 缺 `oss:PutCname` 权限时的错误码与 HTTP 状态（T-OSS6；只能由其它 OSS 探针偶遇 Auth 类错误时顺带记录） | 分类落入 Permanent 而非 Auth，退避节奏错 |
+
+#15–#20 的探针在 `test/integration/oss_test.go`，以 `OSS_TEST_BUCKET` / `OSS_TEST_DOMAIN` 门控；所有者决定（2026-09-07 D24）不另建牺牲 bucket，首次实测由 `www.bestheme.ac.cn` 的受控首绑完成。
 
 **上表唯一没有 `RESULTS.md` 行的是 #5 的 FC3 一半**：FC3 的链形状用例与私钥编码用例同在 `TestFC3CertConfigEncodings` 里，而缺 `FC3_TEST_DOMAIN` 时的 `requireFC3Domain` 把跳过记在了 **`#1`** 名下（`test/integration/fc3_test.go`），于是 `RESULTS.md` 里一行 `#5` 的 FC3 记录都没有。其余各行——包括 #2 / #10 与 #1 的 FC3 一半——的「仍未核实」与其原因都能在 `RESULTS.md` 里逐行找到；#14 已在 2026-09-05 那轮落了结论，同样逐行可查。
 
@@ -926,3 +959,7 @@ type FC3Client interface {
 | D18 | 不做 OLM bundle | 做 | 与 Argo CD 所有权冲突 |
 | D19 | 出站限流按 (AK, service) | 依赖 workqueue 限速 | workqueue 限速不约束 HTTP；CAS list QPS 10 |
 | D20 | 云调用超时独立 flag 30s | 绑 RenewDeadline 8s | replicas 1 后 split-brain 动机消失；8s 制造假失败 |
+| D21 | OSS 按 CAS certId 引用；`RequiresCASUpload` 未满足时 Binding 报 `CASUploadRequired` 而不替证书开上传 | 内联 PEM；Binding 强制证书上传 | 私钥少经一条链路；落实预留能力位；Binding 不拥有证书 CR，反向依赖会把两个 controller 缠在一起 |
+| D22 | 幂等与漂移按 certRef 字符串比对，通用层加身份三元组 | provider 调 CAS `GetUserCertificateDetail` 翻译成指纹；用 `ListCname.Fingerprint` | 前者每轮多一次 CAS 调用且需双 client；后者算法未标明，猜错即静默漂移循环 |
+| D23 | target 显式 `{region, bucket, domainName}` | 只给 domainName、operator 扫 bucket 找 | RAM 面收窄到 bucket 级；少一次全账号列举 |
+| D24 | 不另建牺牲 bucket，实测由 `www.bestheme.ac.cn` 受控首绑完成 | 建测试 bucket + 验证域名 | 所有者决定；代价是首绑即实测，需在低流量时段执行并准备回滚（控制台重新绑回旧证书） |

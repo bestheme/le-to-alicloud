@@ -19,6 +19,16 @@
       "Resource": [
         "acs:fc:<fc3Region>:<accountId>:custom-domains/<domainName>"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "oss:ListCname",
+        "oss:PutCname"
+      ],
+      "Resource": [
+        "acs:oss:*:<accountId>:<bucket>"
+      ]
     }
   ]
 }

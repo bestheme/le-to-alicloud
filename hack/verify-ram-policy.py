@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""校验 RAM 策略的五处副本没有漂移。
+"""校验 RAM 策略的六处副本没有漂移。
 
 README 的「RAM 权限」一节直接内联了完整策略 JSON（所有者要求：读者不该为了拼出
 operator 需要哪些权限而跳两个文件），spec §8.3 也留着同一份策略。代价是同一份内容有了
@@ -10,8 +10,8 @@ operator 需要哪些权限而跳两个文件），spec §8.3 也留着同一份
 
 1. README「RAM 权限」一节里那个完整策略 JSON 块 == docs/ram/full-policy.json
 2. spec §8.3 里那个完整策略 JSON 块 == docs/ram/full-policy.json
-3. certificate-cas-policy.json 与 binding-fc3-policy.json 的 Statement 按顺序拼起来
-   == full-policy.json 的 Statement 列表
+3. certificate-cas-policy.json、binding-fc3-policy.json、binding-oss-policy.json 的
+   Statement 按顺序拼起来 == full-policy.json 的 Statement 列表
 
 只用标准库：这是个门禁脚本，为它引入依赖等于给 CI 加一个可以自己坏掉的东西。
 """
@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 FULL = ROOT / "docs" / "ram" / "full-policy.json"
 CAS = ROOT / "docs" / "ram" / "certificate-cas-policy.json"
 FC3 = ROOT / "docs" / "ram" / "binding-fc3-policy.json"
+OSS = ROOT / "docs" / "ram" / "binding-oss-policy.json"
 
 README = ROOT / "README.md"
 README_SECTION = "## RAM 权限"
@@ -98,14 +99,14 @@ def main():
                  % (path.relative_to(ROOT), diff(
                      "docs/ram/full-policy.json", full, str(path.relative_to(ROOT)), inline)))
 
-    merged = load(CAS)["Statement"] + load(FC3)["Statement"]
+    merged = load(CAS)["Statement"] + load(FC3)["Statement"] + load(OSS)["Statement"]
     if merged != full["Statement"]:
-        fail("certificate-cas-policy.json + binding-fc3-policy.json 的 Statement "
-             "合并后与 full-policy.json 不一致：\n"
+        fail("certificate-cas-policy.json + binding-fc3-policy.json + binding-oss-policy.json "
+             "的 Statement 合并后与 full-policy.json 不一致：\n"
              + diff("docs/ram/full-policy.json", full["Statement"],
-                    "cas + fc3 合并", merged))
+                    "cas + fc3 + oss 合并", merged))
 
-    print("verify-ram-policy: OK（README、spec §8.3 与 docs/ram/ 下三份策略一致）")
+    print("verify-ram-policy: OK（README、spec §8.3 与 docs/ram/ 下四份策略一致）")
 
 
 if __name__ == "__main__":
