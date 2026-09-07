@@ -628,7 +628,7 @@ kubectl -n openshift-user-workload-monitoring get pods
 
 ## RAM 权限
 
-operator 对阿里云只发 **7 个 OpenAPI 动作**，下面这一份策略就是它需要的全部权限，没有一条是多余的。资源级收窄能做的地方都做了：`fc` 逐域名 ARN，`oss` 逐 bucket ARN，`yundun-cert` 只能 `*`（原因见下面「为什么是这样授权」）。
+operator 对阿里云只发 **10 个 OpenAPI 动作**，下面这一份策略就是它需要的全部权限，没有一条是多余的。资源级收窄能做的地方都做了：`fc` 逐域名 ARN，`oss` 逐 bucket ARN，`yundun-cert` 只能 `*`（原因见下面「为什么是这样授权」）。
 
 ```json
 {
@@ -662,6 +662,15 @@ operator 对阿里云只发 **7 个 OpenAPI 动作**，下面这一份策略就�
       "Resource": [
         "acs:oss:*:<accountId>:<bucket>"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "yundun-cert:DescribeSSLCertificatePrivateKey",
+        "yundun-cert:DescribeSSLCertificatePublicKeyDetail",
+        "yundun-cert:CreateSSLCertificate"
+      ],
+      "Resource": "*"
     }
   ]
 }
@@ -682,18 +691,21 @@ operator 对阿里云只发 **7 个 OpenAPI 动作**，下面这一份策略就�
 | `fc:UpdateCustomDomain` | Apply 写入 `certConfig`：首次绑定、证书换代、漂移纠正；`deletionPolicy: Unbind` 时解绑清理 | `Applied=False` reason `CredentialsInvalid`，`Ready` 跟着 `False`；事件 reason 恒为 `ApplyFailed`（事件名与 condition 的 reason 刻意不同名），固定 5 分钟 requeue。域名上还挂着上一张证书，到期就断。解绑路径与 CAS 清理同构：`CleanupFailed` → `Abandon` 发 `CleanupAbandoned`、`Block` 卡 `Terminating` |
 | `oss:ListCname` | OSS 绑定的每一轮 Observe（漂移检测）、`deletionPolicy: Unbind` 解绑前的读取 | `Ready=False`，reason `CredentialsInvalid`；**`Applied` 一个字节都不动**，与 `fc:GetCustomDomain` 缺失同一条规矩。固定 5 分钟 requeue |
 | `oss:PutCname` | OSS 绑定的 Apply（按 CAS certId 换绑：首次绑定、证书换代、漂移纠正）与 `Unbind` 时摘证书 | `Applied=False` reason `CredentialsInvalid`，`Ready` 跟着 `False`，事件 `ApplyFailed`；固定 5 分钟 requeue。解绑路径走 `CleanupFailed` → `Abandon` / `Block` |
+| `yundun-cert:DescribeSSLCertificatePrivateKey` | **operator 自己从不调**。`oss:PutCname` 带 `CertId` 绑证书时，OSS 以调用方的身份去 CAS 取证书，这三个动作是那一步的权限要求 | 与缺 `oss:PutCname` 同症：`PutCname` 回 `AccessDenied`，`Applied=False` reason `CredentialsInvalid`，事件 `ApplyFailed`，5 分钟 requeue。**已实测**：2026-09-07 第一次真实 OSS 绑定就是缺这三条动作而失败的，同一份策略下 `oss:ListCname` 正常 |
+| `yundun-cert:DescribeSSLCertificatePublicKeyDetail` | 同上 | 同上 |
+| `yundun-cert:CreateSSLCertificate` | 同上 | 同上 |
 
 `fc` 的两条动作只在 ARN 命中的域名上生效。**ARN 里少列一个域名，症状大概率与完全没有 `fc:` 权限区分不开**：两者预计都是 `AccessDenied`。这一条**未实测**，出处是 `test/integration/fc3_test.go` 里的分析（探针撞上 `AccessDenied` 时就是因此拒绝下结论的）。
 
-`oss` 的两条动作以 bucket 为资源粒度（`acs:oss:*:<accountId>:<bucket>`），这是 OSS 允许的最细粒度：持有它就能改这个 bucket 上**任意** CNAME 的证书。OSS 绑定按 CAS certId 引用证书，所以 **OSS Binding 必须同时保留 `yundun-cert` 那条**——证书的 `spec.aliyun.uploadToCAS` 关着时 Binding 会停在 `Applied=False` / `CASUploadRequired`。
+`oss` 的两条动作以 bucket 为资源粒度（`acs:oss:*:<accountId>:<bucket>`），这是 OSS 允许的最细粒度：持有它就能改这个 bucket 上**任意** CNAME 的证书。OSS 绑定按 CAS certId 引用证书，所以 **OSS Binding 必须同时保留 `yundun-cert` 那条**——证书的 `spec.aliyun.uploadToCAS` 关着时 Binding 会停在 `Applied=False` / `CASUploadRequired`。除此之外，**OSS 绑定还要 `DescribeSSLCertificatePrivateKey` / `DescribeSSLCertificatePublicKeyDetail` / `CreateSSLCertificate` 这三条 `yundun-cert` 动作**（策略里最后那条 Statement）：`PutCname` 带 `CertId` 时由 OSS 拿着调用方的身份去 CAS 取证书，这三个动作是那一步的权限要求，operator 自己一个都不调。它们同样只能授在 `"Resource": "*"` 上。
 
 ### 按你的部署裁剪
 
 - **`spec.aliyun.uploadToCAS: false`**：只留 `fc` 那条 Statement（这种证书不能被 OSS Binding 引用），`yundun-cert:*` 一个都不给。此时 operator 完全不碰 CAS（不上传、不回收、不探测），`Uploaded` condition 停在 `UploadDisabled` 且不参与 `Ready` 聚合。
 - **只建 `AliyunCertificate`、不建任何 Binding**：只留 `yundun-cert` 那条。证书会同步进 CAS 控制台，但没有任何 FC3 调用。
 - **多个绑定域名**：`Resource` 数组里逐个列 ARN，一个域名一条，不要图省事写 `custom-domains/*`。域名分布在不同 region 时，每条 ARN 各写各的 region。
-- **没有 OSS Binding**：删掉 `oss` 那条 Statement。
-- **有 OSS Binding**：`oss` 那条按 bucket 逐个列 ARN；`yundun-cert` 那条不能删（见上）。
+- **没有 OSS Binding**：删掉 OSS 那两条 Statement——`oss` 那条，和跟在它后面的三个 `yundun-cert:*SSLCertificate*` 动作那条。
+- **有 OSS Binding**：`oss` 那条按 bucket 逐个列 ARN；开头 `yundun-cert` 那条和末尾三个 `*SSLCertificate*` 动作那条都不能删（见上）。
 - **CAS 那条的 `"Resource": "*"` 改不了**，`yundun-cert` 不支持资源级授权，见下一节。
 
 ### 把占位符填成真实值
@@ -714,6 +726,7 @@ operator 对阿里云只发 **7 个 OpenAPI 动作**，下面这一份策略就�
 - **`yundun-cert:*` 的资源类型是「全部资源」，无法资源级收窄。** 策略里的 `"Resource": "*"` 不是偷懒，是 CAS 只支持这一种写法。持有这个 AK 就能删掉账号下**任意**上传证书。这是不可回避的爆炸半径——**必须用一个独立的 RAM 子账号 + 独立 AK**，不要复用任何现有账号的凭证。
 - **`fc` 支持逐域名 ARN 授权**（`acs:fc:{regionId}:{accountId}:custom-domains/{domainName}`），必须用上，别偷懒写 `*`。多个域名就多列几条 ARN。
 - **不要授 `yundun-cert:GetUserCertificateDetail`。** 它的响应里带私钥，而 operator 完全不需要它——上传、删除、列举三个动作就够了。授出去只是白白扩大泄漏面。
+- **`yundun-cert:DescribeSSLCertificatePrivateKey` 让持有者能读出证书私钥，但用 OSS 绑定就绕不开。** 它与上一条说的 `GetUserCertificateDetail` 是两个不同动作：那个不需要、别授；这个是 `oss:PutCname` 按 `CertId` 绑证书时 OSS 拿调用方身份去 CAS 取证书的权限要求，不给就 `AccessDenied`。operator 自己从不调它。这把 CAS 那条本已很大的爆炸半径又推大一格——**只用 FC3 的部署不要授这三条**，用 OSS 的则更要坚持独立 RAM 子账号 + 独立 AK。
 - **只用 FC3、不需要在 CAS 控制台里看到证书的用户**：设 `spec.aliyun.uploadToCAS: false`，只授 `fc` 那条，见上一节的裁剪规则。
 
 ### 文件版
@@ -722,10 +735,10 @@ operator 对阿里云只发 **7 个 OpenAPI 动作**，下面这一份策略就�
 
 | 文件 | 内容 |
 |---|---|
-| `docs/ram/full-policy.json` | 上面那份完整策略，三条 Statement |
+| `docs/ram/full-policy.json` | 上面那份完整策略，四条 Statement |
 | `docs/ram/certificate-cas-policy.json` | 只有 `yundun-cert` 那条（`spec.aliyun.uploadToCAS: true` 时需要） |
 | `docs/ram/binding-fc3-policy.json` | 只有 `fc` 那条，按域名 ARN 授权 |
-| `docs/ram/binding-oss-policy.json` | 只有 `oss` 那条，按 bucket ARN 授权 |
+| `docs/ram/binding-oss-policy.json` | OSS 那两条：`oss` 按 bucket ARN 授权，外加 `PutCname` 绑证书所需的三个 `yundun-cert:*SSLCertificate*` 动作 |
 
 ```bash
 jq . docs/ram/full-policy.json docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json docs/ram/binding-oss-policy.json

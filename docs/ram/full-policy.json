@@ -29,6 +29,15 @@
       "Resource": [
         "acs:oss:*:<accountId>:<bucket>"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "yundun-cert:DescribeSSLCertificatePrivateKey",
+        "yundun-cert:DescribeSSLCertificatePublicKeyDetail",
+        "yundun-cert:CreateSSLCertificate"
+      ],
+      "Resource": "*"
     }
   ]
 }
