@@ -122,7 +122,7 @@ func (s *sdkCAS) Upload(ctx context.Context, name string, certPEM, keyPEM []byte
 		return 0, cerr
 	}
 	if resp == nil || resp.Body == nil || resp.Body.CertId == nil {
-		return 0, &Error{Class: ClassRetryable, Op: "Upload", Code: "EmptyResponse", Err: errors.New("响应缺少 CertId")}
+		return 0, &Error{Class: ClassRetryable, Op: "Upload", Code: CodeEmptyResponse, Err: errors.New("响应缺少 CertId")}
 	}
 	return *resp.Body.CertId, nil
 }

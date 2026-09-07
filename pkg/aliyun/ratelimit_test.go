@@ -76,3 +76,26 @@ func TestLimiters_RespectsContext(t *testing.T) {
 		t.Errorf("ctx 超时后 Wait 应返回错误")
 	}
 }
+
+func TestLimiters_OSSChannelIsSlowAndSeparate(t *testing.T) {
+	l := aliyun.NewLimiters()
+	ctx := context.Background()
+	// 5 QPS、burst 1：第 2 次要等 ~200ms
+	start := time.Now()
+	for i := 0; i < 2; i++ {
+		if err := l.Wait(ctx, "ak1", aliyun.LimitOSS); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if el := time.Since(start); el < 150*time.Millisecond {
+		t.Errorf("2 次 OSS 调用应至少耗时 ~200ms，实际 %v", el)
+	}
+	// OSS 用光令牌后，cas-write 通道不应被拖慢——两者共用一个 limiter 的话这里会等 200ms
+	start = time.Now()
+	if err := l.Wait(ctx, "ak1", aliyun.LimitCASWrite); err != nil {
+		t.Fatal(err)
+	}
+	if el := time.Since(start); el > 50*time.Millisecond {
+		t.Errorf("OSS 与 cas-write 应是独立通道，实际等待 %v", el)
+	}
+}

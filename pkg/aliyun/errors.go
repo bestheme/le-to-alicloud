@@ -34,6 +34,10 @@ func (c ErrClass) String() string {
 	}
 }
 
+// CodeEmptyResponse 是「OpenAPI 调用本身成功、但响应体缺了必需字段」的错误码。
+// 三个 client 共用它，goconst 也因此不再把这个字面量报成待抽取的常量。
+const CodeEmptyResponse = "EmptyResponse"
+
 // Error 是分类过的阿里云错误。绝不携带 request / response body。
 type Error struct {
 	Class ErrClass

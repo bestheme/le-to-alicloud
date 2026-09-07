@@ -93,7 +93,7 @@ func (s *sdkFC3) GetCustomDomain(ctx context.Context, domain string) (*CustomDom
 	}
 	if resp == nil || resp.Body == nil {
 		return nil, &Error{
-			Class: ClassRetryable, Op: ActionGetCustomDomain, Code: "EmptyResponse",
+			Class: ClassRetryable, Op: ActionGetCustomDomain, Code: CodeEmptyResponse,
 			Err: errors.New("响应缺少 body"),
 		}
 	}
