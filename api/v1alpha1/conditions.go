@@ -53,7 +53,10 @@ const (
 	ReasonCertificateNotFound = "CertificateNotFound"
 	ReasonTargetNotFound      = "TargetNotFound"
 	ReasonDomainNotCovered    = "DomainNotCovered"
-	ReasonConflictingBinding  = "ConflictingBinding"
+	// ReasonCASUploadRequired：目标类型按 certId 引用证书（RequiresCASUpload），而证书的
+	// spec.aliyun.uploadToCAS 是 false。Binding 不替证书开上传，等用户改证书 spec。
+	ReasonCASUploadRequired  = "CASUploadRequired"
+	ReasonConflictingBinding = "ConflictingBinding"
 	// ReasonNoConflict 是 Conflict=False 的原因：同目标只有自己，或自己是仲裁胜者。
 	ReasonNoConflict      = "NoConflict"
 	ReasonAccountMismatch = "AccountMismatch"

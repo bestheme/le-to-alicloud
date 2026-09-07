@@ -51,6 +51,22 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 		}
 	}
 
+	newOSSBinding := func(name string) *certsv1alpha1.AliyunCertificateBinding {
+		return &certsv1alpha1.AliyunCertificateBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: certsv1alpha1.AliyunCertificateBindingSpec{
+				CertificateRef: certsv1alpha1.LocalObjectReference{Name: "cert"},
+				Target: certsv1alpha1.BindingTarget{
+					Type: certsv1alpha1.TargetTypeOSSCustomDomain,
+					OSSCustomDomain: &certsv1alpha1.OSSCustomDomainTarget{
+						Region: "cn-hangzhou", Bucket: "bucket-" + ns,
+						DomainName: fmt.Sprintf("%s.%s.example.com", name, ns),
+					},
+				},
+			},
+		}
+	}
+
 	It("默认 deletionPolicy 为 Orphan", func() {
 		b := newBinding("defaults")
 		Expect(k8sClient.Create(ctx, b)).To(Succeed())
@@ -84,6 +100,36 @@ var _ = Describe("AliyunCertificateBinding CRD 校验", func() {
 			return k8sClient.Update(ctx, got)
 		}, "10s", "100ms").Should(MatchError(ContainSubstring(
 			"spec.target: Invalid value: target 不可变，请新建 Binding")))
+	})
+
+	It("接受 type=OSSCustomDomain 且 TargetKey 含 bucket", func() {
+		b := newOSSBinding("oss-ok")
+		Expect(k8sClient.Create(ctx, b)).To(Succeed())
+		got := &certsv1alpha1.AliyunCertificateBinding{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "oss-ok", Namespace: ns}, got)).To(Succeed())
+		Expect(got.TargetKey()).To(Equal(fmt.Sprintf("OSSCustomDomain/cn-hangzhou/bucket-%s/oss-ok.%s.example.com", ns, ns)))
+	})
+
+	It("拒绝 type=OSSCustomDomain 但缺少 ossCustomDomain", func() {
+		b := newOSSBinding("oss-missing")
+		b.Spec.Target.OSSCustomDomain = nil
+		Expect(k8sClient.Create(ctx, b)).To(MatchError(ContainSubstring(
+			"ossCustomDomain 必须且只能在 type=OSSCustomDomain 时设置")))
+	})
+
+	It("拒绝同时带 fc3CustomDomain 与 ossCustomDomain", func() {
+		b := newBinding("both-blocks")
+		b.Spec.Target.OSSCustomDomain = &certsv1alpha1.OSSCustomDomainTarget{
+			Region: "cn-hangzhou", Bucket: "b", DomainName: "x.example.com",
+		}
+		Expect(k8sClient.Create(ctx, b)).To(MatchError(ContainSubstring(
+			"ossCustomDomain 必须且只能在 type=OSSCustomDomain 时设置")))
+	})
+
+	It("拒绝不合法的 bucket 名", func() {
+		b := newOSSBinding("oss-bad-bucket")
+		b.Spec.Target.OSSCustomDomain.Bucket = "Bad_Bucket"
+		Expect(k8sClient.Create(ctx, b)).To(MatchError(ContainSubstring("spec.target.ossCustomDomain.bucket")))
 	})
 
 	It("拒绝未知 deletionPolicy", func() {

@@ -38,6 +38,10 @@ const (
 // TargetTypeFC3CustomDomain 是第一个 provider 类型。
 const TargetTypeFC3CustomDomain = "FC3CustomDomain"
 
+// TargetTypeOSSCustomDomain 是第二个 provider 类型：OSS bucket 的自定义域名（CNAME）。
+// 与 FC3 内联 PEM 不同，OSS 按 CAS certId 引用证书（Capabilities.ReferencesCertByID）。
+const TargetTypeOSSCustomDomain = "OSSCustomDomain"
+
 // IndexBindingByCertificate 是 controller-runtime field index 的键名。
 const IndexBindingByCertificate = "spec.certificateRef.name"
 
@@ -55,13 +59,30 @@ type FC3CustomDomainTarget struct {
 	EnsureHTTPSProtocol bool `json:"ensureHTTPSProtocol,omitempty"`
 }
 
-// BindingTarget 是 discriminated union：type 决定哪个内嵌块必须存在。
+// OSSCustomDomainTarget 指向一个 OSS bucket 上已绑定、已通过所有权验证的自定义域名。
+//
+// 没有 ensureHTTPSProtocol：OSS CNAME 没有协议开关。
+type OSSCustomDomainTarget struct {
+	// bucket 所在 region，如 cn-hangzhou。决定 OSS endpoint，与 CAS 区域无关。
+	// +kubebuilder:validation:MinLength=1
+	Region string `json:"region"`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`
+	Bucket string `json:"bucket"`
+	// +kubebuilder:validation:MinLength=1
+	DomainName string `json:"domainName"`
+}
+
+// BindingTarget 是 discriminated union：type 决定哪个内嵌块必须存在。两条 CEL 合起来
+// 保证任意时刻恰好一个内嵌块存在。
 // +kubebuilder:validation:XValidation:rule="self.type == 'FC3CustomDomain' ? has(self.fc3CustomDomain) : !has(self.fc3CustomDomain)",message="fc3CustomDomain 必须且只能在 type=FC3CustomDomain 时设置"
+// +kubebuilder:validation:XValidation:rule="self.type == 'OSSCustomDomain' ? has(self.ossCustomDomain) : !has(self.ossCustomDomain)",message="ossCustomDomain 必须且只能在 type=OSSCustomDomain 时设置"
 type BindingTarget struct {
-	// +kubebuilder:validation:Enum=FC3CustomDomain
+	// +kubebuilder:validation:Enum=FC3CustomDomain;OSSCustomDomain
 	Type string `json:"type"`
 	// +optional
 	FC3CustomDomain *FC3CustomDomainTarget `json:"fc3CustomDomain,omitempty"`
+	// +optional
+	OSSCustomDomain *OSSCustomDomainTarget `json:"ossCustomDomain,omitempty"`
 }
 
 // AliyunCertificateBindingSpec 定义期望状态。
@@ -97,6 +118,14 @@ type AliyunCertificateBindingStatus struct {
 	// freezeApplied（两条核实过的成功路径上一并清空）。
 	// +optional
 	DriftedFingerprint string `json:"driftedFingerprint,omitempty"`
+	// 目标上实际引用的 CAS certId 字符串（形如 27087165-cn-hangzhou）。
+	// 只有按 certId 引用证书的 provider（OSS）写；FC3 恒为空。appliedFingerprint 照旧写入，
+	// 证书 controller 的保留护栏 3 只认它。
+	// +optional
+	AppliedCertRef string `json:"appliedCertRef,omitempty"`
+	// 上一轮观测到的「漂移 certRef」，语义与 driftedFingerprint 逐条对应。
+	// +optional
+	DriftedCertRef string `json:"driftedCertRef,omitempty"`
 	// +optional
 	LastAppliedTime *metav1.Time `json:"lastAppliedTime,omitempty"`
 	// +optional
@@ -132,7 +161,8 @@ type AliyunCertificateBinding struct {
 	Status AliyunCertificateBindingStatus `json:"status,omitempty"`
 }
 
-// TargetKey 返回 "<type>/<region>/<identifier>"，用于同目标冲突索引。
+// TargetKey 返回 "<type>/<region>/<identifier>"（OSS 为 "<type>/<region>/<bucket>/<domainName>"），
+// 用于同目标冲突索引。
 func (b *AliyunCertificateBinding) TargetKey() string {
 	t := b.Spec.Target
 	switch t.Type {
@@ -141,6 +171,11 @@ func (b *AliyunCertificateBinding) TargetKey() string {
 			return ""
 		}
 		return t.Type + "/" + t.FC3CustomDomain.Region + "/" + t.FC3CustomDomain.DomainName
+	case TargetTypeOSSCustomDomain:
+		if t.OSSCustomDomain == nil {
+			return ""
+		}
+		return t.Type + "/" + t.OSSCustomDomain.Region + "/" + t.OSSCustomDomain.Bucket + "/" + t.OSSCustomDomain.DomainName
 	default:
 		return ""
 	}
