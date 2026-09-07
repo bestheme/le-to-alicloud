@@ -43,6 +43,7 @@ func TestClassify(t *testing.T) {
 		{"forbidden", sdkErr("Forbidden.RAM", 403), aliyun.ClassAuth},
 		{"not exist", sdkErr("CertNotExist", 400), aliyun.ClassNotFound},
 		{"param", sdkErr("InvalidParameter", 400), aliyun.ClassPermanent},
+		{"429 无 Throttling 码", sdkErr("Throttled", 429), aliyun.ClassRetryable},
 		{"ctx deadline", context.DeadlineExceeded, aliyun.ClassRetryable},
 		{"plain", errors.New("boom"), aliyun.ClassPermanent},
 

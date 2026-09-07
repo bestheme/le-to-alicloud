@@ -57,6 +57,8 @@ func TestClassifyOSS(t *testing.T) {
 		{"InvalidAccessKeyId", &oss.ServiceError{Code: "InvalidAccessKeyId", StatusCode: 403},
 			ClassAuth, "InvalidAccessKeyId"},
 		{"5xx", &oss.ServiceError{Code: "InternalError", StatusCode: 500}, ClassRetryable, "InternalError"},
+		{"429 限流", &oss.ServiceError{Code: "TooManyRequests", StatusCode: 429},
+			ClassRetryable, "TooManyRequests"},
 		{"参数错误", &oss.ServiceError{Code: "InvalidArgument", StatusCode: 400}, ClassPermanent, "InvalidArgument"},
 		{"超时", context.DeadlineExceeded, ClassRetryable, "Timeout"},
 	}
