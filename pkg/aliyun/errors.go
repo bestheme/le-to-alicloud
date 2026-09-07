@@ -125,6 +125,9 @@ func classifyCode(code string, status int) ErrClass {
 		code == "ServiceUnavailable",
 		code == "InternalError",
 		strings.HasPrefix(code, "ServiceUnavailable"),
+		// OSS 走的是 S3 风格的错误码命名，不用 Throttling* 这个命名空间，限流只体现在
+		// HTTP 429 上；漏掉它就会让一次瞬时限流落进下面的 Permanent，变成永久失败的 Binding。
+		status == 429,
 		status >= 500:
 		return ClassRetryable
 	case strings.HasPrefix(code, "InvalidAccessKeyId"),
