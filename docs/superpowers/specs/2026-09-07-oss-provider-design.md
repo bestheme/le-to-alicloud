@@ -350,9 +350,9 @@ v0.2.0。CRD 新增字段与 status 字段皆可选，旧对象无需迁移；CR
 
 | # | 待核实 | 猜错的失效方式 |
 |---|---|---|
-| T-OSS1 | `PutCname` 带 `CertId` + `Force=true` 的首绑与换绑是否都成功 | 换绑被拒 ⇒ 续期永远 `ApplyFailed` |
-| T-OSS2 | `CertId` 区域后缀取 CAS 区域还是 bucket 区域（两者不同时才能分辨；首绑两者同为 cn-hangzhou，只能证明「同区域可行」） | 跨区组合下 Apply 被拒 |
-| T-OSS3 | `ListCname` 回报的 `CertId` 是否与写入字符串逐字相同 | 短路永不命中 ⇒ 每小时一次无谓 `PutCname` 并误报漂移 |
+| T-OSS1 | `PutCname` 带 `CertId` + `Force=true` 的首绑与换绑是否都成功。**2026-09-07 实测：首绑成功**（`CertId: "27114423-cn-hangzhou"`, `Force: true`，Binding `Applied=True` / `appliedCertRef` 同值）；**换绑那一半仍未测**，等下次续期换代。同一次实测暴露 RAM 前提：先回 `AccessDenied`，补上三个 `yundun-cert:*SSLCertificate*` 动作后才通（见 §9） | 换绑被拒 ⇒ 续期永远 `ApplyFailed` |
+| T-OSS2 | `CertId` 区域后缀取 CAS 区域还是 bucket 区域（两者不同时才能分辨；首绑两者同为 cn-hangzhou，只能证明「同区域可行」）。**2026-09-07 实测：只证明了「同区域可行」**——CAS 与 bucket 同为 `cn-hangzhou`，后缀在两种解释下同值，语义仍分辨不出；跨区组合未测 | 跨区组合下 Apply 被拒 |
+| T-OSS3 | `ListCname` 回报的 `CertId` 是否与写入字符串逐字相同。**2026-09-07 实测：逐字相同**（ossutil 读回 bucket `applanding-102181` 得 `27114423-cn-hangzhou`），短路必命中；同次读回 `ListCname.Owner=102181` 非空，账号 fencing 前提成立。**已关闭** | 短路永不命中 ⇒ 每小时一次无谓 `PutCname` 并误报漂移 |
 | T-OSS4 | `DeleteCertificate=true` 后 CNAME 记录是否保留 | Unbind 打断线上访问 |
 | T-OSS5 | CAS 删除被 OSS 引用的证书是否被拒、错误码 | 回收路径持续 `ReclaimFailed` |
 | T-OSS6 | 缺 `oss:PutCname` 权限时的错误码与 HTTP 状态 | 分类落入 Permanent 而非 Auth，退避节奏错 |
