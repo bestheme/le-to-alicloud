@@ -19,6 +19,44 @@ const (
 	q20oss = "缺 oss:PutCname 权限时的错误码与 HTTP 状态（T-OSS6）"
 )
 
+// ossProbeIDs 是本组覆盖的全部编号；ossQuestions 把编号映射回 spec §12.3 的问题文本。
+// 每条早退路径都把整组交给 skipRest，由 skipRest 自己筛掉已经落过结论的编号。
+var ossProbeIDs = []string{"#15", "#16", "#17", "#18", "#19", "#20"}
+
+var ossQuestions = map[string]string{
+	"#15": q15oss, "#16": q16oss, "#17": q17oss, "#18": q18oss, "#19": q19oss, "#20": q20oss,
+}
+
+// skipRest 把本轮**还没落过结论**的编号一次性记成「未实测：<原因>」，再 skip 掉整个用例。
+//
+// 每一条早退路径都必须用它，因为 writeResults 是**整文件覆盖**：只记 #15 就退出，会让
+// #16–#20 在 RESULTS.md 里整段消失，读报告的人分不清「没测到」和「忘了写」。
+//
+// 「还没落过结论」这道筛子不是保险：#20 可能已经被 noteAuth 写下过一次真实的鉴权观测，
+// #15 可能刚记完「（首绑）拒绝」，都不该被一行「未实测」盖住。
+// 单编号、且后面什么都不跟的场合仍然用 RecordSkip。
+func skipRest(t *testing.T, why string, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if !recorded(id) {
+			recordSkipNoStop(t, id, ossQuestions[id], why)
+		}
+	}
+	t.Skip(why)
+}
+
+// recorded 报告本次运行是否已经为该编号落过任何一行。
+func recorded(id string) bool {
+	findingsMu.Lock()
+	defer findingsMu.Unlock()
+	for _, f := range findings {
+		if f.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // requireOSSTarget 取 OSS 探针的 bucket 与域名。缺任一项就把整组记成「未实测」并 skip。
 //
 // 所有者决定（2026-09-07 spec D24）不另建牺牲 bucket；这里的 skip 文案要把「怎么补测」说全。
@@ -26,15 +64,9 @@ func requireOSSTarget(t *testing.T) (bucket, domain string) {
 	t.Helper()
 	bucket, domain = env(EnvOSSTestBucket), env(EnvOSSTestDomain)
 	if bucket == "" || domain == "" {
-		why := "未实测：未设置 " + EnvOSSTestBucket + " / " + EnvOSSTestDomain +
-			"。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；" +
-			"首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24）"
-		for _, q := range []struct{ id, q string }{
-			{"#15", q15oss}, {"#16", q16oss}, {"#17", q17oss}, {"#18", q18oss}, {"#19", q19oss}, {"#20", q20oss},
-		} {
-			recordSkipNoStop(t, q.id, q.q, why)
-		}
-		t.Skip(why)
+		skipRest(t, "未实测：未设置 "+EnvOSSTestBucket+" / "+EnvOSSTestDomain+
+			"。本组要真的换绑一个 OSS CNAME 上的证书，没有可供改写的 bucket + 已验证域名就无从测起；"+
+			"首次实测由 www.bestheme.ac.cn 的受控首绑完成（spec 2026-09-07 D24）", ossProbeIDs...)
 	}
 	return bucket, domain
 }
@@ -97,10 +129,11 @@ func TestOSSBindByCertID(t *testing.T) {
 	before, err := oss.GetCname(ctx, bucket, domain)
 	if err != nil {
 		noteAuth(t, err)
-		RecordSkip(t, "#15", q15oss, "未实测：读不到测试 CNAME（"+sdkSummary(err)+"）")
+		skipRest(t, "未实测：读不到测试 CNAME（"+sdkSummary(err)+"）。本组每一项都要在这条 CNAME 上做，"+
+			"读不到就全组无从测起", ossProbeIDs...)
 	}
 	t.Cleanup(func() {
-		// before 为 nil 说明原状根本没读到，没有可还原的目标。上面那条 RecordSkip 会
+		// before 为 nil 说明原状根本没读到，没有可还原的目标。上面那条 skipRest 会
 		// t.Skip 掉整个用例、这个 Cleanup 压根不会注册，所以这里只是形状上的兜底。
 		if before == nil {
 			return
@@ -125,11 +158,13 @@ func TestOSSBindByCertID(t *testing.T) {
 	cert2, key2 := testutil.IssueLeafRSA(t, ca, domain)
 	id1, err := uploadForTest(t, cas, itName(t, "oss1"), cert1, key1, randToken(t))
 	if err != nil {
-		RecordSkip(t, "#15", q15oss, "未实测：CAS 上传测试证书失败（"+sdkSummary(err)+"）")
+		skipRest(t, "未实测：CAS 上传测试证书失败（"+sdkSummary(err)+"）。本组要拿两张自己的证书来回换绑，"+
+			"上传不上去就全组无从测起", ossProbeIDs...)
 	}
 	id2, err := uploadForTest(t, cas, itName(t, "oss2"), cert2, key2, randToken(t))
 	if err != nil {
-		RecordSkip(t, "#15", q15oss, "未实测：CAS 上传第二张测试证书失败（"+sdkSummary(err)+"）")
+		skipRest(t, "未实测：CAS 上传第二张测试证书失败（"+sdkSummary(err)+"）。没有第二张证书就换不了绑，"+
+			"#15 的换绑与其后各项都无从测起", ossProbeIDs...)
 	}
 	ref1, ref2 := itoa(id1)+"-"+region, itoa(id2)+"-"+region
 
@@ -137,9 +172,15 @@ func TestOSSBindByCertID(t *testing.T) {
 	if err := oss.PutCnameCert(ctx, bucket, domain, ref1); err != nil {
 		noteAuth(t, err)
 		Record(t, "#15", q15oss+"（首绑）", "拒绝", sdkSummary(err))
-		t.Fatalf("首绑失败: %s", sdkSummary(err))
+		skipRest(t, "未实测：首绑就被拒，后面每一项都要在「证书已经绑上」的前提下做。"+
+			"#15 的结论见本编号的「（首绑）」行", ossProbeIDs...)
 	}
 	Record(t, "#15", q15oss+"（首绑）", "成功", "certRef="+ref1)
+
+	// boundRef / boundID 跟踪「此刻 CNAME 真正引用的是哪一张证书」，两者永远成对更新。
+	// #19 要删的必须是**被引用**的那一张：换绑或 alt 回绑失败时那张不是 ref2，删 id2 只是
+	// 删掉一张没人引用的证书，据此写下「允许删除被引用的证书」是彻头彻尾的假结论。
+	boundRef, boundID := ref1, id1
 
 	// #17 回读逐字比对
 	got, err := oss.GetCname(ctx, bucket, domain)
@@ -157,6 +198,7 @@ func TestOSSBindByCertID(t *testing.T) {
 		Record(t, "#15", q15oss+"（换绑）", "拒绝", sdkSummary(err))
 	} else {
 		Record(t, "#15", q15oss+"（换绑）", "成功", "certRef "+ref1+" → "+ref2)
+		boundRef, boundID = ref2, id2
 	}
 
 	// #16 区域后缀：两者同区域时只能证明「同区域可行」；有备用 CAS 区域时再试一次跨区。
@@ -172,26 +214,30 @@ func TestOSSBindByCertID(t *testing.T) {
 		default:
 			ref3 := itoa(id3) + "-" + alt
 			perr := oss.PutCnameCert(ctx, bucket, domain, ref3)
-			if perr == nil {
-				Record(t, "#16", q16oss+"（alt）", "接受：后缀取 **CAS 区域**（证书在 "+alt+"，bucket 在 "+region+"）", "certRef="+ref3)
-			} else {
+			if perr != nil {
 				Record(t, "#16", q16oss+"（alt）", "拒绝：跨区引用不可用，certRef 后缀须与 bucket 区域一致或证书须在同区 CAS", sdkSummary(perr))
-			}
-			// 回到 ref2，让后面的 #19 / #18 建立在确定的状态上。
-			if perr == nil {
+			} else {
+				Record(t, "#16", q16oss+"（alt）", "接受：后缀取 **CAS 区域**（证书在 "+alt+"，bucket 在 "+region+"）", "certRef="+ref3)
+				boundRef, boundID = ref3, id3
+				// 回到 ref2，让后面的 #19 / #18 建立在确定的状态上。回不去也不能只 t.Logf：
+				// 那会让 CNAME 停在一个非预期状态而 RESULTS 里一个字都没有。
 				if rerr := oss.PutCnameCert(ctx, bucket, domain, ref2); rerr != nil {
-					t.Logf("回绑 ref2 失败: %s", sdkSummary(rerr))
+					Record(t, "#16", q16oss+"（alt 回绑）", "回绑 ref2 失败，后续 #19/#18 基于 ref3", sdkSummary(rerr))
+				} else {
+					boundRef, boundID = ref2, id2
 				}
 			}
 		}
 	}
 
-	// #19 删被引用的证书（此刻 CNAME 引用的是 ref2）
-	if derr := deleteForTest(t, cas, id2); derr != nil {
-		Record(t, "#19", q19oss, "被拒：错误码="+errCode(derr)+" class="+aliyun.ClassOf(derr).String(), sdkSummary(derr))
+	// #19 删被引用的证书：删的是 boundRef 那一张，不是想当然的 ref2。这条编号问的正是
+	// 「删一张**正在被引用**的证书会怎样」，删错对象得到的「允许」什么都没证明。
+	if derr := deleteForTest(t, cas, boundID); derr != nil {
+		Record(t, "#19", q19oss, "被拒：错误码="+errCode(derr)+" class="+aliyun.ClassOf(derr).String(),
+			sdkSummary(derr)+"；删的是 CNAME 此刻引用的 certRef="+boundRef)
 	} else {
 		after, gerr := oss.GetCname(ctx, bucket, domain)
-		detail := "DeleteUserCertificate 成功"
+		detail := "DeleteUserCertificate 成功；删的是 CNAME 此刻引用的 certRef=" + boundRef
 		if gerr == nil {
 			detail += "；随后 ListCname 回报 CertId=" + after.CertRef + " Type=" + after.CertType
 		}
@@ -209,8 +255,14 @@ func TestOSSBindByCertID(t *testing.T) {
 			Record(t, "#18", q18oss, "保留：CNAME 仍在且无证书", "Status="+after.Status)
 		case gerr == nil:
 			Record(t, "#18", q18oss, "**证书仍在**：DeleteCertificate 未生效", "CertId="+after.CertRef)
-		case aliyun.ClassOf(gerr) == aliyun.ClassNotFound:
+		// ClassNotFound 有两个来源：cnameFromList 的 CnameNotFound（确实是「这条域名不在
+		// 列表里」），和 ListCname 自己的 404（NoSuchBucket 等）。只有前者能支撑
+		// 「CNAME 被删」这个强结论，后者说明的是 bucket 一级出了问题。
+		case errCode(gerr) == "CnameNotFound":
 			Record(t, "#18", q18oss, "**CNAME 被删**：与文档不符", sdkSummary(gerr))
+		case aliyun.ClassOf(gerr) == aliyun.ClassNotFound:
+			Record(t, "#18", q18oss, "无法判定：bucket 级 NotFound（code="+errCode(gerr)+"），"+
+				"不是 cnameFromList 的 CnameNotFound", sdkSummary(gerr))
 		default:
 			Record(t, "#18", q18oss, "无法判定：回读失败", sdkSummary(gerr))
 		}
