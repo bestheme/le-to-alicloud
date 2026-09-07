@@ -140,11 +140,16 @@ func (r *AliyunCertificateBindingReconciler) freezeApplied(
 	ctx context.Context, rd *bindingRound, obs provider.ObservedState, m provider.CertMaterial, wrote bool,
 ) {
 	b := rd.b
+	// appliedFingerprint 对所有 provider 都写：证书 controller 的保留护栏 3 只认它。
+	// 按 certId 引用的 provider 另写 appliedCertRef，那是它自己对账用的身份。
 	b.Status.AppliedFingerprint = m.Fingerprint
-	// 漂移已经被这一轮解决（写完了，或短路核实了云上装的就是这一张），痕迹必须抹掉，
+	if capabilitiesOf(b).ReferencesCertByID {
+		b.Status.AppliedCertRef = m.CASCertRef()
+	}
+	// 漂移已经被这一轮解决（写完了，或短路核实了云上装的就是这一张），两种痕迹都抹掉，
 	// 否则同一张证书日后再次漂移会被 noteDrift 误判成「还是上一轮那次」而不发事件。
 	// 短路路径压根不经过 noteDrift，这里是它唯一的清空点。
-	b.Status.DriftedFingerprint = ""
+	b.Status.DriftedFingerprint, b.Status.DriftedCertRef = "", ""
 	if wrote {
 		b.Status.LastAppliedTime = &metav1.Time{Time: r.now()}
 	}

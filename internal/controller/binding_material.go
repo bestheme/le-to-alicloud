@@ -95,10 +95,15 @@ func loadBindingMaterial(
 // 配置错误变成「证书不覆盖域名」的误报。真正的未知类型由 CRD 的枚举与 provider
 // 注册表拦下。
 func requiredDomainsOf(b *certsv1alpha1.AliyunCertificateBinding) []string {
-	if b.Spec.Target.Type == certsv1alpha1.TargetTypeFC3CustomDomain && b.Spec.Target.FC3CustomDomain != nil {
-		return []string{b.Spec.Target.FC3CustomDomain.DomainName}
+	t := b.Spec.Target
+	switch {
+	case t.Type == certsv1alpha1.TargetTypeFC3CustomDomain && t.FC3CustomDomain != nil:
+		return []string{t.FC3CustomDomain.DomainName}
+	case t.Type == certsv1alpha1.TargetTypeOSSCustomDomain && t.OSSCustomDomain != nil:
+		return []string{t.OSSCustomDomain.DomainName}
+	default:
+		return nil
 	}
-	return nil
 }
 
 // checkDomainCoverage 实施 spec §6.2 步骤 3：leaf SANs 必须按 RFC 6125 覆盖目标域名。

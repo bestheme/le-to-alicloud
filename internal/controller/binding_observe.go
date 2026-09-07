@@ -224,7 +224,7 @@ func setFencedConflict(rd *bindingRound) {
 
 // noteDrift 在观测到「既不是我们上次写的、也不是当前该写的」证书时记一笔。
 //
-// 判定要求 obs.CurrentFingerprint 非空：空证书是「还没绑过」，不是漂移。
+// 判定要求身份三元组的 current 非空：空证书是「还没绑过」，不是漂移。
 // 等于 appliedFingerprint 是正常轮换（我们写的那张还在，只是证书续期了）。
 //
 // **事件与计数器都只在跃迁时记一次**（spec §10.2）。无条件记只在「紧接着的 Apply 成功」
@@ -240,22 +240,30 @@ func setFencedConflict(rd *bindingRound) {
 func (r *AliyunCertificateBindingReconciler) noteDrift(
 	ctx context.Context, rd *bindingRound, obs provider.ObservedState, m provider.CertMaterial,
 ) {
-	cur := obs.CurrentFingerprint
-	if cur == "" || cur == rd.b.Status.AppliedFingerprint || cur == m.Fingerprint {
-		rd.b.Status.DriftedFingerprint = ""
+	id := identityOf(rd.b, obs, m)
+	cur := id.current
+	if cur == "" || cur == id.applied || cur == id.want {
+		rd.b.Status.DriftedFingerprint, rd.b.Status.DriftedCertRef = "", ""
 		return
 	}
-	rd.b.Status.DriftedFingerprint = cur
+	// 漂移值写进与身份同种的字段：certRef 不是指纹，不能塞进 driftedFingerprint。
+	prev := rd.orig.Status.DriftedFingerprint
+	if id.byRef {
+		rd.b.Status.DriftedCertRef = cur
+		prev = rd.orig.Status.DriftedCertRef
+	} else {
+		rd.b.Status.DriftedFingerprint = cur
+	}
 	// 判据取 rd.orig（本轮开始前 API server 上的那一份，也就是「上一轮」的结论），
 	// 与 eventOnReasonChange 同一套写法。收敛性：本轮把 cur 写进了 rd.b，而每一条
 	// 走到这里的路径最终都会 patch status（Apply 成功走 freezeApplied，失败走
 	// handleApplyError），所以下一轮的 rd.orig 上一定读得到同一个值。
-	if rd.orig.Status.DriftedFingerprint == cur {
+	if prev == cur {
 		return
 	}
 	bindingDriftTotal.WithLabelValues(rd.provider).Inc()
 	logf.FromContext(ctx).Info("检测到云侧证书漂移",
 		"domain", targetIdentifier(rd.b),
-		"observed", shortFP(cur), "expected", shortFP(m.Fingerprint))
+		"observed", identityLabel(id, cur), "expected", identityLabel(id, id.want))
 	r.Recorder.Event(rd.b, corev1.EventTypeWarning, certsv1alpha1.ReasonDriftCorrected, driftCorrectedMessage)
 }

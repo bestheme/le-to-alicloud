@@ -79,10 +79,14 @@ func setBindingReadyFalse(b *certsv1alpha1.AliyunCertificateBinding, reason, mes
 // 「target.type 不认识 / 内嵌块缺失」这类失败触发，而那正是 FC3CustomDomain 为 nil 的
 // 时候，直接解引用会把一次配置错误变成 panic。
 func targetIdentifier(b *certsv1alpha1.AliyunCertificateBinding) string {
-	if b.Spec.Target.FC3CustomDomain != nil {
-		return b.Spec.Target.FC3CustomDomain.DomainName
+	switch t := b.Spec.Target; {
+	case t.FC3CustomDomain != nil:
+		return t.FC3CustomDomain.DomainName
+	case t.OSSCustomDomain != nil:
+		return t.OSSCustomDomain.DomainName
+	default:
+		return b.TargetKey()
 	}
-	return b.TargetKey()
 }
 
 // targetRegion 同上，供 region label 使用；取不到时返回空串（label 允许空值）。
@@ -91,10 +95,14 @@ func targetIdentifier(b *certsv1alpha1.AliyunCertificateBinding) string {
 // cleanupAbandonedTotal.WithLabelValues(targetRegion(b), providerErrClass(err))。
 // 绑定侧三个 gauge 的 label 里都没有 region，所以除它之外没有第二个消费者。
 func targetRegion(b *certsv1alpha1.AliyunCertificateBinding) string {
-	if b.Spec.Target.FC3CustomDomain != nil {
-		return b.Spec.Target.FC3CustomDomain.Region
+	switch t := b.Spec.Target; {
+	case t.FC3CustomDomain != nil:
+		return t.FC3CustomDomain.Region
+	case t.OSSCustomDomain != nil:
+		return t.OSSCustomDomain.Region
+	default:
+		return ""
 	}
-	return ""
 }
 
 // aggregateBindingReady 实现 spec §6.2 步骤 8：Ready = Applied && !Conflict。
