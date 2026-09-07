@@ -1,0 +1,13 @@
+apiVersion: certs.bestheme.ac.cn/v1alpha1
+kind: AliyunCertificateBinding
+metadata:
+  name: www-oss
+spec:
+  certificateRef:
+    name: www-bestheme
+  target:
+    type: OSSCustomDomain
+    ossCustomDomain:
+      region: cn-hangzhou
+      bucket: applanding-102181
+      domainName: www.bestheme.ac.cn

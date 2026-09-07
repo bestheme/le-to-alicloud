@@ -3,4 +3,5 @@ resources:
 - aliyun-credentials-secret.yaml
 - certs_v1alpha1_aliyuncertificate.yaml
 - certs_v1alpha1_aliyuncertificatebinding.yaml
+- certs_v1alpha1_aliyuncertificatebinding_oss.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

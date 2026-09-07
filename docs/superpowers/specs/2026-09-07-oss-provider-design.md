@@ -175,7 +175,7 @@ func identityOf(caps provider.Capabilities, b *Binding, obs provider.ObservedSta
 ```
 p, _ := provider.Get(b.Spec.Target.Type)      // 认不出的类型交给步骤 4 现有的工厂错误路径
 if p.Capabilities().RequiresCASUpload {
-    if !ac.Spec.Aliyun.EffectiveUploadToCAS() {
+    if !ac.Spec.Aliyun.UploadEnabled() {
         Applied=False / CASUploadRequired；aggregate；RequeueAfter DriftCheckInterval
     }
     if m.CertID == nil {                       // 这一代还没传完 CAS

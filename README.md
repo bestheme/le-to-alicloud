@@ -331,12 +331,15 @@ spec:
 | 字段 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
 | `certificateRef.name` | string | **是** | — | 同 namespace 的 `AliyunCertificate` |
-| `target.type` | string | **是** | — | 目前只有 `FC3CustomDomain`；**整个 `target` 不可变**（CEL `self == oldSelf`），改目标请新建 Binding |
+| `target.type` | string | **是** | — | `FC3CustomDomain` 或 `OSSCustomDomain`；**整个 `target` 不可变**（CEL `self == oldSelf`），改目标请新建 Binding |
 | `target.fc3CustomDomain.region` | string | **是** | — | `type=FC3CustomDomain` 时必须且只能设置这个块 |
 | `target.fc3CustomDomain.domainName` | string | **是** | — | 证书归属于域名，与函数无关 |
 | `target.fc3CustomDomain.ensureHTTPSProtocol` | bool | 否 | `false` | 只有为 `true` 且域名当前 protocol 不含 HTTPS 时，才把 protocol 改为 `HTTP,HTTPS`；默认不动 |
+| `target.ossCustomDomain.region` | string | **是** | — | `type=OSSCustomDomain` 时必须且只能设置这个块；bucket 所在 region，与 CAS 区域无关 |
+| `target.ossCustomDomain.bucket` | string | **是** | — | bucket 名（`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`） |
+| `target.ossCustomDomain.domainName` | string | **是** | — | 该 bucket 上已绑定、已通过所有权验证的自定义域名。OSS 按 **CAS certId** 引用证书，所以证书的 `spec.aliyun.uploadToCAS` 必须为 `true`（默认值），否则 Binding 停在 `Applied=False` / `CASUploadRequired` |
 | `credentialsRef.name` | string | 否 | 继承 `certificateRef` 所指证书的 `aliyun.credentialsRef` | 同 namespace |
-| `deletionPolicy` | enum（`Orphan` / `Unbind`） | 否 | `Orphan` | `Orphan`：删 Binding 不动云侧；`Unbind`：先 Observe 确认目标上那张确实是自己写的，才清空 `certConfig`（纯 HTTPS 域名同时降为 HTTP） |
+| `deletionPolicy` | enum（`Orphan` / `Unbind`） | 否 | `Orphan` | `Orphan`：删 Binding 不动云侧；`Unbind`：先 Observe 确认目标上那张确实是自己写的，才清空 `certConfig`（纯 HTTPS 域名同时降为 HTTP）；OSS 上是摘掉 CNAME 的证书、CNAME 记录保留 |
 
 `status` 的关键字段：
 
@@ -345,6 +348,8 @@ spec:
 | `observedGeneration` | |
 | `appliedFingerprint` | 目标上实际生效的证书指纹 |
 | `driftedFingerprint` | 上一轮观测到的「漂移证书」指纹：既不是我们上次写的、也不是当前该写的那一张。它的作用是让 `DriftCorrected` 事件与 drift 计数器只在跃迁时发一次，而不是每轮重发 |
+| `appliedCertRef` | OSS 目标上实际引用的 CAS certId 字符串（形如 `27087165-cn-hangzhou`）；FC3 恒为空。`appliedFingerprint` 对两种目标都写 |
+| `driftedCertRef` | 与 `driftedFingerprint` 同义，只是内容是 certRef；OSS 目标用它做漂移事件的跃迁基准 |
 | `lastAppliedTime` / `lastObservedTime` | 上次成功 Apply / 上次 Observe 的时间 |
 | `boundAccountId` | 首次成功 Apply 时固化，用于账号 fencing |
 | `cleanupStartedAt` | 首次进入删除分支的时间，用于 `--cleanup-grace-period` 计时 |
@@ -367,9 +372,27 @@ spec:
       domainName: api.timehorse.bestheme.ac.cn
 ```
 
+OSS 示例（`config/samples/certs_v1alpha1_aliyuncertificatebinding_oss.yaml`）：
+
+```yaml
+apiVersion: certs.bestheme.ac.cn/v1alpha1
+kind: AliyunCertificateBinding
+metadata:
+  name: www-oss
+spec:
+  certificateRef:
+    name: www-bestheme
+  target:
+    type: OSSCustomDomain
+    ossCustomDomain:
+      region: cn-hangzhou
+      bucket: applanding-102181
+      domainName: www.bestheme.ac.cn
+```
+
 ### 上手
 
-`config/samples/` 里的三个样本可以直接用：两个是本项目的 CR（`AliyunCertificate` 与 `AliyunCertificateBinding`），第三个 `aliyun-credentials-secret.yaml` 是核心 `Secret`，不是 CR。凭证 Secret 的两个 `REPLACE_ME` 必须先改掉——**改完的文件不要提交进任何仓库**，生产环境请用 SealedSecret / ExternalSecret 生成它。
+`config/samples/` 里的四个样本可以直接用：三个是本项目的 CR（一个 `AliyunCertificate` 与两个 `AliyunCertificateBinding`），第四个 `aliyun-credentials-secret.yaml` 是核心 `Secret`，不是 CR。OSS 那个样本引用的证书名与另一个样本不同，按需改成你自己的。凭证 Secret 的两个 `REPLACE_ME` 必须先改掉——**改完的文件不要提交进任何仓库**，生产环境请用 SealedSecret / ExternalSecret 生成它。
 
 ```bash
 # oc
@@ -605,7 +628,7 @@ kubectl -n openshift-user-workload-monitoring get pods
 
 ## RAM 权限
 
-operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就是它需要的全部权限，没有一条是多余的。资源级收窄能做的地方都做了：`fc` 逐域名 ARN，`yundun-cert` 只能 `*`（原因见下面「为什么是这样授权」）。
+operator 对阿里云只发 **7 个 OpenAPI 动作**，下面这一份策略就是它需要的全部权限，没有一条是多余的。资源级收窄能做的地方都做了：`fc` 逐域名 ARN，`oss` 逐 bucket ARN，`yundun-cert` 只能 `*`（原因见下面「为什么是这样授权」）。
 
 ```json
 {
@@ -629,12 +652,22 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
       "Resource": [
         "acs:fc:<fc3Region>:<accountId>:custom-domains/<domainName>"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "oss:ListCname",
+        "oss:PutCname"
+      ],
+      "Resource": [
+        "acs:oss:*:<accountId>:<bucket>"
+      ]
     }
   ]
 }
 ```
 
-`<fc3Region>` / `<accountId>` / `<domainName>` 是占位符，**带尖括号的原文不是合法 ARN**，创建策略前必须替换，怎么填见下面「把占位符填成真实值」。同一份内容也在 `docs/ram/full-policy.json`，那是可以直接喂给 `aliyun ram CreatePolicy` 的文件版。**这份 JSON 与 `docs/ram/full-policy.json` 是同一份内容的两处副本，一致性由 `make verify-ram-policy` 门禁保证**（见下面「文件版」）。
+`<fc3Region>` / `<accountId>` / `<domainName>` / `<bucket>` 是占位符，**带尖括号的原文不是合法 ARN**，创建策略前必须替换，怎么填见下面「把占位符填成真实值」。同一份内容也在 `docs/ram/full-policy.json`，那是可以直接喂给 `aliyun ram CreatePolicy` 的文件版。**这份 JSON 与 `docs/ram/full-policy.json` 是同一份内容的两处副本，一致性由 `make verify-ram-policy` 门禁保证**（见下面「文件版」）。
 
 ### 每个 Action 用在哪、缺了会怎样
 
@@ -647,14 +680,20 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
 | `yundun-cert:ListUserCertificateOrder` | 三处：每 `--cas-probe-interval`（默认 12h）探测当前证书是否还在云上；上传撞上同名冲突时按名认领既有 `certId`（write-ahead 的崩溃恢复退化路径）；删除时认领 write-ahead 记录指向的那一张 | 探测路径：一条 Warning 事件 `ProbeFailed`，**condition 不动**（列不出清单说明不了服役中那张有问题），`status.casProbedAt` 不推进，所以每一轮 reconcile 都会重试。认领路径更疼：同名冲突后认不回 `certId`，`Uploaded=False` reason `UploadFailed` 并发 `UploadFailed` 事件；删除时认领失败走上面那条 `CleanupFailed` 处置，被 `Abandon` 放走的话那张证书就成了孤儿（日志里留 `pendingCASName` 供人工兜底） |
 | `fc:GetCustomDomain` | 绑定的每一轮 Observe（漂移检测，`--drift-check-interval` 默认 1h）、Apply 前 read-modify-write 的读取、`deletionPolicy: Unbind` 解绑前的读取 | `Ready=False`，reason `CredentialsInvalid`；**`Applied` 一个字节都不动**——一次读被拒绝说不出目标上那张证书还在不在服役。**不发事件**，固定 5 分钟 requeue。漂移检测就此停摆：证书换代不会被应用，你只会看到 `Ready=False` |
 | `fc:UpdateCustomDomain` | Apply 写入 `certConfig`：首次绑定、证书换代、漂移纠正；`deletionPolicy: Unbind` 时解绑清理 | `Applied=False` reason `CredentialsInvalid`，`Ready` 跟着 `False`；事件 reason 恒为 `ApplyFailed`（事件名与 condition 的 reason 刻意不同名），固定 5 分钟 requeue。域名上还挂着上一张证书，到期就断。解绑路径与 CAS 清理同构：`CleanupFailed` → `Abandon` 发 `CleanupAbandoned`、`Block` 卡 `Terminating` |
+| `oss:ListCname` | OSS 绑定的每一轮 Observe（漂移检测）、`deletionPolicy: Unbind` 解绑前的读取 | `Ready=False`，reason `CredentialsInvalid`；**`Applied` 一个字节都不动**，与 `fc:GetCustomDomain` 缺失同一条规矩。固定 5 分钟 requeue |
+| `oss:PutCname` | OSS 绑定的 Apply（按 CAS certId 换绑：首次绑定、证书换代、漂移纠正）与 `Unbind` 时摘证书 | `Applied=False` reason `CredentialsInvalid`，`Ready` 跟着 `False`，事件 `ApplyFailed`；固定 5 分钟 requeue。解绑路径走 `CleanupFailed` → `Abandon` / `Block` |
 
 `fc` 的两条动作只在 ARN 命中的域名上生效。**ARN 里少列一个域名，症状大概率与完全没有 `fc:` 权限区分不开**：两者预计都是 `AccessDenied`。这一条**未实测**，出处是 `test/integration/fc3_test.go` 里的分析（探针撞上 `AccessDenied` 时就是因此拒绝下结论的）。
 
+`oss` 的两条动作以 bucket 为资源粒度（`acs:oss:*:<accountId>:<bucket>`），这是 OSS 允许的最细粒度：持有它就能改这个 bucket 上**任意** CNAME 的证书。OSS 绑定按 CAS certId 引用证书，所以 **OSS Binding 必须同时保留 `yundun-cert` 那条**——证书的 `spec.aliyun.uploadToCAS` 关着时 Binding 会停在 `Applied=False` / `CASUploadRequired`。
+
 ### 按你的部署裁剪
 
-- **`spec.aliyun.uploadToCAS: false`**：只留 `fc` 那条 Statement，`yundun-cert:*` 一个都不给。此时 operator 完全不碰 CAS（不上传、不回收、不探测），`Uploaded` condition 停在 `UploadDisabled` 且不参与 `Ready` 聚合。
+- **`spec.aliyun.uploadToCAS: false`**：只留 `fc` 那条 Statement（这种证书不能被 OSS Binding 引用），`yundun-cert:*` 一个都不给。此时 operator 完全不碰 CAS（不上传、不回收、不探测），`Uploaded` condition 停在 `UploadDisabled` 且不参与 `Ready` 聚合。
 - **只建 `AliyunCertificate`、不建任何 Binding**：只留 `yundun-cert` 那条。证书会同步进 CAS 控制台，但没有任何 FC3 调用。
 - **多个绑定域名**：`Resource` 数组里逐个列 ARN，一个域名一条，不要图省事写 `custom-domains/*`。域名分布在不同 region 时，每条 ARN 各写各的 region。
+- **没有 OSS Binding**：删掉 `oss` 那条 Statement。
+- **有 OSS Binding**：`oss` 那条按 bucket 逐个列 ARN；`yundun-cert` 那条不能删（见上）。
 - **CAS 那条的 `"Resource": "*"` 改不了**，`yundun-cert` 不支持资源级授权，见下一节。
 
 ### 把占位符填成真实值
@@ -662,6 +701,7 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
 - **`<fc3Region>`** 取 Binding 的 `spec.target.fc3CustomDomain.region`，也就是**FC3 自定义域名所在的 region**。它与 `spec.aliyun.region` / `spec.aliyun.casRegion` **没有任何关系**：CAS 在一个 region、FC3 域名在另一个 region 是完全正常的组合，这里必须填后者。填错的症状同样是 `AccessDenied`，而且看不出是 region 错了。
 - **`<accountId>`** 是阿里云主账号 ID，一串纯数字。控制台右上角账号菜单里能看到；FC3 自定义域名的 CNAME 目标 `<uid>.<region>.fc.aliyuncs.com` 的第一段也是它。绑定成功之后 operator 会把观测到的账号固化进 `status.boundAccountId`，可以拿它反查：`kubectl get aliyuncertificatebinding <name> -o jsonpath='{.status.boundAccountId}'`。第一次配置时的顺手做法是先用 `custom-domains/*` 授权、跑通一次读出账号，再把 ARN 收窄到逐域名。
 - **`<domainName>`** 取 `spec.target.fc3CustomDomain.domainName`，就是 FC3 上那个自定义域名本身，不带协议、不带端口、不带路径。
+- **`<bucket>`** 取 Binding 的 `spec.target.ossCustomDomain.bucket`。OSS 的 ARN 里 region 位写 `*`（bucket 名全局唯一，OSS 的资源级授权不按 region 收窄）。
 
 填完之后 `Resource` 这一行大致长这样（region、账号、域名都换成你自己的）：
 
@@ -678,19 +718,20 @@ operator 对阿里云只发 **5 个 OpenAPI 动作**，下面这一份策略就�
 
 ### 文件版
 
-三份 JSON 都是可以直接创建策略的原文，内容与本节完全一致：
+四份 JSON 都是可以直接创建策略的原文，内容与本节完全一致：
 
 | 文件 | 内容 |
 |---|---|
-| `docs/ram/full-policy.json` | 上面那份完整策略，两条 Statement |
+| `docs/ram/full-policy.json` | 上面那份完整策略，三条 Statement |
 | `docs/ram/certificate-cas-policy.json` | 只有 `yundun-cert` 那条（`spec.aliyun.uploadToCAS: true` 时需要） |
 | `docs/ram/binding-fc3-policy.json` | 只有 `fc` 那条，按域名 ARN 授权 |
+| `docs/ram/binding-oss-policy.json` | 只有 `oss` 那条，按 bucket ARN 授权 |
 
 ```bash
-jq . docs/ram/full-policy.json docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json
+jq . docs/ram/full-policy.json docs/ram/certificate-cas-policy.json docs/ram/binding-fc3-policy.json docs/ram/binding-oss-policy.json
 ```
 
-**这五处副本（README 里那份、spec §8.3 里那份，加三个文件）的一致性由门禁盯着，不靠人记得同步**：`make verify-ram-policy` 断言 README 与 spec §8.3 里的完整策略都与 `full-policy.json` 逐字相等、且另两份的 `Statement` 合并后等于它的 `Statement` 列表，任一不等就打印 diff 并失败。CI 的 lint workflow 每次 push / PR 都会跑它，而且 `if: always()`——Go 那边的 lint 挂了也照样能看到策略有没有漂移。改任何一处策略之后，本地跑一遍再提交：
+**这六处副本（README 里那份、spec §8.3 里那份，加四个文件）的一致性由门禁盯着，不靠人记得同步**：`make verify-ram-policy` 断言 README 与 spec §8.3 里的完整策略都与 `full-policy.json` 逐字相等、且另三份的 `Statement` 合并后等于它的 `Statement` 列表，任一不等就打印 diff 并失败。CI 的 lint workflow 每次 push / PR 都会跑它，而且 `if: always()`——Go 那边的 lint 挂了也照样能看到策略有没有漂移。改任何一处策略之后，本地跑一遍再提交：
 
 ```bash
 make verify-ram-policy
@@ -704,9 +745,9 @@ aliyun ram CreatePolicy --PolicyName le-to-alicloud --PolicyDocument "$(cat docs
 
 ### 集成测试的额外权限
 
-`test/integration/` 的探针会在真实账号上建删证书、并改写 `FC3_TEST_DOMAIN` 指定域名的 `certConfig`，用的就是上面这份策略，**没有额外的 Action 需要授**。
+`test/integration/` 的探针会在真实账号上建删证书、并改写 `FC3_TEST_DOMAIN` 指定域名的 `certConfig`，配了 `OSS_TEST_BUCKET` / `OSS_TEST_DOMAIN` 时还会真的换绑那个 CNAME 上的证书，用的就是上面这份策略，**没有额外的 Action 需要授**。
 
-唯一一处提到别的动作是排障建议：FC 的 `AccessDenied` 分不清「压根没有 `fc:` 权限」和「有权限但这个域名不在授权的 ARN 集合里」，要分辨就手工再调一次不针对具体域名的只读动作（例如 `fc:ListCustomDomains`），它也 `AccessDenied` 才说明是前者。探针自己不做这一步（`test/integration/fc3_test.go` 里写明了理由），所以 `fc:ListCustomDomains` 只是人工排障时可以临时加、查完就撤的一条，**operator 与自动化测试都不需要它**。
+唯一一处提到别的动作是排障建议：FC 的 `AccessDenied` 分不清「压根没有 `fc:` 权限」和「有权限但这个域名不在授权的 ARN 集合里」，要分辨就手工再调一次不针对具体域名的只读动作（例如 `fc:ListCustomDomains`），它也 `AccessDenied` 才说明是前者。探针自己不做这一步（`test/integration/fc3_test.go` 里写明了理由），所以 `fc:ListCustomDomains` 只是人工排障时可以临时加、查完就撤的一条，**operator 与自动化测试都不需要它**。OSS 探针同样只用上面这份策略里的 `oss:ListCname` / `oss:PutCname`。
 
 ## 威胁模型
 
@@ -934,7 +975,7 @@ make kustomize && ./bin/kustomize build config/default | grep -c "^kind: CustomR
 
 ### 集成测试 runbook
 
-`test/integration/` 下的探针会在**真实阿里云账号**上创建并删除证书，配了 `FC3_TEST_DOMAIN` 时还会真的改写那个域名的 `certConfig`。**不要用生产账号，不要用生产域名。**
+`test/integration/` 下的探针会在**真实阿里云账号**上创建并删除证书，配了 `FC3_TEST_DOMAIN` 时还会真的改写那个域名的 `certConfig`；配了 `OSS_TEST_BUCKET` / `OSS_TEST_DOMAIN` 时会真的换绑那个 CNAME 上的证书（探针结束时会还原原来的 certId，还不回去时会在 `RESULTS.md` 里写明）。**不要用生产账号，不要用生产域名。**
 
 1. 建一个独立 RAM 子账号，只给「RAM 权限」一节的那份完整策略，生成独立 AK。
 2. 准备环境变量：
