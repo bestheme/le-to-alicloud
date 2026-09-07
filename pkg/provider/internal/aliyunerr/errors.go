@@ -56,6 +56,11 @@ func ToProviderError(op string, err error, failReason string) error {
 	case aliyun.ClassNotFound:
 		// 域名不存在不是瞬时故障：可能是 Terraform 还没建。Retryable=false，
 		// 让通用层用固定 5m 的长 requeue 而不是指数退避（spec §6.2 步骤 5）。
+		//
+		// 落进这个分支的不止 FC3 的 DomainNameNotFound：OSS 侧还有 bucket 不存在
+		// （NoSuchBucket，走 HTTP 404）和 bucket 上没有该自定义域名（CnameNotFound，
+		// 由 pkg/aliyun.cnameFromList 在 ListCname 结果里找不到 domain 时自行合成）。
+		// 三者对 Binding 的含义相同：目标还不在，等它出现。
 		return withOp(provider.Errorf(provider.CodeTargetNotFound, false, certsv1alpha1.ReasonTargetNotFound, err))
 	case aliyun.ClassAuth:
 		return withOp(provider.Errorf(provider.CodeAuth, false, certsv1alpha1.ReasonCredentialsInvalid, err))

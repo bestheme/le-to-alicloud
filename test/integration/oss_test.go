@@ -202,9 +202,11 @@ func TestOSSBindByCertID(t *testing.T) {
 	if err != nil {
 		Record(t, "#17", q17oss, "无法判定：回读失败", sdkSummary(err))
 	} else if got.CertRef == ref1 {
-		Record(t, "#17", q17oss, "逐字相同", "写入="+ref1+" 回读="+got.CertRef+" Type="+got.CertType)
+		Record(t, "#17", q17oss, "逐字相同",
+			"写入="+ref1+" 回读="+got.CertRef+" Type="+got.CertType+" Owner="+got.AccountID)
 	} else {
-		Record(t, "#17", q17oss, "**不同**：短路会失效，需要归一化", "写入="+ref1+" 回读="+got.CertRef)
+		Record(t, "#17", q17oss, "**不同**：短路会失效，需要归一化",
+			"写入="+ref1+" 回读="+got.CertRef+" Owner="+got.AccountID)
 	}
 
 	// #15 换绑（不带 PreviousCertId，Force=true）

@@ -148,7 +148,9 @@ type AliyunCertificateBindingStatus struct {
 // +kubebuilder:printcolumn:name="Applied",type=string,JSONPath=`.status.conditions[?(@.type=="Applied")].status`
 // +kubebuilder:printcolumn:name="Conflict",type=string,JSONPath=`.status.conditions[?(@.type=="Conflict")].status`
 // +kubebuilder:printcolumn:name="Certificate",type=string,JSONPath=`.spec.certificateRef.name`
-// +kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.spec.target.fc3CustomDomain.domainName`
+// +kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.spec.target.type`
+// +kubebuilder:printcolumn:name="FC3Domain",type=string,priority=1,JSONPath=`.spec.target.fc3CustomDomain.domainName`
+// +kubebuilder:printcolumn:name="OSSDomain",type=string,priority=1,JSONPath=`.spec.target.ossCustomDomain.domainName`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // AliyunCertificateBinding 把一张 AliyunCertificate 部署到一个阿里云目标。

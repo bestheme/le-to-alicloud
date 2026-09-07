@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -174,12 +175,14 @@ func issueAndBindOSS(ctx context.Context, ns, certName, bindingName string) (buc
 }
 
 // pokeBinding 用 annotation 推一轮 reconcile（bindingMeaningfulChange 认 annotation 变化）。
+// 值取纳秒时间戳而不是递增计数：同一个 Binding 会被推很多轮，值必须每次都不同，
+// 否则 Update 写进去的是同一个值，annotation 没变，这一轮 poke 悄悄变成空操作。
 func pokeBinding(ctx context.Context, ns, name string) {
 	b := getBinding(ctx, ns, name)
 	if b.Annotations == nil {
 		b.Annotations = map[string]string{}
 	}
-	b.Annotations["poke"] = fmt.Sprintf("%d", len(b.Annotations["poke"])+1)
+	b.Annotations["poke"] = strconv.FormatInt(time.Now().UnixNano(), 10)
 	ExpectWithOffset(1, k8sClient.Update(ctx, b)).To(Succeed())
 }
 

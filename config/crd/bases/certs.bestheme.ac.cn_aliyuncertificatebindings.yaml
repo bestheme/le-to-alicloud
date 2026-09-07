@@ -27,8 +27,16 @@ spec:
     - jsonPath: .spec.certificateRef.name
       name: Certificate
       type: string
-    - jsonPath: .spec.target.fc3CustomDomain.domainName
+    - jsonPath: .spec.target.type
       name: Target
+      type: string
+    - jsonPath: .spec.target.fc3CustomDomain.domainName
+      name: FC3Domain
+      priority: 1
+      type: string
+    - jsonPath: .spec.target.ossCustomDomain.domainName
+      name: OSSDomain
+      priority: 1
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
