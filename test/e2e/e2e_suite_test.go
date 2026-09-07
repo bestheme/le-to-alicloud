@@ -1,3 +1,5 @@
+//go:build e2e
+
 /*
 Copyright 2026 Hangzhou Yunqi Intelligence Technology Co., Ltd.
 
@@ -20,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -34,8 +37,11 @@ var (
 	// These variables are useful if CertManager is already installed, avoiding
 	// re-installation and conflicts.
 	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
-	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
-	isCertManagerAlreadyInstalled = false
+	// certManagerInstalledByUs 只有在本套件真的执行完 InstallCertManager 之后才为 true，
+	// AfterSuite 据此决定要不要卸载。这里刻意用「装过才拆」的正向标志，而不是脚手架原来
+	// 那个「没检测到就拆」的反向标志：反向标志在 BeforeSuite 提前失败时仍然是零值 false，
+	// 而 Ginkgo 照样会跑 AfterSuite，于是卸载会打到一个本套件根本没动过的集群上。
+	certManagerInstalledByUs = false
 
 	// projectImage is the name of the image which will be build and loaded
 	// with the code source changes to be tested.
@@ -53,6 +59,21 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
+	// 集群身份闸门，必须放在构建/加载镜像之前。这套 e2e 会在集群上安装、并在 AfterSuite 里
+	// 卸载 cert-manager；只要当前 kubeconfig 指的不是一次性 Kind 集群，那次卸载就会打到真
+	// 集群上。2026-09-05 与 2026-09-06 各发生过一次：cert-manager 的 namespace 与 6 个 CRD
+	// 被从生产 OpenShift 上删掉，且不会自动装回。确实要在非 Kind 集群上跑时，显式设
+	// E2E_ALLOW_NON_KIND=1 表示自己清楚会发生什么。
+	By("verifying that the current kubeconfig context points at a Kind cluster")
+	if os.Getenv("E2E_ALLOW_NON_KIND") != "1" {
+		output, err := utils.Run(exec.Command("kubectl", "config", "current-context"))
+		Expect(err).NotTo(HaveOccurred(), "Failed to read the current kubeconfig context")
+		currentContext := strings.TrimSpace(output)
+		Expect(currentContext).To(HavePrefix("kind-"), fmt.Sprintf(
+			"refusing to run the e2e suite against context %q: it installs and uninstalls "+
+				"cert-manager cluster-wide. Set E2E_ALLOW_NON_KIND=1 to override.", currentContext))
+	}
+
 	By("building the manager(Operator) image")
 	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
 	_, err := utils.Run(cmd)
@@ -70,10 +91,12 @@ var _ = BeforeSuite(func() {
 	// Setup CertManager before the suite if not skipped and if not already installed
 	if !skipCertManagerInstall {
 		By("checking if cert manager is installed already")
-		isCertManagerAlreadyInstalled = utils.IsCertManagerCRDsInstalled()
-		if !isCertManagerAlreadyInstalled {
+		alreadyInstalled, err := utils.IsCertManagerCRDsInstalled()
+		Expect(err).NotTo(HaveOccurred(), "Failed to check whether CertManager CRDs are installed")
+		if !alreadyInstalled {
 			_, _ = fmt.Fprintf(GinkgoWriter, "Installing CertManager...\n")
 			Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
+			certManagerInstalledByUs = true
 		} else {
 			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: CertManager is already installed. Skipping installation...\n")
 		}
@@ -81,9 +104,10 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	// Teardown CertManager after the suite if not skipped and if it was not already installed
-	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
+	// 只拆本套件自己装的那一份。卸载失败要显式断言出来：半拆的 cert-manager 会让后续
+	// 运行以莫名其妙的方式失败，收尾的失败不能只留一行 warning。
+	if certManagerInstalledByUs {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling CertManager...\n")
-		utils.UninstallCertManager()
+		Expect(utils.UninstallCertManager()).To(Succeed(), "Failed to uninstall CertManager")
 	}
 })

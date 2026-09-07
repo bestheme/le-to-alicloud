@@ -3,6 +3,7 @@ run:
   allow-parallel-runners: true
   build-tags:
     - integration
+    - e2e
 linters:
   default: none
   enable:
