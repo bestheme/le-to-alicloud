@@ -234,6 +234,18 @@ func (r *AliyunCertificateBindingReconciler) reconcileBindingReady(
 		return ctrl.Result{RequeueAfter: certificateGateRequeue}, r.patchBinding(ctx, rd)
 	}
 
+	// 3c. 按 certId 引用证书的目标必须先有 certId（spec 2026-09-07 §5.2）。只查注册表，
+	// 不碰凭证、不发云调用——凭证错误不该盖住一个更早、更便宜就能发现的配置错误。
+	if reason, msg := casUploadGate(capabilitiesOf(b), ac, m); reason != "" {
+		setBindingCondition(b, certsv1alpha1.ConditionApplied, metav1.ConditionFalse, reason, msg)
+		aggregateBindingReady(b)
+		requeue := r.DriftCheckInterval
+		if reason == certsv1alpha1.ReasonCertificateNotReady {
+			requeue = certificateGateRequeue // certId 通常一轮就到；证书 watch 也会唤醒
+		}
+		return ctrl.Result{RequeueAfter: requeue}, r.patchBinding(ctx, rd)
+	}
+
 	// 4. 解析凭证并构造 provider client（spec §6.2 步骤 4）
 	p, cl, err := r.providerClient(ctx, b, ac)
 	if err != nil {

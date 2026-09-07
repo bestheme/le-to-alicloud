@@ -42,6 +42,8 @@ const certificateGateRequeue = 30 * time.Second
 // 指纹对得上时才用——续期在途时两者会短暂不一致，此时按 Secret 的指纹重新派生名字，
 // 绝不把上一代的 certId 贴到新证书上。那种不一致的材料也不会被写出去，见 certificateGate。
 //
+// CASRegion 取自 spec（EffectiveCASRegion），与 certId 一起拼成 OSS 用的 certRef。
+//
 // reader 必须是能直读 Secret 的 client（manager client 对 corev1.Secret 关了 cache），
 // 全程只 Get 单个对象、绝不 List。
 func loadBindingMaterial(
@@ -79,6 +81,7 @@ func loadBindingMaterial(
 		CASName:     naming.CASName(ac.Name, b.Fingerprint),
 		NotAfter:    b.Leaf.NotAfter,
 		DNSNames:    b.DNSNames(),
+		CASRegion:   ac.Spec.Aliyun.EffectiveCASRegion(),
 	}
 	if cur := ac.Status.Current; cur != nil && cur.Fingerprint == b.Fingerprint {
 		m.CertID = cur.CertID
