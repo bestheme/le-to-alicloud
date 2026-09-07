@@ -73,6 +73,12 @@ func switchToUnbind(ctx context.Context, ns, name string) {
 		return cur.Spec.DeletionPolicy == certsv1alpha1.DeletionPolicyUnbind &&
 			cur.Status.ObservedGeneration >= gen
 	}, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
+	// 按目标类型选计数器：OSS 的 Binding 上 FC3CustomDomain 是 nil，照着 FC3 那条路
+	// 取域名会直接 nil 解引用。两条路等的是同一件事——本 Binding 的云侧读调用停止增长。
+	if o := b.Spec.Target.OSSCustomDomain; o != nil {
+		quiesceOSSTarget(o.Bucket, o.DomainName)
+		return
+	}
 	quiesceTarget(b.Spec.Target.FC3CustomDomain.DomainName)
 }
 

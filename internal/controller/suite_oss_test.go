@@ -57,8 +57,6 @@ func ossBucketFor(ns string) string { return "bucket-" + ns }
 // 发现「云上没有我」而重传。所以本 helper 用 DeferCleanup 在用例结束时把证书删掉
 // （finalizer 走 fake CAS，瞬间完成），常驻证书集合里不留开着上传的对象。
 // 调用方必须先删 Binding 再让这个 cleanup 跑：Binding 的 finalizer 会等证书。
-//
-//nolint:unused // Task 6 只测 3c 的 CASUploadRequired 分支（那一支要的是关着上传的证书），开着上传的这个由 Task 7 的 Apply 用例调用
 func createCertificateWithCAS(ctx context.Context, ns, name string, dnsNames ...string) {
 	ac := &certsv1alpha1.AliyunCertificate{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -116,8 +114,6 @@ func ossDomainFor(ns, binding string) string { return fmt.Sprintf("%s.%s.example
 
 // certRefOf 读证书 status.current.certId 拼出 OSS 侧应观测到的 certRef。
 // 拼法必须与 provider.CertMaterial.CASCertRef() 一致（"<certId>-<casRegion>"）。
-//
-//nolint:unused // 只有走到 Apply 才有 certRef 可读；调用点是 Task 7 的 OSS Apply / 漂移用例
 func certRefOf(ctx context.Context, ns, certName string) string {
 	ac := getAC(ctx, ns, certName)
 	if ac.Status.Current == nil || ac.Status.Current.CertID == nil {
